@@ -1,6 +1,8 @@
 // payload.go 改写发往上游的 chat 请求体：
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
+//  3. role 归一化（developer → system，上游 role 白名单不含 developer，code=11128）
+//  4. 系统提示词补全（首条非 system 或其内容为空时补默认值，上游要求首条必须是 system）
 package upstream
 
 import (
@@ -28,6 +30,7 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	obj["stream"] = true
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	ensureSystemPrompt(obj)
 	normalizeReasoningEffort(obj, efforts)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
@@ -39,6 +42,62 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	return out
+}
+
+// defaultSystemPrompt 请求的系统提示词为空时代为注入的内容。
+const defaultSystemPrompt = "You are a helpful assistant."
+
+// ensureSystemPrompt 保证首条消息是内容非空的 system；仅在其为空时才补，有内容则完全不动。
+//
+// 背景：上游校验首条必须是 system，否则 HTTP 400 code=11128
+// （"first message is not system prompt"）。部分 OpenAI 兼容客户端（如 Cherry Studio）
+// 的连通性检查与默认对话不带 system，或把 system 配成空串，请求会被上游直接拒绝；
+// 协议兼容由网关承担，调用方无需改客户端。
+//
+// 三种处置：
+//   - 首条非 system → 在最前插入一条默认 system
+//   - 首条是 system 但内容为空 → 就地填入默认内容（不新增第二条：语义上就是补全该条，
+//     且上游对多 system 的行为尚未实测，见 normalizeRoles 注释）
+//   - 首条是 system 且内容非空 → 不动，尊重调用方自己的提示词
+//
+// 必须在 normalizeRoles 之后调用：developer 会被归一为 system，
+// 若先注入再归一，首条 developer 会被补成两条 system。
+// messages 缺失或为空时不注入——空列表本就非法，交由上游报错，避免掩盖真实问题。
+func ensureSystemPrompt(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return
+	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok {
+		return
+	}
+	role, _ := first["role"].(string)
+	if !strings.EqualFold(strings.TrimSpace(role), "system") {
+		sys := map[string]any{"role": "system", "content": defaultSystemPrompt}
+		obj["messages"] = append([]any{sys}, msgs...)
+		log.Printf("injected default system prompt (首条 role=%q 非 system)", role)
+		return
+	}
+	if systemContentEmpty(first["content"]) {
+		first["content"] = defaultSystemPrompt
+		log.Printf("filled empty system prompt (首条 system 内容为空)")
+	}
+}
+
+// systemContentEmpty 报告 system 消息的 content 是否为空。
+// 兼容两种形态：字符串（缺失/空串/纯空白）与数组（空数组）。
+func systemContentEmpty(v any) bool {
+	switch c := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []any:
+		return len(c) == 0
+	default:
+		return false
+	}
 }
 
 // effortRank 档位从低到高。

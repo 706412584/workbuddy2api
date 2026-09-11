@@ -8,13 +8,17 @@ import (
 // TestNormalizeRoles 验证出站请求体把 developer 角色归一为 system。
 // 上游 role 白名单不含 developer（OpenAI 新规范的 system 别名），
 // 命中即 HTTP 400 code=11128；此处走 PrepareBodyOptWithEfforts 全链路断言。
+//
+// 注意：本用例同时穿过 ensureSystemPrompt（首条非 system 会补一条默认 system），
+// 因此首条不是 system 的输入，期望值里会多出一位前导 "system"；
+// 补全行为本身由 TestEnsureSystemPrompt 专门覆盖。
 func TestNormalizeRoles(t *testing.T) {
 	cases := []struct {
 		name      string
 		body      string
 		wantRoles []string // 与输出 messages 逐条对应的期望 role；len 即消息数
 	}{
-		{"developer 改写为 system",
+		{"developer 改写为 system（已成 system，不再补）",
 			`{"messages":[{"role":"developer","content":"x"}]}`, []string{"system"}},
 		{"Developer 首字母大写改写",
 			`{"messages":[{"role":"Developer","content":"x"}]}`, []string{"system"}},
@@ -22,19 +26,19 @@ func TestNormalizeRoles(t *testing.T) {
 			`{"messages":[{"role":"DEVELOPER","content":"x"}]}`, []string{"system"}},
 		{"前后空白 TrimSpace 后改写",
 			`{"messages":[{"role":" developer ","content":"x"}]}`, []string{"system"}},
-		{"system 原样保留",
+		{"system 原样保留（不重复补）",
 			`{"messages":[{"role":"system","content":"x"}]}`, []string{"system"}},
-		{"user 原样保留",
-			`{"messages":[{"role":"user","content":"x"}]}`, []string{"user"}},
-		{"assistant 原样保留",
-			`{"messages":[{"role":"assistant","content":"x"}]}`, []string{"assistant"}},
-		{"tool 原样保留（不因未知而改写）",
-			`{"messages":[{"role":"tool","content":"x"}]}`, []string{"tool"}},
-		{"messages 缺失不 panic 且其余字段不变",
+		{"user 本身原样保留，仅在其前补一条 system",
+			`{"messages":[{"role":"user","content":"x"}]}`, []string{"system", "user"}},
+		{"assistant 本身原样保留，仅在其前补一条 system",
+			`{"messages":[{"role":"assistant","content":"x"}]}`, []string{"system", "assistant"}},
+		{"tool 本身原样保留（不因未知而改写）",
+			`{"messages":[{"role":"tool","content":"x"}]}`, []string{"system", "tool"}},
+		{"messages 缺失不补不 panic 且其余字段不变",
 			`{"model":"glm-5.2"}`, []string{}},
-		{"messages 为空数组不 panic",
+		{"messages 为空数组不补（空列表本就非法，交上游报错）",
 			`{"messages":[]}`, []string{}},
-		{"混合消息仅 developer 被改写",
+		{"混合消息：首条 developer 转 system 后不再补，其余原样",
 			`{"messages":[{"role":"developer","content":"a"},{"role":"user","content":"b"},{"role":"developer","content":"c"}]}`,
 			[]string{"system", "user", "system"}},
 		{"sanitize=false 时仍归一（与脱敏解耦）",
@@ -144,4 +148,95 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnsureSystemPrompt 系统提示词补全：仅在「缺失」或「内容为空」时补默认值，
+// 有内容则完全不碰（不能覆盖调用方自己的提示词）。
+func TestEnsureSystemPrompt(t *testing.T) {
+	// 取输出首条消息的 role 与 content。
+	firstOf := func(t *testing.T, body string) (role string, content any, count int) {
+		t.Helper()
+		out := PrepareBodyOptWithEfforts([]byte(body), true, nil)
+		var obj map[string]any
+		if err := json.Unmarshal(out, &obj); err != nil {
+			t.Fatalf("unmarshal: %v (out=%s)", err, out)
+		}
+		msgs, _ := obj["messages"].([]any)
+		if len(msgs) == 0 {
+			return "", nil, 0
+		}
+		m, _ := msgs[0].(map[string]any)
+		role, _ = m["role"].(string)
+		return role, m["content"], len(msgs)
+	}
+
+	t.Run("缺失 system → 在最前补一条，原有消息不动", func(t *testing.T) {
+		role, content, n := firstOf(t, `{"messages":[{"role":"user","content":"hi"}]}`)
+		if role != "system" || content != defaultSystemPrompt {
+			t.Fatalf("首条=%q/%v want system/%q", role, content, defaultSystemPrompt)
+		}
+		if n != 2 {
+			t.Errorf("消息数=%d want 2", n)
+		}
+	})
+
+	t.Run("system 内容为空串 → 就地填入默认值，不新增消息", func(t *testing.T) {
+		role, content, n := firstOf(t, `{"messages":[{"role":"system","content":""},{"role":"user","content":"hi"}]}`)
+		if role != "system" || content != defaultSystemPrompt {
+			t.Fatalf("首条=%q/%v want system/%q", role, content, defaultSystemPrompt)
+		}
+		if n != 2 {
+			t.Errorf("消息数=%d want 2（应替换内容而非新增）", n)
+		}
+	})
+
+	t.Run("system 内容为纯空白 → 视为空并填入", func(t *testing.T) {
+		_, content, _ := firstOf(t, `{"messages":[{"role":"system","content":"   \n\t "},{"role":"user","content":"hi"}]}`)
+		if content != defaultSystemPrompt {
+			t.Errorf("content=%v want %q", content, defaultSystemPrompt)
+		}
+	})
+
+	t.Run("system 缺 content 字段 → 视为空并填入", func(t *testing.T) {
+		_, content, _ := firstOf(t, `{"messages":[{"role":"system"},{"role":"user","content":"hi"}]}`)
+		if content != defaultSystemPrompt {
+			t.Errorf("content=%v want %q", content, defaultSystemPrompt)
+		}
+	})
+
+	t.Run("system content 为空数组 → 视为空并填入", func(t *testing.T) {
+		_, content, _ := firstOf(t, `{"messages":[{"role":"system","content":[]},{"role":"user","content":"hi"}]}`)
+		if content != defaultSystemPrompt {
+			t.Errorf("content=%v want %q", content, defaultSystemPrompt)
+		}
+	})
+
+	// 关键：有内容时必须原样保留，不能被网关覆盖。
+	t.Run("system 有内容 → 完全不动", func(t *testing.T) {
+		const mine = "你是一只猫，只用喵回答"
+		role, content, n := firstOf(t, `{"messages":[{"role":"system","content":"`+mine+`"},{"role":"user","content":"hi"}]}`)
+		if role != "system" || content != mine {
+			t.Fatalf("首条=%q/%v want system/%q（不得覆盖调用方提示词）", role, content, mine)
+		}
+		if n != 2 {
+			t.Errorf("消息数=%d want 2（不得新增）", n)
+		}
+	})
+
+	t.Run("system 内容为数组且非空 → 不动", func(t *testing.T) {
+		_, content, _ := firstOf(t, `{"messages":[{"role":"system","content":[{"type":"text","text":"hi"}]},{"role":"user","content":"x"}]}`)
+		if _, isArr := content.([]any); !isArr {
+			t.Errorf("content=%v want 保持数组形态", content)
+		}
+	})
+
+	t.Run("与 sanitize 开关解耦：sanitize=false 也补", func(t *testing.T) {
+		out := PrepareBodyOptWithEfforts([]byte(`{"messages":[{"role":"user","content":"hi"}]}`), false, nil)
+		var obj map[string]any
+		json.Unmarshal(out, &obj)
+		msgs, _ := obj["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("消息数=%d want 2", len(msgs))
+		}
+	})
 }
