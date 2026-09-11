@@ -23,9 +23,24 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"workbuddy2api/internal/auth"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+const (
+	billingBaseCN     = "https://www.codebuddy.cn"
+	billingBaseGlobal = "https://www.workbuddy.ai"
+)
+
+// billingBaseFor 按账号 domain 选 billing base：workbuddy.ai 属国外版。
+// 复用 auth 包的区域判定，避免各处重复实现域名规则。
+func billingBaseFor(domain string) string {
+	a := &auth.Auth{Domain: domain}
+	if a.Region() == auth.RegionGlobal {
+		return billingBaseGlobal
+	}
+	return billingBaseCN
+}
 
 type authFile struct {
 	Auth struct {
@@ -98,7 +113,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseCN+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, billingBaseFor(af.Auth.Domain)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}

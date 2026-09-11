@@ -46,6 +46,7 @@ func (k CoolKind) String() string {
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
 	UID             string    `json:"uid"`
+	Region          string    `json:"region,omitempty"` // 账号所属上游区域（"cn"/"global"），由凭证 domain 推导
 	Nickname        string    `json:"nickname,omitempty"`
 	Credits         int64     `json:"credits"`
 	Cooling         bool      `json:"cooling"`
@@ -470,7 +471,14 @@ func (p *Pool) Pick() *auth.Auth {
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried)
+	return p.pick(tried, nil)
+}
+
+// PickExcludingWhere 在 PickExcluding 基础上只考虑 pred 为真的账号（pred==nil 等同不过滤）。
+// 典型用途：按账号区域过滤，使请求只用支持其模型的上游区域账号。
+// 谓词同时作用于常规候选集与全冷却兜底路径——否则全员冷却时会兜底到不合格的账号。
+func (p *Pool) PickExcludingWhere(tried map[string]bool, pred func(*auth.Auth) bool) *auth.Auth {
+	return p.pick(tried, pred)
 }
 
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
@@ -479,7 +487,7 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, pred func(*auth.Auth) bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -495,12 +503,15 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
+		if pred != nil && !pred(e.a) {
+			continue
+		}
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now)
+		return p.pickEarliestExpiryLocked(tried, pred, now)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -560,7 +571,8 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *auth.Auth {
+// pred（可 nil）同样作用于兜底：区域受限请求在全员冷却时不得越区兜底。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, pred func(*auth.Auth) bool, now time.Time) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -573,6 +585,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *a
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
 		}
 		if p.inFlightFull(e) {
+			continue
+		}
+		if pred != nil && !pred(e.a) {
 			continue
 		}
 		exp := e.expiry(now)
@@ -898,6 +913,13 @@ func (p *Pool) AvailableUIDs() []string {
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
+	return p.PickByUIDWhere(uid, nil)
+}
+
+// PickByUIDWhere 同 PickByUID，但额外要求 pred 为真（pred==nil 等同不过滤）。
+// 用于粘性路由：粘性号若不属于本次请求允许的区域，返回 nil，
+// 调用方据此解绑并回落普通轮换。
+func (p *Pool) PickByUIDWhere(uid string, pred func(*auth.Auth) bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -911,6 +933,9 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	if p.inFlightFull(e) {
 		return nil
 	}
+	if pred != nil && !pred(e.a) {
+		return nil
+	}
 	e.lastUsed = now
 	return e.a
 }
@@ -921,10 +946,19 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+	return p.CountsDetailedWhere(nil)
+}
+
+// CountsDetailedWhere 同 CountsDetailed，但只统计 pred 为真的账号（pred==nil 等同不过滤）。
+// 谓词作用于账号凭证，与选号谓词同语义（如按区域过滤），使 /status 的计数与账号列表口径一致。
+func (p *Pool) CountsDetailedWhere(pred func(*auth.Auth) bool) (total, healthy, cooling, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
+		if pred != nil && !pred(e.a) {
+			continue
+		}
 		total++
 		switch {
 		case e.disabled:
@@ -957,12 +991,38 @@ func (p *Pool) ServableNow() bool {
 	return false
 }
 
+// Regions 返回池中现存账号覆盖的区域（升序去重）。
+// 供上层按区域产出模型列表：只挂单区账号时不应列出另一区独有的模型。
+func (p *Pool) Regions() []auth.Region {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := make(map[auth.Region]bool, 2)
+	for _, e := range p.byUID {
+		seen[e.a.Region()] = true
+	}
+	out := make([]auth.Region, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
 func (p *Pool) List() []Status {
+	return p.ListWhere(nil)
+}
+
+// ListWhere 同 List，但只返回 pred 为真的账号（pred==nil 等同不过滤）。
+// 谓词作用于账号凭证，与选号谓词同语义（如按区域过滤）。
+func (p *Pool) ListWhere(pred func(*auth.Auth) bool) []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
+	for uid, e := range p.byUID {
+		if pred != nil && !pred(e.a) {
+			continue
+		}
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
@@ -977,6 +1037,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
 		UID:             uid,
+		Region:          string(e.a.Region()),
 		Nickname:        e.a.Nickname,
 		Credits:         e.credits,
 		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),

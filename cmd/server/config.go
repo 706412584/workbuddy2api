@@ -10,12 +10,24 @@ import (
 	"time"
 )
 
+// APIKeySpec 一个 API key 及其绑定的上游区域（region 为空/缺省 = 不限区域）。
+// 定义在 main 包内以免 config 依赖 server 包；字段与 server.APIKeySpec 对齐。
+type APIKeySpec struct {
+	Key    string `json:"key"`
+	Region string `json:"region"` // "" / "cn" / "global"
+	Name   string `json:"name"`   // 可选标识，仅用于日志
+}
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	APIKey    string `json:"api_key"`    // 空 = 不鉴权；单个密钥，不限区域（兼容旧配置）
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// APIKeys 多密钥列表，每项可绑定区域：绑定后该密钥的请求只走对应区域的账号，
+	// 其 /v1/models 与 /status 也按该区域过滤。与 api_key 合并生效。
+	APIKeys []APIKeySpec `json:"api_keys"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -251,6 +263,36 @@ func (c *Config) normalize() error {
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
+	}
+	if err := c.validateAPIKeys(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateAPIKeys 归一化并校验 api_keys：region 只允许空/cn/global（大小写不敏感），
+// key 不得为空，且跨 api_key 与 api_keys 不得出现重复密钥
+// （重复会让「该密钥属于哪个区域」产生歧义，故直接报错而非静默取其一）。
+func (c *Config) validateAPIKeys() error {
+	seen := map[string]string{} // key → 来源描述，用于报错定位
+	if c.APIKey != "" {
+		seen[c.APIKey] = "api_key"
+	}
+	for i := range c.APIKeys {
+		k := &c.APIKeys[i]
+		k.Region = strings.ToLower(strings.TrimSpace(k.Region))
+		switch k.Region {
+		case "", "cn", "global":
+		default:
+			return fmt.Errorf("api_keys[%d].region must be cn or global (or empty), got %q", i, k.Region)
+		}
+		if k.Key == "" {
+			return fmt.Errorf("api_keys[%d].key must not be empty", i)
+		}
+		if prev, dup := seen[k.Key]; dup {
+			return fmt.Errorf("api_keys[%d].key duplicates %s（同一密钥不能绑定两个区域）", i, prev)
+		}
+		seen[k.Key] = fmt.Sprintf("api_keys[%d]", i)
 	}
 	return nil
 }

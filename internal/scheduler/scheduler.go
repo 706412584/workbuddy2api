@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -166,6 +167,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
+// global（workbuddy.ai）账号跳过签到：该区无签到活动，调用恒返回
+// code=10001「签到活动未开启或已过期」，只是噪音日志；余额查询仍照常执行。
 func (s *Scheduler) RunCheckinNow() {
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -175,7 +178,9 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		if a.Region() == auth.RegionGlobal {
+			log.Printf("checkin %s: 跳过（global 区无签到活动）", st.UID)
+		} else if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			log.Printf("checkin %s: %v", st.UID, err)
 			// 已签到等业务错误也继续走余额查询
 		}

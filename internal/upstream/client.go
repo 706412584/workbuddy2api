@@ -162,14 +162,18 @@ type Client struct {
 	IdleTimeout time.Duration
 
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
+	// 按区域分槽：两个区域同一模型的 effort 档位可能不同，且 FetchModels 会整体替换
+	// 所查区域的数据，共用一份会互相抹掉。无 supportedEfforts 的模型不入槽。
 	effortsMu sync.RWMutex
-	efforts   map[string][]string
+	efforts   map[auth.Region]map[string][]string
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	ChatBaseCN    string
-	BillingBaseCN string
+	ChatBaseCN     string
+	BillingBaseCN  string
+	ChatBaseGlobal string
+	BillingBaseGl  string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -187,6 +191,8 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
+		ChatBaseGlobal:       "https://www.workbuddy.ai",
+		BillingBaseGl:        "https://www.workbuddy.ai",
 	}
 }
 
@@ -199,29 +205,36 @@ func (c *Client) chatHTTP() *http.Client {
 }
 
 func (c *Client) chatBase(a *auth.Auth) string {
+	if a != nil && a.Region() == auth.RegionGlobal {
+		return c.ChatBaseGlobal
+	}
 	return c.ChatBaseCN
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
+	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(a))
 }
 
-// effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
-func (c *Client) effortsSnapshot() map[string][]string {
+// effortsSnapshot 返回该账号所在区域的 effort 能力缓存副本；nil 表示未知（透传不降级）。
+func (c *Client) effortsSnapshot(a *auth.Auth) map[string][]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	if len(c.efforts) == 0 {
+	src := c.efforts[a.Region()]
+	if len(src) == 0 {
 		return nil
 	}
-	cp := make(map[string][]string, len(c.efforts))
-	for k, v := range c.efforts {
+	cp := make(map[string][]string, len(src))
+	for k, v := range src {
 		cp[k] = v
 	}
 	return cp
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
+	if a != nil && a.Region() == auth.RegionGlobal {
+		return c.BillingBaseGl
+	}
 	return c.BillingBaseCN
 }
 
@@ -297,7 +310,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(a, body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -429,6 +442,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
+	// 只替换该账号所在区域的槽位，另一区域的缓存保持不变。
 	cache := make(map[string][]string, len(out))
 	for _, mi := range out {
 		if len(mi.Efforts) > 0 {
@@ -436,7 +450,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 	}
 	c.effortsMu.Lock()
-	c.efforts = cache
+	if c.efforts == nil {
+		c.efforts = make(map[auth.Region]map[string][]string, 2)
+	}
+	c.efforts[a.Region()] = cache
 	c.effortsMu.Unlock()
 	return out, nil
 }

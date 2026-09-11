@@ -19,27 +19,50 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strings"
 	"time"
 )
 
-// 上游常量（CN only）
+// upstreamBaseCN/Global 两区上游 base；区域由 url 子命令的参数选择，
+// 并随 state 文件传给 poll（登录流程跨进程，无法用内存传递）。
 const (
-	upstreamBaseCN    = "https://copilot.tencent.com"
-	clientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer     = "https://www.codebuddy.cn"
-	endpointAuthState = upstreamBaseCN + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct = upstreamBaseCN + "/v2/plugin/login/account?state="
-	endpointAuthToken = upstreamBaseCN + "/v2/plugin/auth/token?state="
-	stateFile         = "/tmp/wb2api-login-state.json"
+	upstreamBaseCN     = "https://copilot.tencent.com"
+	upstreamBaseGlobal = "https://www.workbuddy.ai"
+	clientUA           = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originReferer      = "https://www.codebuddy.cn"
+	originRefererGlob  = "https://www.workbuddy.ai"
+	stateFile          = "/tmp/wb2api-login-state.json"
 )
 
-// commonHeaders 通用请求头
-func commonHeaders(req *http.Request) {
+// regionEndpoints 一个区域的上游 base 与 Origin/Referer。
+type regionEndpoints struct {
+	base   string
+	origin string
+}
+
+// regionEndpoint 按区域名取上游端点；仅接受 "cn"/"global"。
+func regionEndpoint(region string) (regionEndpoints, error) {
+	switch region {
+	case "cn", "":
+		return regionEndpoints{base: upstreamBaseCN, origin: originReferer}, nil
+	case "global":
+		return regionEndpoints{base: upstreamBaseGlobal, origin: originRefererGlob}, nil
+	default:
+		return regionEndpoints{}, fmt.Errorf("unknown region %q (want cn|global)", region)
+	}
+}
+
+func (e regionEndpoints) authStateURL() string { return e.base + "/v2/plugin/auth/state?platform=CLI" }
+func (e regionEndpoints) loginAcctURL() string { return e.base + "/v2/plugin/login/account?state=" }
+func (e regionEndpoints) authTokenURL() string { return e.base + "/v2/plugin/auth/token?state=" }
+
+// commonHeaders 通用请求头（Origin/Referer 按区域取值）。
+func commonHeaders(req *http.Request, e regionEndpoints) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
+	req.Header.Set("Origin", e.origin)
+	req.Header.Set("Referer", e.origin+"/")
 	req.Header.Set("User-Agent", clientUA)
 }
 
@@ -51,6 +74,7 @@ type apiEnvelope struct {
 }
 
 // doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error
+// headers 为 nil 时用该区域的 commonHeaders 兜底。
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
@@ -58,8 +82,6 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	}
 	if headers != nil {
 		headers(req)
-	} else {
-		commonHeaders(req)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -89,12 +111,13 @@ func fatal(format string, args ...any) {
 }
 
 type loginState struct {
-	State string `json:"state"`
+	State  string `json:"state"`
+	Region string `json:"region"` // "cn"（缺省）或 "global"；poll 据此选上游 base
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll>")
+		fatal("usage: login <url [cn|global] | poll>")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -102,8 +125,17 @@ func main() {
 
 	switch os.Args[1] {
 	case "url":
+		region := ""
+		if len(os.Args) >= 3 {
+			region = strings.ToLower(os.Args[2])
+		}
+		ep, err := regionEndpoint(region)
+		if err != nil {
+			fatal("%v", err)
+		}
 		// handleStartLogin (oauth.go:68-87)
-		data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
+		data, _, err := doJSON(client, http.MethodPost, ep.authStateURL(),
+			func(r *http.Request) { commonHeaders(r, ep) }, bytes.NewReader([]byte("{}")))
 		if err != nil {
 			fatal("auth state failed: %v", err)
 		}
@@ -114,7 +146,7 @@ func main() {
 		if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
 			fatal("auth state: missing state or authUrl")
 		}
-		raw, _ := json.Marshal(loginState{State: st.State})
+		raw, _ := json.Marshal(loginState{State: st.State, Region: region})
 		if err := os.WriteFile(stateFile, raw, 0o600); err != nil {
 			fatal("write state: %v", err)
 		}
@@ -129,9 +161,14 @@ func main() {
 		if err := json.Unmarshal(raw, &ls); err != nil {
 			fatal("parse state: %v", err)
 		}
+		ep, err := regionEndpoint(ls.Region)
+		if err != nil {
+			fatal("%v", err)
+		}
 		// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 		// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-		tokRaw, status, errTok := doJSON(client, http.MethodGet, endpointAuthToken+ls.State, nil, nil)
+		tokRaw, status, errTok := doJSON(client, http.MethodGet, ep.authTokenURL()+ls.State,
+			func(r *http.Request) { commonHeaders(r, ep) }, nil)
 		if errTok != nil {
 			if status == 0 || status >= 500 {
 				fatal("token endpoint error: %v", errTok)
@@ -154,10 +191,10 @@ func main() {
 			Nickname     string `json:"nickname"`
 		}
 		acctHeaders := func(r *http.Request) {
-			commonHeaders(r)
+			commonHeaders(r, ep)
 			r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		}
-		if acctRaw, _, errAcct := doJSON(client, http.MethodGet, endpointLoginAcct+ls.State, acctHeaders, nil); errAcct == nil {
+		if acctRaw, _, errAcct := doJSON(client, http.MethodGet, ep.loginAcctURL()+ls.State, acctHeaders, nil); errAcct == nil {
 			_ = json.Unmarshal(acctRaw, &acct)
 		}
 		out := map[string]any{

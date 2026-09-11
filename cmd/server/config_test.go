@@ -491,3 +491,79 @@ func TestBadSessionTTL(t *testing.T) {
 		t.Fatal("want error for bad session_sticky.ttl")
 	}
 }
+
+func TestAPIKeysParsedAndNormalized(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"api_keys":[
+		{"key":"k1","region":"CN","name":"国内"},
+		{"key":"k2","region":"Global","name":"国外"},
+		{"key":"k3","name":"不限区"}
+	]}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(c.APIKeys) != 3 {
+		t.Fatalf("api_keys=%d want 3", len(c.APIKeys))
+	}
+	// region 大小写归一为小写；缺省为空 = 不限区域。
+	if c.APIKeys[0].Region != "cn" || c.APIKeys[1].Region != "global" || c.APIKeys[2].Region != "" {
+		t.Errorf("regions=%q/%q/%q want cn/global/\"\"",
+			c.APIKeys[0].Region, c.APIKeys[1].Region, c.APIKeys[2].Region)
+	}
+}
+
+func TestBadAPIKeyRegionRejected(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"api_keys":[{"key":"k1","region":"eu"}]}`), 0o600)
+	_, err := Load(fp)
+	if err == nil {
+		t.Fatal("want error for unknown region")
+	}
+	if !strings.Contains(err.Error(), "region") {
+		t.Errorf("error should mention region: %v", err)
+	}
+}
+
+func TestEmptyAPIKeyRejected(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"api_keys":[{"key":"","region":"cn"}]}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for empty key")
+	}
+}
+
+// TestDuplicateAPIKeyRejected 同一密钥绑定两个区域会让「该请求走哪个区」产生歧义，
+// 故必须报错而非静默取其一。重复也包括 api_key 与 api_keys 之间。
+func TestDuplicateAPIKeyRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	fp1 := filepath.Join(dir, "dup_in_list.json")
+	os.WriteFile(fp1, []byte(`{"api_keys":[{"key":"same","region":"cn"},{"key":"same","region":"global"}]}`), 0o600)
+	if _, err := Load(fp1); err == nil {
+		t.Error("want error for duplicate key inside api_keys")
+	}
+
+	fp2 := filepath.Join(dir, "dup_with_legacy.json")
+	os.WriteFile(fp2, []byte(`{"api_key":"same","api_keys":[{"key":"same","region":"cn"}]}`), 0o600)
+	if _, err := Load(fp2); err == nil {
+		t.Error("want error for key duplicated between api_key and api_keys")
+	}
+}
+
+// TestLegacyAPIKeyStillWorks api_key 单独存在时仍生效（向后兼容），且可与 api_keys 共存。
+func TestLegacyAPIKeyStillWorks(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"api_key":"legacy","api_keys":[{"key":"cnk","region":"cn"}]}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.APIKey != "legacy" || len(c.APIKeys) != 1 {
+		t.Errorf("legacy=%q api_keys=%d want legacy/1", c.APIKey, len(c.APIKeys))
+	}
+}

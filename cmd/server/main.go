@@ -4,10 +4,12 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -133,6 +135,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		APIKeys:      serverAPIKeys(cfg.APIKeys),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -156,9 +159,50 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("workbuddy2api listening on %s", cfg.Listen)
+	log.Printf("api keys: %s", describeAPIKeys(cfg))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// serverAPIKeys 把配置里的密钥列表转成 server 包的规范类型。
+// 区域字符串已由 validateAPIKeys 归一化，此处只做类型转换。
+func serverAPIKeys(in []APIKeySpec) []server.APIKeySpec {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]server.APIKeySpec, 0, len(in))
+	for _, k := range in {
+		out = append(out, server.APIKeySpec{Key: k.Key, Region: auth.Region(k.Region), Name: k.Name})
+	}
+	return out
+}
+
+// describeAPIKeys 汇总密钥配置供启动日志排查（只报数量与区域，绝不打印密钥本身）。
+func describeAPIKeys(cfg *Config) string {
+	n := len(cfg.APIKeys)
+	if cfg.APIKey != "" {
+		n++
+	}
+	if n == 0 {
+		return "未配置（不鉴权）"
+	}
+	desc := make([]string, 0, n)
+	if cfg.APIKey != "" {
+		desc = append(desc, "legacy=不限区域")
+	}
+	for _, k := range cfg.APIKeys {
+		region := k.Region
+		if region == "" {
+			region = "不限区域"
+		}
+		name := k.Name
+		if name == "" {
+			name = "-"
+		}
+		desc = append(desc, name+"="+region)
+	}
+	return fmt.Sprintf("%d 个 [%s]", n, strings.Join(desc, ", "))
 }

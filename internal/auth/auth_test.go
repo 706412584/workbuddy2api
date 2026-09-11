@@ -93,3 +93,26 @@ func TestNeedsRefresh(t *testing.T) {
 		t.Error("far future should not need refresh")
 	}
 }
+
+func TestRegion(t *testing.T) {
+	cases := []struct {
+		domain string
+		want   Region
+	}{
+		{"copilot.tencent.com", RegionCN},
+		{"www.codebuddy.cn", RegionCN},
+		{"", RegionCN},                       // 空 domain 向后兼容为 CN
+		{"example.com", RegionCN},            // 未知域名归 CN
+		{"www.workbuddy.ai", RegionGlobal},   // 国外版
+		{"workbuddy.ai", RegionGlobal},       // 裸域名（无前导点）
+		{"api.workbuddy.ai", RegionGlobal},   // 子域
+		{"WWW.WorkBuddy.AI", RegionGlobal},   // 大小写不敏感
+		{" www.workbuddy.ai ", RegionGlobal}, // 前后空白
+	}
+	for _, c := range cases {
+		a := &Auth{Domain: c.domain}
+		if got := a.Region(); got != c.want {
+			t.Errorf("Region(domain=%q) = %q, want %q", c.domain, got, c.want)
+		}
+	}
+}

@@ -30,6 +30,22 @@ const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\"
 	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
 	"data: [DONE]\n\n"
 
+// resetModelsCache 清空两区的动态模型缓存（TTL 缓存 + 失败负缓存）。
+// 动态模型缓存是进程级全局的，跨用例会互相污染，故每个相关用例开头都要清。
+func resetModelsCache() {
+	dynamicModelsCache.mu.Lock()
+	dynamicModelsCache.cn = modelsSlot{}
+	dynamicModelsCache.global = modelsSlot{}
+	dynamicModelsCache.mu.Unlock()
+}
+
+// cachedModelCount 返回该区域当前缓存的动态模型数。
+func cachedModelCount(r auth.Region) int {
+	dynamicModelsCache.mu.RLock()
+	defer dynamicModelsCache.mu.RUnlock()
+	return len(dynamicModelsCache.slot(r).ids)
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {
@@ -610,11 +626,7 @@ func TestModelsEndpoint(t *testing.T) {
 
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -663,21 +675,14 @@ func TestModelsDynamic(t *testing.T) {
 	}
 
 	// 第二次调用走缓存（把上游关掉也成功）
-	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
-	dynamicModelsCache.RUnlock()
-	if cached != 3 {
+	if cached := cachedModelCount(auth.RegionCN); cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
 	}
 }
 
 func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游 500
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -701,11 +706,7 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 
 func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
@@ -726,11 +727,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -754,9 +751,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.lastFail = time.Now().Add(-10 * time.Minute)
-	dynamicModelsCache.Unlock()
+	dynamicModelsCache.mu.Lock()
+	dynamicModelsCache.slot(auth.RegionCN).lastFail = time.Now().Add(-10 * time.Minute)
+	dynamicModelsCache.mu.Unlock()
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
@@ -1066,5 +1063,416 @@ func TestStatusRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("healthz: code=%d", rec.Code)
+	}
+}
+
+// cnAuth / globalAuth 构造两区账号，便于区域路由用例。
+func cnAuth(uid, at string) *auth.Auth {
+	return &auth.Auth{UID: uid, AccessToken: at, ExpiresAt: 9999999999, Domain: "copilot.tencent.com"}
+}
+
+func globalAuth(uid, at string) *auth.Auth {
+	return &auth.Auth{UID: uid, AccessToken: at, ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"}
+}
+
+// TestChatRoutesModelToOwningRegion 请求应只发给支持该模型的区域账号。
+// 注意：实测 global 可用的 13 个模型在 CN 均存在，因此「区域限制」实际只表现为
+// 「CN 独有模型不得发给 global 账号」；反向由 TestChatNoMatchingRegionReturns503 覆盖。
+func TestChatRoutesModelToOwningRegion(t *testing.T) {
+	// 注意：global 的模型列表接口恒 500，其上可能还有未探测到的独有模型，
+	// 因此路由表只收录已证实的映射，未知模型一律不限制。
+	cases := []struct {
+		model    string
+		wantAuth string // 期望被调用的账号 AccessToken；空 = 两区皆可，不做断言
+	}{
+		{"deepseek-v4-pro", "Bearer at-cn"}, // CN 独有（global 调它报 11102）
+		{"hunyuan-chat", "Bearer at-cn"},    // CN 独有
+		{"deepseek-v4.1-flash", ""},         // 两区都有
+		{"glm-5.2", ""},                     // 两区都有
+	}
+	for _, c := range cases {
+		t.Run(c.model, func(t *testing.T) {
+			var got []string
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				got = append(got, authz)
+				return 200, sseOK, true
+			})
+			p := testPoolWith(
+				cnAuth("cn", "at-cn"),
+				globalAuth("intl", "at-intl"),
+			)
+			h := NewHandler(Config{Pool: p, Upstream: up})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"`+c.model+`","messages":[{"role":"user","content":"hi"}]}`)))
+			if rec.Code != 200 {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			if len(got) == 0 {
+				t.Fatal("no upstream call")
+			}
+			if c.wantAuth != "" && got[0] != c.wantAuth {
+				t.Fatalf("upstream called with %v, want first=%s (model %s 必须路由到其所属区域)",
+					got, c.wantAuth, c.model)
+			}
+			// CN 独有模型绝不能被发给 global 账号（否则上游 11102）。
+			if c.wantAuth == "Bearer at-cn" {
+				for _, a := range got {
+					if a == "Bearer at-intl" {
+						t.Fatalf("CN 独有模型 %s 被发给了 global 账号: %v", c.model, got)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestChatNoMatchingRegionReturns503 池中无该区域账号时应返回 503 且说明原因，
+// 而不是退化去调用错误区域的账号。
+func TestChatNoMatchingRegionReturns503(t *testing.T) {
+	called := false
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		called = true
+		return 200, sseOK, true
+	})
+	// 池中只有 global 账号，却请求 CN 独有模型。
+	p := testPoolWith(globalAuth("intl", "at-intl"))
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503 body=%s", rec.Code, rec.Body)
+	}
+	if called {
+		t.Error("must not call upstream when no account in the model's region")
+	}
+	if !strings.Contains(rec.Body.String(), "deepseek-v4-pro") {
+		t.Errorf("503 body should name the model: %s", rec.Body)
+	}
+}
+
+// TestChatUnknownModelNotRegionRestricted 未收录的模型不作区域限制（向前兼容上游新增模型）。
+func TestChatUnknownModelNotRegionRestricted(t *testing.T) {
+	var got []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		got = append(got, authz)
+		return 200, sseOK, true
+	})
+	// 只有 global 账号，模型表未收录 → 应照常服务。
+	p := testPoolWith(globalAuth("intl", "at-intl"))
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"brand-new-model-9000","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d want 200 body=%s", rec.Code, rec.Body)
+	}
+	if len(got) != 1 || got[0] != "Bearer at-intl" {
+		t.Errorf("upstream calls=%v want [Bearer at-intl]", got)
+	}
+}
+
+// TestModelsListIsUnionOfPoolRegions /v1/models 应返回池中两区模型的并集：
+// 仅 global 账号时列出 global 模型（不列 CN 独有），混池时两区并集去重。
+func TestModelsListIsUnionOfPoolRegions(t *testing.T) {
+	modelIDs := func(rec *httptest.ResponseRecorder) map[string]bool {
+		var resp map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		ids := map[string]bool{}
+		for _, m := range resp["data"].([]any) {
+			ids[m.(map[string]any)["id"].(string)] = true
+		}
+		return ids
+	}
+	// 让动态接口失败，走静态表以便断言确定内容。
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 500, `boom`, false
+	})
+
+	// 只有 CN 账号 → 只有 CN 静态表，不含 global 独有的 hy4-preview-x。
+	resetModelsCache()
+	h := NewHandler(Config{Pool: testPoolWith(cnAuth("cn", "at-cn")), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	ids := modelIDs(rec)
+	if !ids["deepseek-v4-pro"] {
+		t.Error("CN 账号池应含 deepseek-v4-pro")
+	}
+	if ids["hy4-preview-x"] {
+		t.Error("只挂 CN 账号时不应列出 global 独有的 hy4-preview-x")
+	}
+
+	// 混池 → 两区并集。
+	resetModelsCache()
+	h = NewHandler(Config{Pool: testPoolWith(cnAuth("cn", "at-cn"), globalAuth("intl", "at-intl")), Upstream: up})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	ids = modelIDs(rec)
+	if !ids["deepseek-v4-pro"] || !ids["hy4-preview-x"] {
+		t.Errorf("混池应含两区模型: deepseek-v4-pro=%v hy4-preview-x=%v", ids["deepseek-v4-pro"], ids["hy4-preview-x"])
+	}
+
+	// 只有 global 账号 → 不含 CN 独有的 deepseek-v4-pro。
+	resetModelsCache()
+	h = NewHandler(Config{Pool: testPoolWith(globalAuth("intl", "at-intl")), Upstream: up})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	ids = modelIDs(rec)
+	if ids["deepseek-v4-pro"] {
+		t.Error("只挂 global 账号时不应列出 CN 独有的 deepseek-v4-pro")
+	}
+	if !ids["hy4-preview-x"] {
+		t.Error("global 账号池应含 hy4-preview-x")
+	}
+}
+
+// TestRegionsForModel 路由表与未知模型回退的单元断言。
+func TestRegionsForModel(t *testing.T) {
+	if got := regionsForModel(""); got != nil {
+		t.Errorf("empty model → %v want nil (不限制)", got)
+	}
+	if got := regionsForModel("totally-unknown"); got != nil {
+		t.Errorf("unknown model → %v want nil (不限制)", got)
+	}
+	if got := regionsForModel("deepseek-v4-pro"); len(got) != 1 || got[0] != auth.RegionCN {
+		t.Errorf("deepseek-v4-pro → %v want [cn]", got)
+	}
+	// 实测：global 可用的模型在 CN 均存在（hy4-preview-x 即两区共有），
+	// 故此处断言两区，而非仅 global。
+	if got := regionsForModel("hy4-preview-x"); len(got) != 2 {
+		t.Errorf("hy4-preview-x → %v want 两区共有", got)
+	}
+	// 两区共有：cn 在前（升序），且不得重复。
+	got := regionsForModel("deepseek-v4.1-flash")
+	if len(got) != 2 || got[0] != auth.RegionCN || got[1] != auth.RegionGlobal {
+		t.Errorf("deepseek-v4.1-flash → %v want [cn global]", got)
+	}
+	if pred := regionAllowed(nil); pred != nil {
+		t.Error("regionAllowed(nil) 应为 nil = 不过滤")
+	}
+}
+
+// ── API key 绑定区域 ──────────────────────────────────────────────
+
+// TestConstrainRegions 单元断言四种组合（密钥不限区域 / 密钥绑定 + 模型不限 /
+// 密钥绑定 + 模型有限取交集 / 无交集）。
+func TestConstrainRegions(t *testing.T) {
+	cnOnly := []auth.Region{auth.RegionCN}
+	both := []auth.Region{auth.RegionCN, auth.RegionGlobal}
+	cnKey := &APIKeySpec{Key: "k", Region: auth.RegionCN}
+	globalKey := &APIKeySpec{Key: "g", Region: auth.RegionGlobal}
+	freeKey := &APIKeySpec{Key: "f"}
+
+	cases := []struct {
+		name   string
+		model  []auth.Region
+		key    *APIKeySpec
+		want   []auth.Region
+		wantOK bool
+	}{
+		{"密钥不限区域+模型有限 → 原样", cnOnly, freeKey, cnOnly, true},
+		{"密钥不限区域+模型未知 → 仍不限制", nil, freeKey, nil, true},
+		{"无密钥(不鉴权)+模型未知 → 不限制", nil, nil, nil, true},
+		{"密钥CN+模型未知 → 收敛为CN", nil, cnKey, []auth.Region{auth.RegionCN}, true},
+		{"密钥CN+模型CN → 交集CN", cnOnly, cnKey, []auth.Region{auth.RegionCN}, true},
+		{"密钥CN+模型两区 → 交集CN", both, cnKey, []auth.Region{auth.RegionCN}, true},
+		{"密钥CN+模型仅global → 无交集", []auth.Region{auth.RegionGlobal}, cnKey, nil, false},
+		{"密钥global+模型仅CN → 无交集", cnOnly, globalKey, nil, false},
+		{"密钥global+模型两区 → 交集global", both, globalKey, []auth.Region{auth.RegionGlobal}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := constrainRegions(c.model, c.key)
+			if ok != c.wantOK {
+				t.Fatalf("ok=%v want %v (got=%v)", ok, c.wantOK, got)
+			}
+			if len(got) != len(c.want) {
+				t.Fatalf("regions=%v want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("regions=%v want %v", got, c.want)
+				}
+			}
+		})
+	}
+}
+
+// keysPool 构造 CN + global 双账号池，并把 global 账号权重拉高：
+// 若区域约束失效，global 账号会因权重最高而被优先选中，从而暴露问题。
+func keysPool() *pool.Pool {
+	p := testPoolWith(
+		cnAuth("cn", "at-cn"),
+		globalAuth("intl", "at-intl"),
+	)
+	p.SetCredits("intl", 999999)
+	p.SetCredits("cn", 1)
+	return p
+}
+
+// TestAPIKeyRegionBindsAccount 绑定的密钥必须只用本区账号：
+// 即便另一区账号权重远高，也必须被排除。
+func TestAPIKeyRegionBindsAccount(t *testing.T) {
+	cases := []struct {
+		name     string
+		key      string
+		wantAuth string
+	}{
+		{"cn 密钥", "k-cn", "Bearer at-cn"},
+		{"global 密钥", "k-global", "Bearer at-intl"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var got []string
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				got = append(got, authz)
+				return 200, sseOK, true
+			})
+			h := NewHandler(Config{Pool: keysPool(), Upstream: up, APIKeys: []APIKeySpec{
+				{Key: "k-cn", Region: auth.RegionCN, Name: "cn"},
+				{Key: "k-global", Region: auth.RegionGlobal, Name: "global"},
+			}})
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("Authorization", "Bearer "+c.key)
+			h.ServeHTTP(rec, req)
+			if rec.Code != 200 {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			if len(got) != 1 || got[0] != c.wantAuth {
+				t.Fatalf("upstream calls=%v want [%s]（密钥区域约束失效，可能跑到了另一区）", got, c.wantAuth)
+			}
+		})
+	}
+}
+
+// TestAPIKeyRegionRejectsModelFromOtherRegion 区域密钥请求不属于其区域的模型 → 404，
+// 且不得调用上游（该模型对此密钥根本不存在）。
+func TestAPIKeyRegionRejectsModelFromOtherRegion(t *testing.T) {
+	called := false
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		called = true
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: keysPool(), Upstream: up, APIKeys: []APIKeySpec{
+		{Key: "k-global", Region: auth.RegionGlobal},
+	}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)) // 仅 CN 可用
+	req.Header.Set("Authorization", "Bearer k-global")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code=%d want 404 body=%s", rec.Code, rec.Body)
+	}
+	if called {
+		t.Error("must not call upstream: 该模型对此密钥不存在")
+	}
+	// 错误体不得泄露区域结构。
+	if body := rec.Body.String(); strings.Contains(body, "region") || strings.Contains(body, "cn") {
+		t.Errorf("404 body 不应泄露区域信息: %s", body)
+	}
+}
+
+// TestAPIKeyRegionFiltersModels 区域密钥的 /v1/models 只含本区模型。
+func TestAPIKeyRegionFiltersModels(t *testing.T) {
+	modelIDs := func(key string) map[string]bool {
+		resetModelsCache()
+		up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+			return 500, `boom`, false // 走静态表，内容确定
+		})
+		h := NewHandler(Config{Pool: keysPool(), Upstream: up, APIKeys: []APIKeySpec{
+			{Key: "k-cn", Region: auth.RegionCN},
+			{Key: "k-global", Region: auth.RegionGlobal},
+		}})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+		var resp map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		ids := map[string]bool{}
+		for _, m := range resp["data"].([]any) {
+			ids[m.(map[string]any)["id"].(string)] = true
+		}
+		return ids
+	}
+
+	cn := modelIDs("k-cn")
+	if !cn["deepseek-v4-pro"] {
+		t.Error("cn 密钥应含 deepseek-v4-pro")
+	}
+	if cn["hy4-preview-x"] {
+		t.Error("cn 密钥不应含 global 独有模型")
+	}
+
+	global := modelIDs("k-global")
+	if !global["hy4-preview-x"] {
+		t.Error("global 密钥应含 hy4-preview-x")
+	}
+	if global["deepseek-v4-pro"] {
+		t.Error("global 密钥不应含 CN 独有模型 deepseek-v4-pro")
+	}
+}
+
+// TestAPIKeyRegionFiltersStatus 区域密钥的 /status 只看到本区账号，计数口径同步。
+func TestAPIKeyRegionFiltersStatus(t *testing.T) {
+	statusUIDs := func(key string) (ids map[string]bool, total float64) {
+		up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+		h := NewHandler(Config{Pool: keysPool(), Upstream: up, APIKeys: []APIKeySpec{
+			{Key: "k-cn", Region: auth.RegionCN},
+			{Key: "k-global", Region: auth.RegionGlobal},
+			{Key: "k-any"}, // 不限区域
+		}})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/status", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+		var resp map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		ids = map[string]bool{}
+		for _, a := range resp["accounts"].([]any) {
+			ids[a.(map[string]any)["uid"].(string)] = true
+		}
+		return ids, resp["total"].(float64)
+	}
+
+	cn, cnTotal := statusUIDs("k-cn")
+	if len(cn) != 1 || !cn["cn"] || cnTotal != 1 {
+		t.Errorf("cn 密钥 status: accounts=%v total=%v want 仅 cn/1", cn, cnTotal)
+	}
+	global, globalTotal := statusUIDs("k-global")
+	if len(global) != 1 || !global["intl"] || globalTotal != 1 {
+		t.Errorf("global 密钥 status: accounts=%v total=%v want 仅 intl/1", global, globalTotal)
+	}
+	// 不限区域密钥仍看到全部（改造前行为）。
+	all, allTotal := statusUIDs("k-any")
+	if len(all) != 2 || allTotal != 2 {
+		t.Errorf("不限区域密钥 status: accounts=%v total=%v want 2 个/2", all, allTotal)
+	}
+}
+
+// TestUnknownAPIKeyRejected 未登记的密钥仍 401。
+func TestUnknownAPIKeyRejected(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: keysPool(), Upstream: up, APIKeys: []APIKeySpec{
+		{Key: "k-cn", Region: auth.RegionCN},
+	}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer nope")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code=%d want 401", rec.Code)
 	}
 }

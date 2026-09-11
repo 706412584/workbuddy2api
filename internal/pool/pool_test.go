@@ -1475,3 +1475,141 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 	}
 	p.Release("u1")
 }
+
+// regionPred 构造按区域过滤的谓词，模拟 handler 的模型→区域路由。
+func regionPred(want auth.Region) func(*auth.Auth) bool {
+	return func(a *auth.Auth) bool { return a.Region() == want }
+}
+
+func TestPickExcludingWhereFiltersByRegion(t *testing.T) {
+	withNoPickGap(t)
+	// 不允许区域的账号积分更高：若不生效会被选中，从而暴露过滤失效。
+	p := New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // 恒选权重第一 → 确定性
+	p.Add(&auth.Auth{UID: "cn", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl", Domain: "www.workbuddy.ai"})
+	p.SetCredits("cn", 5000)
+	p.SetCredits("intl", 100)
+
+	got := p.PickExcludingWhere(nil, regionPred(auth.RegionGlobal))
+	if got == nil || got.UID != "intl" {
+		t.Fatalf("pick=%+v want intl (区域过滤必须排除积分更高的 cn)", got)
+	}
+	got = p.PickExcludingWhere(nil, regionPred(auth.RegionCN))
+	if got == nil || got.UID != "cn" {
+		t.Fatalf("pick=%+v want cn", got)
+	}
+	// pred=nil 不限区域 → 高积分 cn 胜出。
+	if got = p.PickExcludingWhere(nil, nil); got == nil || got.UID != "cn" {
+		t.Fatalf("pick=%+v want cn (nil 谓词不过滤)", got)
+	}
+}
+
+func TestPickExcludingWhereNoMatchReturnsNil(t *testing.T) {
+	// 池中只有 CN 账号，却只要 global → 无候选。此时不得回落越区选号。
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "cn2", Domain: ""})
+	p.SetCredits("cn1", 100)
+	if got := p.PickExcludingWhere(nil, regionPred(auth.RegionGlobal)); got != nil {
+		t.Fatalf("pick=%+v want nil (无 global 账号，不得越区)", got)
+	}
+}
+
+func TestPickExcludingWhereRespectsPredOnCooldownFallback(t *testing.T) {
+	// 全员冷却时走 pickEarliestExpiryLocked 兜底，谓词仍须生效——
+	// 漏掉这处会让区域受限请求兜底到错误区域的账号。
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl", Domain: "www.workbuddy.ai"})
+	// 冷却时长错开，避免兜底在到期时间相同时依赖 map 遍历序。
+	p.Cooldown("intl", CoolSoft, time.Hour, "x")
+	p.Cooldown("cn", CoolSoft, 30*time.Minute, "x") // cn 更早到期，是「优先兜底」对象
+
+	// 只要 global：必须绕开更早到期的 cn，选中 intl。
+	got := p.PickExcludingWhere(nil, regionPred(auth.RegionGlobal))
+	if got == nil || got.UID != "intl" {
+		t.Fatalf("fallback pick=%+v want intl (兜底不得越区到更早到期的 cn)", got)
+	}
+	// 只要 CN：即便 intl 冷却更晚，也应选中 cn。
+	got = p.PickExcludingWhere(nil, regionPred(auth.RegionCN))
+	if got == nil || got.UID != "cn" {
+		t.Fatalf("fallback pick=%+v want cn", got)
+	}
+	// 无匹配区域 → nil，且不得退化为「随便给一个」。
+	if got := p.PickExcludingWhere(nil, func(*auth.Auth) bool { return false }); got != nil {
+		t.Fatalf("fallback pick=%+v want nil", got)
+	}
+}
+
+func TestPickByUIDWhereEnforcesPredicate(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl", Domain: "www.workbuddy.ai"})
+
+	// 区域匹配 → 正常返回。
+	if got := p.PickByUIDWhere("intl", regionPred(auth.RegionGlobal)); got == nil || got.UID != "intl" {
+		t.Fatalf("pick=%+v want intl", got)
+	}
+	// 区域不匹配 → nil（供 handler 解绑粘性号并回落轮换）。
+	if got := p.PickByUIDWhere("cn", regionPred(auth.RegionGlobal)); got != nil {
+		t.Fatalf("pick=%+v want nil (粘性号区域不符)", got)
+	}
+	// pred=nil 保持原语义。
+	if got := p.PickByUIDWhere("cn", nil); got == nil || got.UID != "cn" {
+		t.Fatalf("pick=%+v want cn (nil 谓词不过滤)", got)
+	}
+}
+
+func TestListWhereFiltersByRegion(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn", Domain: "copilot.tencent.com", Nickname: "国内号"})
+	p.Add(&auth.Auth{UID: "intl", Domain: "www.workbuddy.ai", Nickname: "国外号"})
+
+	// pred=nil 返回全部（List 的原语义）。
+	if got := p.ListWhere(nil); len(got) != 2 {
+		t.Fatalf("ListWhere(nil)=%d want 2", len(got))
+	}
+	if got := p.List(); len(got) != 2 {
+		t.Fatalf("List()=%d want 2（应等同 ListWhere(nil)）", len(got))
+	}
+
+	cnList := p.ListWhere(regionPred(auth.RegionCN))
+	if len(cnList) != 1 || cnList[0].UID != "cn" {
+		t.Fatalf("CN 过滤结果=%+v want 仅 cn", cnList)
+	}
+	// Status 应透出区域，供 /status 观察每个账号属哪一区。
+	if cnList[0].Region != "cn" {
+		t.Errorf("Status.Region=%q want cn", cnList[0].Region)
+	}
+	intlList := p.ListWhere(regionPred(auth.RegionGlobal))
+	if len(intlList) != 1 || intlList[0].UID != "intl" || intlList[0].Region != "global" {
+		t.Fatalf("global 过滤结果=%+v want 仅 intl/global", intlList)
+	}
+}
+
+func TestCountsDetailedWhereFiltersByRegion(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "cn2", Domain: ""})
+	p.Add(&auth.Auth{UID: "intl", Domain: "www.workbuddy.ai"})
+	p.Cooldown("intl", CoolSoft, time.Hour, "x") // intl 计为 cooling
+
+	total, healthy, cooling, disabled, _ := p.CountsDetailedWhere(nil)
+	if total != 3 || healthy != 2 || cooling != 1 || disabled != 0 {
+		t.Errorf("不筛选: total=%d healthy=%d cooling=%d disabled=%d want 3/2/1/0",
+			total, healthy, cooling, disabled)
+	}
+
+	// 计数口径必须与账号列表口径一致：CN 只见 2 个账号、全 healthy、无 cooling。
+	total, healthy, cooling, disabled, inFlight := p.CountsDetailedWhere(regionPred(auth.RegionCN))
+	if total != 2 || healthy != 2 || cooling != 0 || disabled != 0 || inFlight != 0 {
+		t.Errorf("CN 筛选: total=%d healthy=%d cooling=%d disabled=%d inFlight=%d want 2/2/0/0/0",
+			total, healthy, cooling, disabled, inFlight)
+	}
+	// 反向：global 只见 1 个且处于冷却，不得把 CN 的 healthy 计进来。
+	total, healthy, cooling, _, _ = p.CountsDetailedWhere(regionPred(auth.RegionGlobal))
+	if total != 1 || healthy != 0 || cooling != 1 {
+		t.Errorf("global 筛选: total=%d healthy=%d cooling=%d want 1/0/1", total, healthy, cooling)
+	}
+}

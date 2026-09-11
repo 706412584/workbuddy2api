@@ -1,6 +1,10 @@
 {
   "listen": ":7863",
   "api_key": "your-api-key-here",
+  "api_keys": [
+    {"key": "your-cn-key-here", "region": "cn", "name": "cn"},
+    {"key": "your-global-key-here", "region": "global", "name": "global"}
+  ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "cooldown": {

@@ -251,6 +251,44 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	}
 }
 
+// TestRunCheckinSkipsGlobalRegion global（workbuddy.ai）账号无签到活动：
+// 应跳过 DailyCheckin（避免每次都拿到 code=10001 噪音错误），但余额查询照常执行。
+func TestRunCheckinSkipsGlobalRegion(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 85}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	global := &auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"}
+	cn := &auth.Auth{UID: "c1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: 9999999999, Domain: "copilot.tencent.com"}
+	p.Add(global)
+	p.Add(cn)
+
+	up := &upstream.Client{
+		HTTP:           srv.Client(),
+		ChatBaseCN:     srv.URL,
+		BillingBaseCN:  srv.URL,
+		ChatBaseGlobal: srv.URL,
+		BillingBaseGl:  srv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+	s.RunCheckinNow()
+
+	// 只有 CN 账号签到；global 被跳过。
+	if got := f.checkinCalls.Load(); got != 1 {
+		t.Errorf("checkin calls=%d want 1（global 应被跳过，仅 CN 签到）", got)
+	}
+	// 两个账号都应拿到余额（余额查询不因区域跳过）。
+	for _, uid := range []string{"g1", "c1"} {
+		st, _ := p.Status(uid)
+		if st.Credits != 85 {
+			t.Errorf("%s credits=%d want 85（余额查询应照常执行）", uid, st.Credits)
+		}
+	}
+}
+
 func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 	f := &fakeUpstream{}
 	srv := f.server()

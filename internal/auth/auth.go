@@ -27,6 +27,29 @@ type Auth struct {
 	FilePath     string // 来源文件；refresh 后原子写回此处
 }
 
+// Region 账号所属的上游区域。区域由凭证的 domain 字段推导，
+// 因此同一账号池可混放国内版与国外版账号，无需全局配置。
+type Region string
+
+const (
+	// RegionCN 国内版（codebuddy.cn / copilot.tencent.com）。
+	RegionCN Region = "cn"
+	// RegionGlobal 国外版（workbuddy.ai）。
+	RegionGlobal Region = "global"
+)
+
+// globalSuffix 判定国外版账号的域名后缀；子域（如 www./api.）也属于国外版。
+const globalSuffix = ".workbuddy.ai"
+
+// Region 返回账号所属区域。domain 为空视为 CN（向后兼容旧凭证）。
+func (a *Auth) Region() Region {
+	d := strings.ToLower(strings.TrimSpace(a.Domain))
+	if d == strings.TrimPrefix(globalSuffix, ".") || strings.HasSuffix(d, globalSuffix) {
+		return RegionGlobal
+	}
+	return RegionCN
+}
+
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
 

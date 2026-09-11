@@ -327,16 +327,82 @@ func TestDailyCheckinAlready(t *testing.T) {
 	}
 }
 
-func TestBasesAlwaysCN(t *testing.T) {
+// TestBasesByRegion 上游 base 与 Origin 按账号区域选择：
+// workbuddy.ai 域走全局 base，其余（含空 domain）走 CN base。
+func TestBasesByRegion(t *testing.T) {
 	c := testClient(nil)
+	c.ChatBaseGlobal = "https://chat.global"
+	c.BillingBaseGl = "https://billing.global"
+
 	cn := &auth.Auth{Domain: ""}
-	other := &auth.Auth{Domain: "example.com"}
+	unknown := &auth.Auth{Domain: "example.com"}
+	global := &auth.Auth{Domain: "www.workbuddy.ai"}
+
 	if c.chatBase(cn) != "https://chat.example" || c.billingBase(cn) != "https://billing.example" {
-		t.Error("cn bases wrong")
+		t.Errorf("cn bases wrong: %s %s", c.chatBase(cn), c.billingBase(cn))
 	}
-	// 恒 CN：domain 不同不改变上游 host。
-	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
-		t.Error("bases must be CN regardless of domain")
+	// 未知域名归 CN。
+	if c.chatBase(unknown) != c.chatBase(cn) || c.billingBase(unknown) != c.billingBase(cn) {
+		t.Error("unknown domain must fall back to CN bases")
+	}
+	// 全局账号走全局 base。
+	if c.chatBase(global) != "https://chat.global" || c.billingBase(global) != "https://billing.global" {
+		t.Errorf("global bases wrong: %s %s", c.chatBase(global), c.billingBase(global))
+	}
+
+	// Origin/Referer 同源按区域切换。
+	if got := originRefererFor(global); got != originRefererGlob {
+		t.Errorf("global origin=%q want %q", got, originRefererGlob)
+	}
+	if got := originRefererFor(cn); got != originRefererCN {
+		t.Errorf("cn origin=%q want %q", got, originRefererCN)
+	}
+	if got := originRefererFor(nil); got != originRefererCN {
+		t.Errorf("nil auth origin=%q want CN", got)
+	}
+}
+
+// TestEffortsCacheIsolatedByRegion 两个区域的 effort 缓存必须互不覆盖：
+// FetchModels 只替换所查账号区域的槽位。
+func TestEffortsCacheIsolatedByRegion(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models") {
+			// 两区返回同一模型但档位不同，以区分来源。
+			efforts := `["low","high"]`
+			if strings.Contains(r.Header.Get("Referer"), "workbuddy.ai") {
+				efforts = `["medium"]`
+			}
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"supportedEfforts":`+efforts+`}}
+			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
+		}
+		return jsonResp(200, `{"code":0}`), nil
+	})
+	c.ChatBaseGlobal = "https://chat.global"
+
+	cn := &auth.Auth{AccessToken: "at", UID: "cn", Domain: ""}
+	global := &auth.Auth{AccessToken: "at", UID: "g", Domain: "www.workbuddy.ai"}
+
+	if _, err := c.FetchModels(cn); err != nil {
+		t.Fatalf("fetch cn: %v", err)
+	}
+	if _, err := c.FetchModels(global); err != nil {
+		t.Fatalf("fetch global: %v", err)
+	}
+
+	// 拉取 global 后，CN 的档位不得被覆盖。
+	if got := c.effortsSnapshot(cn); len(got["glm-5.2"]) != 2 {
+		t.Errorf("cn efforts=%v want 2 档（被 global 覆盖？）", got["glm-5.2"])
+	}
+	if got := c.effortsSnapshot(global); len(got["glm-5.2"]) != 1 || got["glm-5.2"][0] != "medium" {
+		t.Errorf("global efforts=%v want [medium]", got["glm-5.2"])
+	}
+	// 反向：重新拉 CN 也不得抹掉 global。
+	if _, err := c.FetchModels(cn); err != nil {
+		t.Fatalf("refetch cn: %v", err)
+	}
+	if got := c.effortsSnapshot(global); len(got["glm-5.2"]) != 1 {
+		t.Errorf("global efforts after cn refetch=%v want [medium]", got["glm-5.2"])
 	}
 }
 

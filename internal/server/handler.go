@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +18,30 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+// APIKeySpec 一个 API key 及其绑定的上游区域。
+// Region 为空表示不限区域（等价于旧的单一 api_key 行为）；绑定后该密钥的请求
+// 只会使用对应区域的账号，其 /v1/models 与 /status 也按该区域过滤。
+type APIKeySpec struct {
+	Key    string      `json:"key"`
+	Region auth.Region `json:"region"`
+	Name   string      `json:"name"` // 可选，用于日志/排查标识
+}
+
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// APIKey 旧版单一密钥（空 = 不鉴权）。保留以兼容既有配置；
+	// 语义等价于 APIKeys 中 Region 为空的一项（不限区域）。
+	APIKey string
+	// APIKeys 多密钥列表，每项可绑定区域。与 APIKey 合并生效；
+	// 两者皆空 = 不鉴权。
+	APIKeys   []APIKeySpec
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
+	// 注意：该计数是全局的，不随密钥区域过滤（router 未按区域记账）。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
 	RedisMode    string
@@ -46,8 +62,9 @@ const ServiceName = "workbuddy2api"
 
 // Handler 主路由。
 type Handler struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg  Config
+	mux  *http.ServeMux
+	keys []APIKeySpec // 合并后的生效密钥（旧 APIKey → 不限区域项）；空 = 不鉴权
 }
 
 // NewHandler 构建 handler。
@@ -62,6 +79,11 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 旧 api_key 视为「不限区域」的一项，与 api_keys 列表合并。
+	if cfg.APIKey != "" {
+		h.keys = append(h.keys, APIKeySpec{Key: cfg.APIKey, Name: "legacy"})
+	}
+	h.keys = append(h.keys, cfg.APIKeys...)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -73,16 +95,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+// authedHandler 需要知道「哪个密钥发起了请求」的处理器。
+// key 为 nil 表示未鉴权（未配置任何密钥）。
+type authedHandler func(w http.ResponseWriter, r *http.Request, key *APIKeySpec)
+
+// withAuth 校验 Bearer 密钥并把命中的 spec 传给处理器。
+// 密钥用 == 比较而非恒定时间比较：与改造前一致，不引入新的行为差异。
+func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" {
-			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") || strings.TrimPrefix(authz, "Bearer ") != h.cfg.APIKey {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		if len(h.keys) == 0 {
+			next(w, r, nil) // 未配置密钥 = 不鉴权、不限区域
+			return
+		}
+		authz := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authz, "Bearer ") {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		token := strings.TrimPrefix(authz, "Bearer ")
+		for i := range h.keys {
+			if h.keys[i].Key == token {
+				next(w, r, &h.keys[i])
 				return
 			}
 		}
-		next(w, r)
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 	}
 }
 
@@ -103,8 +140,12 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+// status 返回账号池观测信息。绑定区域的密钥只看到该区域的账号与计数；
+// 未绑定区域的密钥看到全部（改造前行为）。
+// sticky_sessions 例外：该计数来自 router 的全局记账，不随区域过滤。
+func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
+	pred := keyRegionPred(key)
+	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailedWhere(pred)
 	sticky := 0
 	if h.cfg.StickyCount != nil {
 		sticky = h.cfg.StickyCount()
@@ -114,7 +155,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		redisMode = "noop"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":        h.cfg.Pool.List(),
+		"accounts":        h.cfg.Pool.ListWhere(pred),
 		"total":           total,
 		"healthy":         healthy,
 		"cooling":         cooling,
@@ -125,8 +166,17 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// keyRegionPred 把密钥绑定的区域编译成账号谓词；未绑定区域返回 nil（=不过滤）。
+// 复用 regionAllowed，使「密钥区域」与「模型区域」共用同一套判定语义。
+func keyRegionPred(key *APIKeySpec) func(*auth.Auth) bool {
+	if key == nil || key.Region == "" {
+		return nil
+	}
+	return regionAllowed([]auth.Region{key.Region})
+}
+
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
-var staticModels = []map[string]any{
+var staticModelsCN = []map[string]any{
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
@@ -139,13 +189,141 @@ var staticModels = []map[string]any{
 	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 }
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
-	sync.RWMutex
+// 静态 global（workbuddy.ai）模型表。
+// 该表必须存在且准确：intl 的动态模型接口 /console/enterprises/personal/models
+// 实测恒 500（重试 3/3），因此 intl 必然回退到本表。
+// 内容为 2026-09 用真实 intl 凭证逐个模型实测「可用」的结果。
+// 注意 global 不含 deepseek-v4-flash / deepseek-v4-pro（调用报 code=11102 service info not found）。
+var staticModelsGlobal = []map[string]any{
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k2.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy4-preview-x", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "auto", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+}
+
+// modelRegions 模型 → 支持它的区域集合（区域路由表）。
+// 来源：2026-09 实测。CN 取自动态接口的 cli agent 列表；global 为逐个模型实调结果。
+// 存在的意义：两区模型阵容不同，把请求发给不支持的域名会拿到 401 / code=11102。
+var modelRegions = func() map[string]map[auth.Region]bool {
+	m := map[string]map[auth.Region]bool{}
+	add := func(r auth.Region, ids ...string) {
+		for _, id := range ids {
+			if m[id] == nil {
+				m[id] = map[auth.Region]bool{}
+			}
+			m[id][r] = true
+		}
+	}
+	add(auth.RegionCN,
+		"auto", "default",
+		"deepseek-v3-2-volc", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash",
+		"glm-4.6", "glm-4.6v", "glm-4.7", "glm-5.0", "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash", "glm-5v-turbo",
+		"hunyuan-2.0-thinking", "hunyuan-chat", "hunyuan-image-v3.0",
+		"hy3", "hy3-x", "hy4-preview", "hy4-preview-x",
+		"kimi-k2-thinking", "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k3-1",
+		"minimax-m2.5", "minimax-m3",
+	)
+	add(auth.RegionGlobal,
+		"auto", "deepseek-v4.1-flash",
+		"glm-5.1", "glm-5.2", "glm-5.3", "glm-5v-turbo",
+		"hy3", "hy4-preview", "hy4-preview-x",
+		"kimi-k2.5", "kimi-k2.6", "kimi-k2.7",
+		"minimax-m3",
+	)
+	return m
+}()
+
+// regionsForModel 返回支持该模型的区域；未知模型返回 nil，语义为「不作限制」
+// （向前兼容上游新增模型：宁可让它按普通轮换试一次，也不要因表未收录而直接拒绝）。
+func regionsForModel(model string) []auth.Region {
+	if model == "" {
+		return nil
+	}
+	set := modelRegions[model]
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]auth.Region, 0, len(set))
+	for r := range set {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// constrainRegions 把「模型允许的区域」与「密钥绑定的区域」取交集。
+// 返回的第二个值为 false 表示无交集——该模型对此密钥不存在，调用方应报 404。
+//
+// 四种组合：
+//   - 密钥不限区域 → 原样返回模型区域（nil 仍为 nil，即不限制）
+//   - 密钥绑定 + 模型不限区域（nil）→ 收敛为密钥区域
+//   - 密钥绑定 + 模型有区域 → 求交集
+//   - 交集为空 → (nil, false)
+func constrainRegions(modelRegions []auth.Region, key *APIKeySpec) ([]auth.Region, bool) {
+	if key == nil || key.Region == "" {
+		return modelRegions, true
+	}
+	if len(modelRegions) == 0 {
+		return []auth.Region{key.Region}, true
+	}
+	out := make([]auth.Region, 0, len(modelRegions))
+	for _, r := range modelRegions {
+		if r == key.Region {
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// regionAllowed 把允许区域编译成选号谓词；allowed 为空（模型未知）时返回 nil = 不过滤。
+func regionAllowed(allowed []auth.Region) func(*auth.Auth) bool {
+	if len(allowed) == 0 {
+		return nil
+	}
+	set := make(map[auth.Region]bool, len(allowed))
+	for _, r := range allowed {
+		set[r] = true
+	}
+	return func(a *auth.Auth) bool { return set[a.Region()] }
+}
+
+// modelsSlot 单区域的动态模型缓存。
+type modelsSlot struct {
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
 }
+
+// modelsCache 动态模型缓存，按区域分槽。
+// 分区域的原因：两区模型阵容不同，且 global 的动态接口恒 500。
+// 共用一份会让先成功的一区覆盖另一区，也会让 global 的失败把 CN 一起拖进负缓存。
+type modelsCache struct {
+	mu     sync.RWMutex
+	cn     modelsSlot
+	global modelsSlot
+}
+
+func (m *modelsCache) slot(r auth.Region) *modelsSlot {
+	if r == auth.RegionGlobal {
+		return &m.global
+	}
+	return &m.cn
+}
+
+// dynamicModelsCache 动态模型缓存（进程级）。
+var dynamicModelsCache = &modelsCache{}
 
 const (
 	dynamicModelsTTL        = time.Hour
@@ -153,16 +331,44 @@ const (
 )
 
 // models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
-func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) models(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   h.modelList(key),
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
-func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
+// modelList 返回该密钥可见的模型列表（按 id 去重，CN 在前）。
+// 绑定区域的密钥只看到该区域的模型——与其请求被路由到的账号集合一致，
+// 因此列表里出现的模型一定可用，反之请求不在列表里的模型会得到 404。
+// 未绑定区域的密钥看到池中实际存在区域的并集：只挂 CN 账号时不列出仅 global
+// 可用的模型，故单区域部署的列表与改造前一致。
+func (h *Handler) modelList(key *APIKeySpec) []map[string]any {
+	regions := h.cfg.Pool.Regions()
+	if key != nil && key.Region != "" {
+		regions = []auth.Region{key.Region}
+	}
+	if len(regions) == 0 {
+		regions = []auth.Region{auth.RegionCN} // 空池：给出默认一区，避免返回空列表
+	}
+	seen := make(map[string]bool)
+	out := make([]map[string]any, 0, len(regions)*8)
+	for _, r := range regions {
+		for _, m := range h.regionModels(r) {
+			id, _ := m["id"].(string)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// regionModels 单个区域的模型列表：动态接口优先，失败回落该区域的静态表。
+func (h *Handler) regionModels(r auth.Region) []map[string]any {
+	if infos := h.fetchDynamicModels(r); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
 			entry := map[string]any{
@@ -180,60 +386,86 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		return out
 	}
-	return staticModels
+	if r == auth.RegionGlobal {
+		return staticModelsGlobal
+	}
+	return staticModelsCN
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
+// fetchDynamicModels 从池中该区域的一个健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
-func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
+// 缓存与负缓存均按区域独立：global 的动态接口恒 500，不得因此让 CN 也走静态表。
+func (h *Handler) fetchDynamicModels(r auth.Region) []upstream.ModelInfo {
+	dynamicModelsCache.mu.Lock()
+	slot := dynamicModelsCache.slot(r)
+	if len(slot.ids) > 0 && time.Since(slot.fetched) < dynamicModelsTTL {
+		out := slot.ids
+		dynamicModelsCache.mu.Unlock()
 		return out
 	}
 	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
+	if !slot.lastFail.IsZero() && time.Since(slot.lastFail) < modelsFetchFailCooldown {
+		dynamicModelsCache.mu.Unlock()
 		return nil
 	}
-	dynamicModelsCache.RUnlock()
+	dynamicModelsCache.mu.Unlock()
 
-	acct := h.cfg.Pool.Pick()
+	acct := h.cfg.Pool.PickExcludingWhere(nil, regionAllowed([]auth.Region{r}))
 	if acct == nil {
 		return nil
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
+		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 是该区域的负缓存。
 		h.cfg.Pool.NoteError(acct.UID)
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
+		dynamicModelsCache.mu.Lock()
+		dynamicModelsCache.slot(r).lastFail = time.Now()
+		dynamicModelsCache.mu.Unlock()
 		return nil
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
+	dynamicModelsCache.mu.Lock()
+	slot = dynamicModelsCache.slot(r)
+	slot.ids = infos
+	slot.fetched = time.Now()
+	slot.lastFail = time.Time{} // 成功则清空负缓存
+	dynamicModelsCache.mu.Unlock()
 	return infos
 }
 
-func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
 	var peek struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
+
+	// 区域路由：按模型确定支持它的区域，本次请求只在该区域的账号中轮换。
+	// 两区模型阵容不同，把请求发给不支持的域名会拿到 401 / code=11102。
+	// 模型未收录时 allowedRegions 为 nil → 不作限制（向前兼容上游新增模型）。
+	allowedRegions := regionsForModel(peek.Model)
+
+	// 再叠加密钥绑定的区域约束（两者取交集）。密钥绑定后，其可见模型集合
+	// 与可用账号集合都限定在该区域，因此请求该区域的模型必然可用。
+	regions, ok := constrainRegions(allowedRegions, key)
+	if !ok {
+		// 无交集：该模型在此密钥的可见列表里不存在，按 OpenAI 语义报 404。
+		// 不回显另一区域的任何信息，避免泄露内部区域结构。
+		writeOpenAIError(w, http.StatusNotFound, "model_not_found",
+			"model "+peek.Model+" does not exist")
+		st.status = http.StatusNotFound
+		return
+	}
+	allowedRegions = regions
+	pickPred := regionAllowed(allowedRegions)
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -243,6 +475,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	stickyUID := ""
 	if h.cfg.Session != nil {
 		sessKey = session.ExtractKey(body)
+		// 区域密钥给会话键加区域前缀，使两区的粘性绑定互不干扰：
+		// 同一 conversationId 分别用 cn / global 密钥时不应争抢同一个绑定。
+		// 未绑定区域的密钥不加前缀，行为与改造前一致。
+		if sessKey != "" && key != nil && key.Region != "" {
+			sessKey = string(key.Region) + "|" + sessKey
+		}
 		if sessKey != "" {
 			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
 				stickyUID = uid
@@ -273,18 +511,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
+		// 选号：粘性号优先（PickByUIDWhere 已校验 health + 在途未满 + 区域匹配），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUID(stickyUID)
+			acct = h.cfg.Pool.PickByUIDWhere(stickyUID, pickPred)
 			if acct == nil {
-				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
+				// 粘性号当前不可用（冷却/占满/区域不符）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
 				stickyUID = ""
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.cfg.Pool.PickExcludingWhere(tried, pickPred)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -370,9 +608,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		return
 	}
-	msg := "all accounts unavailable (cooling/disabled)"
-	if lastErr != nil {
-		msg += ": " + lastErr.Error()
+	// 轮换耗尽有两种截然不同的原因，必须分开表述，否则会把排查方向带偏：
+	//   - lastErr == nil：真的没有可尝试的账号（区域无账号 / 全冷却 / 全禁用）。
+	//   - lastErr != nil：账号是好的，但每次尝试都被上游拒绝（如 400 消息格式错误）。
+	//     此时若仍断言「账号不可用」，会让调用方去查账号，而真正的问题在请求体。
+	regionNote := ""
+	if len(allowedRegions) > 0 {
+		regions := make([]string, 0, len(allowedRegions))
+		for _, rr := range allowedRegions {
+			regions = append(regions, string(rr))
+		}
+		regionNote = " in region " + strings.Join(regions, "/")
+	}
+	msg := "no attempt succeeded" + regionNote + " for model " + peek.Model
+	if lastErr == nil {
+		msg = "no available account" + regionNote + " for model " + peek.Model +
+			" (账号不可用：不存在 / 冷却中 / 已禁用)"
+	} else {
+		msg += " (账号可用，但上游拒绝了每次尝试): " + lastErr.Error()
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 	st.status = http.StatusServiceUnavailable
