@@ -136,6 +136,7 @@ func main() {
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
 		APIKeys:      serverAPIKeys(cfg.APIKeys),
+		Protocol:     serverProtocol(cfg.Protocol),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -178,6 +179,14 @@ func serverAPIKeys(in []APIKeySpec) []server.APIKeySpec {
 		out = append(out, server.APIKeySpec{Key: k.Key, Region: auth.Region(k.Region), Name: k.Name})
 	}
 	return out
+}
+
+// serverProtocol 把配置里的协议适配段转成 server 包的规范类型。
+func serverProtocol(in ProtocolConfig) server.ProtocolConfig {
+	return server.ProtocolConfig{
+		DefaultModel: in.DefaultModel,
+		ModelMapping: in.ModelMapping,
+	}
 }
 
 // describeAPIKeys 汇总密钥配置供启动日志排查（只报数量与区域，绝不打印密钥本身）。

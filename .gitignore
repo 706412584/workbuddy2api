@@ -31,3 +31,5 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+# 第三方代码的许可与署名声明必须进版本库（非设计文档，不受上面规则约束）
+!internal/apicompat/PROVENANCE.md

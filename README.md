@@ -32,7 +32,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 能力 | 说明 |
 |---|---|
-| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程（无 PKCE），自动落盘凭证并重启容器 |
+| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程（无 PKCE），自动落盘凭证并重启容器；支持国内版与国外版 |
+| 🌍 **双区域账号池** | 国内版（codebuddy.cn）与国外版（workbuddy.ai）账号可混池，区域由凭证 `domain` 自动判别、零配置；按模型路由到支持的区域 |
+| 🔌 **三协议入口** | OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`（Claude Code）、OpenAI Responses `/v1/responses`（Codex CLI），共用同一账号池与治理策略 |
 | 🔄 **多账号池** | 三因子加权随机选号（积分比例 ×10 + 闲置补偿 + 成功率 ×3），Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429/限流文案软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402/余额不足硬冷却至次日 04:00、连续失败指数退避熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑 |
@@ -172,7 +174,10 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置）。不限区域 |
+| `api_keys[]` | 空 | 多密钥列表 `{key,region,name}`；`region` 为 `cn`/`global` 时空该密钥只走对应区域账号。与 `api_key` 合并生效，重复密钥报错 |
+| `protocol.default_model` | `deepseek-v4.1-flash` | `/v1/messages` 与 `/v1/responses` 未命中映射时的上游模型；空 = 原样透传 |
+| `protocol.model_mapping` | 空 | 客户端模型名 → 上游模型名（精确匹配，再按名字边界前缀匹配） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `cooldown.soft_rate` | `600s` | 软限流（429/限流文案）冷却**基数**；同一账号连续触发按 2 倍指数退避 |
@@ -351,11 +356,54 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/messages` | 同上 | **Anthropic Messages 协议**（Claude Code 直连）；流式/非流式 |
+| `POST /v1/messages/count_tokens` | 同上 | token 计数（**本地估算**，上游无此接口；仅用于客户端上下文预算） |
+| `POST /v1/responses` | 同上 | **OpenAI Responses 协议**（Codex CLI 直连）；流式/非流式 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
+| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性/区域） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：仅当 `api_key`/`api_keys` 非空才校验 `Authorization: Bearer <key>`；**都为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+### 多协议接入（Claude Code / Codex CLI）
+
+上游只提供 chat completions，故 `/v1/messages` 与 `/v1/responses` 由网关做双向转换
+（转换实现位于 `internal/apicompat`，来源与许可见该目录 `PROVENANCE.md`）。
+三个协议**共用同一账号池与轮换/冷却/区域/粘性策略**，只是入口与响应格式不同。
+
+**客户端模型名需要映射**：Claude Code 发 `claude-*`、Codex 发 `gpt-*`，而上游只有
+`glm-*`/`deepseek-*` 等，不映射会直接得到 `code=11102`。在 `config.json` 配置：
+
+```json
+"protocol": {
+  "default_model": "deepseek-v4.1-flash",
+  "model_mapping": {
+    "claude-sonnet-4-5": "deepseek-v4.1-flash",
+    "gpt-5-codex": "deepseek-v4.1-flash"
+  }
+}
+```
+
+解析顺序：`model_mapping` 精确匹配 → 前缀匹配（按名字边界，因此
+`claude-sonnet-4-5` 能命中 `claude-sonnet-4-5-20250929`）→ `default_model` → 原样透传。
+`default_model` 缺省为 `deepseek-v4.1-flash`（CN 与 global 两区都有）。响应中回显**客户端原始模型名**。
+
+**接入方式**：
+
+```bash
+# Claude Code
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7863
+export ANTHROPIC_API_KEY=<你的 cn 或 global 密钥>
+
+# Codex CLI（config.toml）
+# base_url = "http://127.0.0.1:7863/v1"
+```
+
+> 区域由**密钥**决定：绑 `cn` 的密钥只走国内账号，绑 `global` 的只走国外账号。
+> 请求的模型若不属于该密钥的区域，返回 404 `model_not_found`（与其 `/v1/models` 列表一致）。
+
+**兼容性处理**：请求的系统提示词为空时（缺失 / 空串 / 纯空白），网关会在最前补一条默认
+`system`——上游要求首条必须是 system，否则 400 `code=11128`。**有内容则完全不改**。
 
 `/healthz` 响应示例（200/503 同结构，仅状态码与计数变化）：
 

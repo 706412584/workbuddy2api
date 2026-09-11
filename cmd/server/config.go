@@ -18,6 +18,17 @@ type APIKeySpec struct {
 	Name   string `json:"name"`   // 可选标识，仅用于日志
 }
 
+// ProtocolConfig 协议适配（Anthropic /v1/messages、OpenAI /v1/responses）的模型名映射。
+// 客户端发的是 claude-* / gpt-* 这类名字，本网关上游只有 glm/deepseek 等，
+// 不做映射会直接拿到 code=11102（模型不存在）。
+type ProtocolConfig struct {
+	// DefaultModel 未命中映射表时使用的上游模型。空 = 不映射（原样透传）。
+	DefaultModel string `json:"default_model"`
+	// ModelMapping 客户端模型名 → 上游模型名。
+	// 先精确匹配，再按名字边界作前缀匹配（容纳 claude-sonnet-4-5-20250929 这类带日期后缀的）。
+	ModelMapping map[string]string `json:"model_mapping"`
+}
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
@@ -28,6 +39,9 @@ type Config struct {
 	// APIKeys 多密钥列表，每项可绑定区域：绑定后该密钥的请求只走对应区域的账号，
 	// 其 /v1/models 与 /status 也按该区域过滤。与 api_key 合并生效。
 	APIKeys []APIKeySpec `json:"api_keys"`
+
+	// Protocol 协议适配（Anthropic /v1/messages、OpenAI /v1/responses）的模型名映射。
+	Protocol ProtocolConfig `json:"protocol"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -123,6 +137,9 @@ func Default() *Config {
 	c.Schedule.TravelEnabled = true
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
+	// 协议适配的默认目标模型：deepseek-v4.1-flash 在 CN 与 global 两区都存在，
+	// 且带 thinking。用户不配 protocol 段时，Claude Code / Codex 直接可用。
+	c.Protocol.DefaultModel = "deepseek-v4.1-flash"
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -266,6 +283,25 @@ func (c *Config) normalize() error {
 	}
 	if err := c.validateAPIKeys(); err != nil {
 		return err
+	}
+	if err := c.validateProtocol(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateProtocol 校验协议适配的模型映射：客户端模型名与目标模型名都不得为空。
+// 空值会让映射静默失效（mapModel 会跳过空项），进而把客户端模型名原样发给上游并得到
+// code=11102——错误现场在上游，排查成本高，故在启动时直接拒绝。
+func (c *Config) validateProtocol() error {
+	c.Protocol.DefaultModel = strings.TrimSpace(c.Protocol.DefaultModel)
+	for client, upstream := range c.Protocol.ModelMapping {
+		if strings.TrimSpace(client) == "" {
+			return fmt.Errorf("protocol.model_mapping: 存在空的客户端模型名")
+		}
+		if strings.TrimSpace(upstream) == "" {
+			return fmt.Errorf("protocol.model_mapping[%s]: 目标模型名不得为空", client)
+		}
 	}
 	return nil
 }

@@ -7,6 +7,14 @@
   ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "protocol": {
+    "default_model": "deepseek-v4.1-flash",
+    "model_mapping": {
+      "claude-sonnet-4-5": "deepseek-v4.1-flash",
+      "claude-opus-4-1": "glm-5.2",
+      "gpt-5-codex": "deepseek-v4.1-flash"
+    }
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"

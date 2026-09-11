@@ -567,3 +567,57 @@ func TestLegacyAPIKeyStillWorks(t *testing.T) {
 		t.Errorf("legacy=%q api_keys=%d want legacy/1", c.APIKey, len(c.APIKeys))
 	}
 }
+
+// TestProtocolDefaultModel 不写 protocol 段时也应有默认目标模型，
+// 否则 Claude Code / Codex 开箱即用到上游报 11102。
+func TestProtocolDefaultModel(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Protocol.DefaultModel != "deepseek-v4.1-flash" {
+		t.Errorf("default_model=%q want deepseek-v4.1-flash", c.Protocol.DefaultModel)
+	}
+}
+
+func TestProtocolModelMappingLoaded(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"protocol":{"default_model":"glm-5.2","model_mapping":{"claude-sonnet-4-5":"deepseek-v4.1-flash"}}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.Protocol.DefaultModel != "glm-5.2" {
+		t.Errorf("default_model=%q", c.Protocol.DefaultModel)
+	}
+	if got := c.Protocol.ModelMapping["claude-sonnet-4-5"]; got != "deepseek-v4.1-flash" {
+		t.Errorf("mapping=%q", got)
+	}
+}
+
+// TestProtocolEmptyMappingValueRejected 空目标模型会让映射静默失效
+// （modelmap 会跳过空值），表现为请求被原样转发到上游并报 11102——
+// 现场在上游难以排查，故启动时直接拒绝。
+func TestProtocolEmptyMappingValueRejected(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"protocol":{"model_mapping":{"claude-x":""}}}`), 0o600)
+	_, err := Load(fp)
+	if err == nil {
+		t.Fatal("want error for empty mapping target")
+	}
+	if !strings.Contains(err.Error(), "model_mapping") {
+		t.Errorf("error 应指明 model_mapping: %v", err)
+	}
+}
+
+// TestProtocolEmptyMappingKeyRejected 空客户端模型名是无意义配置，同样拒绝。
+func TestProtocolEmptyMappingKeyRejected(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"protocol":{"model_mapping":{"":"glm-5.2"}}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for empty mapping key")
+	}
+}

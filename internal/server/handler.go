@@ -36,7 +36,9 @@ type Config struct {
 	APIKey string
 	// APIKeys 多密钥列表，每项可绑定区域。与 APIKey 合并生效；
 	// 两者皆空 = 不鉴权。
-	APIKeys   []APIKeySpec
+	APIKeys []APIKeySpec
+	// Protocol 协议适配配置（Anthropic /v1/messages、OpenAI /v1/responses 的模型名映射）。
+	Protocol  ProtocolConfig
 	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -85,6 +87,10 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h.keys = append(h.keys, cfg.APIKeys...)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// 协议适配：同一账号池同时服务 Anthropic（Claude Code）与 Responses（Codex）客户端。
+	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuth(h.countTokens))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -432,54 +438,51 @@ func (h *Handler) fetchDynamicModels(r auth.Region) []upstream.ModelInfo {
 	return infos
 }
 
-func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-		return
+// forwardOpt 转发所需的请求级上下文，由各协议的 handler 组装后交给 forwardChat。
+type forwardOpt struct {
+	// pickPred 账号谓词（模型区域 ∩ 密钥区域）；nil = 不过滤。
+	pickPred func(*auth.Auth) bool
+	// sessKey 会话键（取自客户端原始请求体，未加区域前缀）；空 = 不走粘性。
+	sessKey string
+	// key 本次请求命中的密钥；用于给会话键加区域前缀（nil = 未鉴权）。
+	key *APIKeySpec
+	// st 请求级统计；成功与失败都会写入 uid/status，由调用方负责收尾输出。
+	st *chatStat
+	// allowedRegions 允许的区域，仅用于失败文案。
+	allowedRegions []auth.Region
+	// model 客户端请求的模型名，仅用于失败文案。
+	model string
+	// writeErr 失败时的错误响应写出函数；nil = OpenAI 格式（默认）。
+	// 各协议的客户端只认自己协议的错误体（Claude Code 读 Anthropic 的
+	// {"type":"error",...}），故允许调用方覆盖。
+	writeErr func(w http.ResponseWriter, status int, code, msg string)
+}
+
+// sessionKey 提取会话键；未启用粘性时返回空，省去一次无谓的 JSON 解析。
+func (h *Handler) sessionKey(body []byte) string {
+	if h.cfg.Session == nil {
+		return ""
 	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &peek)
+	return session.ExtractKey(body)
+}
 
-	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
-
-	// 区域路由：按模型确定支持它的区域，本次请求只在该区域的账号中轮换。
-	// 两区模型阵容不同，把请求发给不支持的域名会拿到 401 / code=11102。
-	// 模型未收录时 allowedRegions 为 nil → 不作限制（向前兼容上游新增模型）。
-	allowedRegions := regionsForModel(peek.Model)
-
-	// 再叠加密钥绑定的区域约束（两者取交集）。密钥绑定后，其可见模型集合
-	// 与可用账号集合都限定在该区域，因此请求该区域的模型必然可用。
-	regions, ok := constrainRegions(allowedRegions, key)
-	if !ok {
-		// 无交集：该模型在此密钥的可见列表里不存在，按 OpenAI 语义报 404。
-		// 不回显另一区域的任何信息，避免泄露内部区域结构。
-		writeOpenAIError(w, http.StatusNotFound, "model_not_found",
-			"model "+peek.Model+" does not exist")
-		st.status = http.StatusNotFound
-		return
-	}
-	allowedRegions = regions
-	pickPred := regionAllowed(allowedRegions)
-
-	tried := map[string]bool{}
-	var lastErr error
-
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+// forwardChat 执行「选号 → 轮换 → 调上游」，成功返回上游响应流（调用方负责 Close）。
+// 全部尝试失败时返回 nil —— 此时已按错误策略处置过账号，且 HTTP 错误响应已写好。
+//
+// 三种协议（OpenAI chat completions / Anthropic messages / OpenAI responses）共用本函数：
+// 它们的差异只在请求体构造与响应渲染，而选号、在途租约、token 刷新、错误分类处置、
+// 粘性重绑这些语义必须完全一致，故集中于此，避免三处各写一份而产生行为漂移。
+func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) io.ReadCloser {
+	// 会话粘性：解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
 	stickyUID := ""
 	if h.cfg.Session != nil {
-		sessKey = session.ExtractKey(body)
+		sessKey = o.sessKey
 		// 区域密钥给会话键加区域前缀，使两区的粘性绑定互不干扰：
 		// 同一 conversationId 分别用 cn / global 密钥时不应争抢同一个绑定。
 		// 未绑定区域的密钥不加前缀，行为与改造前一致。
-		if sessKey != "" && key != nil && key.Region != "" {
-			sessKey = string(key.Region) + "|" + sessKey
+		if sessKey != "" && o.key != nil && o.key.Region != "" {
+			sessKey = string(o.key.Region) + "|" + sessKey
 		}
 		if sessKey != "" {
 			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
@@ -487,6 +490,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 			}
 		}
 	}
+
+	st := o.st
+	tried := map[string]bool{}
+	var lastErr error
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -514,7 +521,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 		// 选号：粘性号优先（PickByUIDWhere 已校验 health + 在途未满 + 区域匹配），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDWhere(stickyUID, pickPred)
+			acct = h.cfg.Pool.PickByUIDWhere(stickyUID, o.pickPred)
 			if acct == nil {
 				// 粘性号当前不可用（冷却/占满/区域不符）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
@@ -522,7 +529,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcludingWhere(tried, pickPred)
+			acct = h.cfg.Pool.PickExcludingWhere(tried, o.pickPred)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -585,50 +592,106 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
-		if peek.Stream {
-			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
-			st.status = http.StatusOK
-			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
-			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
-			rc.Close()
-			return
-		}
-		resp, err := upstream.Aggregate(rc)
-		rc.Close()
-		if err != nil {
-			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
-			st.status = http.StatusBadGateway
-			return
-		}
-		writeJSON(w, http.StatusOK, resp)
-		st.status = http.StatusOK
-		st.toks = completionTokens(resp)
-		return
+		// 租约不在此释放：由调用方在读尽响应流后统一归还（defer）。
+		return rc
 	}
+
 	// 轮换耗尽有两种截然不同的原因，必须分开表述，否则会把排查方向带偏：
 	//   - lastErr == nil：真的没有可尝试的账号（区域无账号 / 全冷却 / 全禁用）。
 	//   - lastErr != nil：账号是好的，但每次尝试都被上游拒绝（如 400 消息格式错误）。
 	//     此时若仍断言「账号不可用」，会让调用方去查账号，而真正的问题在请求体。
 	regionNote := ""
-	if len(allowedRegions) > 0 {
-		regions := make([]string, 0, len(allowedRegions))
-		for _, rr := range allowedRegions {
+	if len(o.allowedRegions) > 0 {
+		regions := make([]string, 0, len(o.allowedRegions))
+		for _, rr := range o.allowedRegions {
 			regions = append(regions, string(rr))
 		}
 		regionNote = " in region " + strings.Join(regions, "/")
 	}
-	msg := "no attempt succeeded" + regionNote + " for model " + peek.Model
+	msg := "no attempt succeeded" + regionNote + " for model " + o.model
 	if lastErr == nil {
-		msg = "no available account" + regionNote + " for model " + peek.Model +
+		msg = "no available account" + regionNote + " for model " + o.model +
 			" (账号不可用：不存在 / 冷却中 / 已禁用)"
 	} else {
 		msg += " (账号可用，但上游拒绝了每次尝试): " + lastErr.Error()
 	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	writeErr := o.writeErr
+	if writeErr == nil {
+		writeErr = writeOpenAIError
+	}
+	writeErr(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 	st.status = http.StatusServiceUnavailable
+	return nil
+}
+
+func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	var peek struct {
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &peek)
+
+	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
+	st := newChatStat(time.Now(), body, peek.Stream)
+	defer st.done()
+
+	// 区域路由：按模型确定支持它的区域，本次请求只在该区域的账号中轮换。
+	// 两区模型阵容不同，把请求发给不支持的域名会拿到 401 / code=11102。
+	// 模型未收录时 allowedRegions 为 nil → 不作限制（向前兼容上游新增模型）。
+	allowedRegions := regionsForModel(peek.Model)
+
+	// 再叠加密钥绑定的区域约束（两者取交集）。密钥绑定后，其可见模型集合
+	// 与可用账号集合都限定在该区域，因此请求该区域的模型必然可用。
+	regions, ok := constrainRegions(allowedRegions, key)
+	if !ok {
+		// 无交集：该模型在此密钥的可见列表里不存在，按 OpenAI 语义报 404。
+		// 不回显另一区域的任何信息，避免泄露内部区域结构。
+		writeOpenAIError(w, http.StatusNotFound, "model_not_found",
+			"model "+peek.Model+" does not exist")
+		st.status = http.StatusNotFound
+		return
+	}
+	allowedRegions = regions
+	pickPred := regionAllowed(allowedRegions)
+
+	rc := h.forwardChat(w, body, forwardOpt{
+		pickPred:       pickPred,
+		sessKey:        h.sessionKey(body),
+		key:            key,
+		st:             st,
+		allowedRegions: allowedRegions,
+		model:          peek.Model,
+	})
+	if rc == nil {
+		return // 失败：forwardChat 已按错误策略处置账号并写好响应
+	}
+
+	if peek.Stream {
+		// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
+		st.status = http.StatusOK
+		stats := newChatStatsReaderSince(rc, st.start)
+		_ = upstream.Stream(w, stats)
+		st.ttfb = stats.TTFB()
+		st.toks, _ = stats.Tokens()
+		rc.Close()
+		return
+	}
+	resp, err := upstream.Aggregate(rc)
+	rc.Close()
+	if err != nil {
+		// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
+		st.status = http.StatusBadGateway
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+	st.status = http.StatusOK
+	st.toks = completionTokens(resp)
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
