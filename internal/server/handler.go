@@ -684,6 +684,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 		_ = upstream.Stream(w, stats)
 		st.ttfb = stats.TTFB()
 		st.toks, _ = stats.Tokens()
+		logThinkingLoop(stats, st)
 		rc.Close()
 		return
 	}

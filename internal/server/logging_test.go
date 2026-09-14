@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -280,5 +282,93 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestThinkingLoopSignalDetectsRepetition 锁定思考死循环的识别能力。
+// 实测样本：deepseek-v4 曾 thinking 空转 25 万个 delta、正文零输出、耗时 901s。
+func TestThinkingLoopSignalDetectsRepetition(t *testing.T) {
+	// 模拟「1 let / 2 look / 3 me」反复循环：同一段文本重复喂入。
+	var sb strings.Builder
+	phrase := "1 let me check the file 2 look at the code 3 me verify this "
+	for i := 0; i < 2000; i++ {
+		sb.WriteString(`data: {"choices":[{"delta":{"reasoning_content":`)
+		b, _ := json.Marshal(phrase)
+		sb.Write(b)
+		sb.WriteString(`}}]}` + "\n\n")
+	}
+	sb.WriteString("data: [DONE]\n\n")
+
+	r := newChatStatsReaderSince(strings.NewReader(sb.String()), time.Now())
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	think, text, distinct, total := r.LoopSignal()
+	if text != 0 {
+		t.Errorf("text_chars=%d want 0（本用例无正文输出）", text)
+	}
+	if think < 100_000 {
+		t.Errorf("think_chars=%d want >=100000", think)
+	}
+	// 循环文本的唯一块数应远小于总块数（占比 <10%）。
+	if total == 0 || distinct*10 > total {
+		t.Errorf("distinct=%d/%d want 唯一块占比 <10%%（循环特征）", distinct, total)
+	}
+}
+
+// TestThinkingLoopRatioSeparatesLoopFromNormal 验证 ratio 能把循环文本与正常文本分开。
+//
+// ratio 只用于日志诊断，不是门禁（门禁是 thinkChars 与 textChars）。
+// 真正要保证的不变量是：循环文本的 ratio 显著低于正常行文，这样日志里的 ratio
+// 才能帮人判断「这是循环还是只是思考久」。
+//
+// 2026-09-13 实测参照：44 个真实 thinking 块 ratio 全为 1.000；
+// 同一短语重复 3000 次的循环文本 ratio 为 0.0027。
+func TestThinkingLoopRatioSeparatesLoopFromNormal(t *testing.T) {
+	ratio := func(build func(*strings.Builder)) float64 {
+		var sb strings.Builder
+		build(&sb)
+		sb.WriteString("data: [DONE]\n\n")
+		r := newChatStatsReaderSince(strings.NewReader(sb.String()), time.Now())
+		_, _ = io.Copy(io.Discard, r)
+		_, _, distinct, total := r.LoopSignal()
+		if total == 0 {
+			t.Fatal("no chunks")
+		}
+		return float64(distinct) / float64(total)
+	}
+
+	// 正常行文：内容逐段变化，无长距离重复。
+	normal := ratio(func(sb *strings.Builder) {
+		for i := 0; i < 500; i++ {
+			fmt.Fprintf(sb, `data: {"choices":[{"delta":{"reasoning_content":"第 %d 步检查文件与预期是否一致再决定下一步。"}}]}`+"\n\n", i)
+		}
+	})
+	// 循环：同一短语反复。
+	loop := ratio(func(sb *strings.Builder) {
+		for i := 0; i < 2000; i++ {
+			sb.WriteString(`data: {"choices":[{"delta":{"reasoning_content":"1 let me check 2 look at the code 3 me verify "}}]}` + "\n\n")
+		}
+	})
+
+	if loop*20 > normal {
+		t.Errorf("循环 ratio=%.4f 未显著低于正常 ratio=%.4f：判据无法区分", loop, normal)
+	}
+}
+
+// TestLoopSignalCountsTextOutput 有正文输出时 textChars 必须反映出来，
+// 否则「正文为零」这个判据会失效。
+func TestLoopSignalCountsTextOutput(t *testing.T) {
+	sse := `data: {"choices":[{"delta":{"content":"hello world"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{"reasoning_content":"thinking here"}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	think, text, _, _ := r.LoopSignal()
+	if text != len("hello world") {
+		t.Errorf("text_chars=%d want %d", text, len("hello world"))
+	}
+	if think != len("thinking here") {
+		t.Errorf("think_chars=%d want %d", think, len("thinking here"))
 	}
 }
