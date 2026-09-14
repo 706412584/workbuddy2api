@@ -13,11 +13,13 @@ package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -735,6 +737,58 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	}
 }
 
+// Reset 清除账号的冷却、软退避与熔断状态，可选一并解除禁用。
+// 返回重置前的人类可读描述与结果，供管理面板如实展示。
+//
+// 熔断器（breakerUntil / fails / retryCount）是非持久化的运行态：改造前面板靠
+// 「停进程再起进程」把它清掉，现在进程不停了，必须在这里显式清。
+// 冷却域（until / reason / softStreak）清空后由调用方 Flush() 落盘。
+// 不动 successCount / errTotal：那是累计统计，不是状态。
+func (p *Pool) Reset(uid string, includeDisabled bool) (before, after string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.byUID[uid]
+	if e == nil {
+		return "无记录", "无需重置"
+	}
+	now := time.Now()
+	var parts []string
+	if !e.until.IsZero() && now.Before(e.until) {
+		parts = append(parts, "冷却至 "+e.until.Local().Format("2006-01-02 15:04:05"))
+	}
+	if e.softStreak > 0 {
+		parts = append(parts, fmt.Sprintf("退避 ×%d", e.softStreak))
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		parts = append(parts, "熔断中")
+	}
+	// 禁用标记一律如实报出：账上带着它却说「本来就没状态」，会让人以为这次重置
+	// 把什么都清了，实际标记还在。没清掉时额外注明，免得报了个寂寞。
+	if e.disabled {
+		if includeDisabled {
+			parts = append(parts, "已禁用")
+		} else {
+			parts = append(parts, "已禁用（本次未解除）")
+		}
+	}
+	before = "本来就没状态"
+	if len(parts) > 0 {
+		before = strings.Join(parts, "，")
+	}
+
+	e.until = time.Time{}
+	e.reason = ""
+	e.softStreak = 0
+	e.breakerUntil = time.Time{}
+	e.fails = 0
+	e.retryCount = 0
+	if includeDisabled {
+		e.disabled = false
+	}
+	p.dirty.Store(true)
+	return before, "已重置"
+}
+
 // softDurationLocked 按连续软冷却次数把基数 d 指数放大：d << (streak-1)，封顶 softRateMax。
 // softRateMax 未注入（<=0）时按 defaultSoftRateMax 算。streak<=1 时原样返回 d。
 // 左移位数受 softStreakShiftMax 限制，避免 streak 极大时移位溢出。
@@ -867,6 +921,34 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.softStreak = 0
 		p.dirty.Store(true)
 	}
+}
+
+// NoteTestOK 面板「测试连接」成功后写回池中状态：清冷却/退避/熔断，并解除禁用。
+//
+// 为什么要单独一个方法，而不是复用 NoteSuccess：
+//   - 测试是诊断，不该计入 successCount/lastSuccess —— 那些字段描述的是**真实请求**
+//     的调度表现，把测试混进去会污染 /status 的「最近活动」与成功率权重。
+//   - 测试必须解除禁用：disabled 只在 session 死亡时设置，而测试通过恰好证明
+//     session 活着，二者直接矛盾。且 upsertLocked 重新导入凭证时保留旧状态，
+//     所以「重新登录 → 导入 → 测试通过」若不在此解除，就会永远卡在「已禁用」。
+//
+// 只改池中状态，不碰凭证文件。
+func (p *Pool) NoteTestOK(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.byUID[uid]
+	if e == nil {
+		return
+	}
+	e.disabled = false
+	e.until = time.Time{}
+	e.reason = ""
+	e.coolKind = 0
+	e.softStreak = 0
+	e.breakerUntil = time.Time{}
+	e.fails = 0
+	e.retryCount = 0
+	p.dirty.Store(true)
 }
 
 // Status 查询单账号状态。

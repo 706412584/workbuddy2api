@@ -1613,3 +1613,146 @@ func TestCountsDetailedWhereFiltersByRegion(t *testing.T) {
 		t.Errorf("global 筛选: total=%d healthy=%d cooling=%d want 1/0/1", total, healthy, cooling)
 	}
 }
+
+// TestResetClearsCoolingStreakAndBreaker 覆盖管理面板「重置账号状态」依赖的语义。
+//
+// 改造前面板靠「停进程 → 改 state.json → 起进程」达成这件事：因为网关运行中改文件
+// 会被下一次 flush 原样盖掉，且熔断器（breakerUntil/fails/retryCount）是纯运行态、
+// 落盘也带不走。现在进程不停了，Reset 必须在内存里一次清干净 —— 这条测试就是那个保证。
+func TestResetClearsCoolingStreakAndBreaker(t *testing.T) {
+	p := New("")
+	a := &auth.Auth{UID: "u1", Nickname: "测试号"}
+	p.Add(a)
+	p.SetBreaker(1, 30*time.Minute, time.Hour) // 阈值 1 = 一次错误即熔断，便于构造
+	p.SetCredits("u1", 1000)
+	p.NoteSuccess("u1") // 埋下累计统计，用于验证 Reset 不动它们
+
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	p.NoteError("u1") // 触发熔断
+
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.SoftStreak == 0 || st.BreakerUntil.IsZero() {
+		t.Fatalf("前置状态没构造出来: cooling=%v streak=%d breaker=%v", st.Cooling, st.SoftStreak, st.BreakerUntil)
+	}
+	// 池子里只有一个带状态的号时 Pick 仍会选中它 —— 那是 pool 有意的全冷却兜底
+	// （pickEarliestExpiryLocked：软冷却/熔断号照常住回兜底，只排除 CoolHard 与 disabled）。
+	// 补一个健康号，才能真正验证「有健康号时状态号让开」。
+	p.Add(&auth.Auth{UID: "u2"})
+	if got := p.Pick(); got == nil || got.UID != "u2" {
+		t.Fatalf("池内有健康号时不该选中冷却+熔断的 u1，got=%v", got)
+	}
+
+	before, after := p.Reset("u1", false)
+	if before == "" || after != "已重置" {
+		t.Errorf("before/after 文案不符: %q / %q", before, after)
+	}
+	if before == "本来就没状态" {
+		t.Errorf("明明有冷却与熔断，before 却说没状态: %q", before)
+	}
+
+	st, _ = p.Status("u1")
+	if st.Cooling || st.SoftStreak != 0 || !st.BreakerUntil.IsZero() || st.BreakerFails != 0 {
+		t.Errorf("Reset 后仍有状态残留: cooling=%v streak=%d breakerUntil=%v fails=%d",
+			st.Cooling, st.SoftStreak, st.BreakerUntil, st.BreakerFails)
+	}
+	if st.Reason != "" || !st.Until.IsZero() {
+		t.Errorf("冷却域未清空: reason=%q until=%v", st.Reason, st.Until)
+	}
+	// 累计统计（成功率权重的输入）不属于「状态」，重置不该抹掉
+	if st.SuccessCount == 0 || st.Credits != 1000 {
+		t.Errorf("累计统计被误清: success=%d credits=%d", st.SuccessCount, st.Credits)
+	}
+}
+
+// TestResetDisabledOnlyWhenAsked 验证 includeDisabled 的开关语义：
+// 不勾选时保留禁用标记（凭证真失效了就该一直禁用），勾选时才解除。
+func TestResetDisabledOnlyWhenAsked(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead")
+
+	before, _ := p.Reset("u1", false)
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Error("includeDisabled=false 时不该解除禁用")
+	}
+	if !strings.Contains(before, "已禁用") {
+		t.Errorf("未勾选时 before 不该提到禁用: %q", before)
+	}
+
+	before, _ = p.Reset("u1", true)
+	st, _ = p.Status("u1")
+	if st.Disabled {
+		t.Error("includeDisabled=true 时应解除禁用")
+	}
+	if !strings.Contains(before, "已禁用") {
+		t.Errorf("勾选时 before 应如实说明原为禁用: %q", before)
+	}
+}
+
+// TestResetUnknownUID 未知 uid 不是错误，如实回报即可（面板可能拿着过期的 uid 列表）。
+func TestResetUnknownUID(t *testing.T) {
+	p := New("")
+	before, after := p.Reset("nope", false)
+	if before != "无记录" || after != "无需重置" {
+		t.Errorf("未知 uid: before=%q after=%q", before, after)
+	}
+}
+
+// TestNoteTestOKClearsEverything 锁定「测试连通成功后池中状态必须回到正常」。
+// 面板的测试连接是绕开池子跑的诊断（直接读凭证打上游），成功时不写回就会
+// 一直显示「已禁用 / 冷却中」，而账号实际是好的。
+func TestNoteTestOKClearsEverything(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	// 把能踩的状态全踩上：硬冷却 + 退避 + 熔断 + 禁用。
+	p.CooldownUntilTomorrow4AM("u1", "余额不足")
+	p.Cooldown("u1", CoolSoft, 600*time.Second, "429 rate limit")
+	p.Disable("u1", "12153 session dead")
+
+	st, _ := p.Status("u1")
+	if !st.Cooling || !st.Disabled {
+		t.Fatalf("前置条件未建立: %+v", st)
+	}
+
+	p.NoteTestOK("u1")
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("no status")
+	}
+	if st.Cooling {
+		t.Errorf("仍处于冷却: kind=%s until=%v", st.CoolKind, st.Until)
+	}
+	if st.Disabled {
+		t.Error("仍处于禁用：测试通过恰好证明 session 活着，必须解除")
+	}
+	if st.CoolKind != "" || st.Reason != "" {
+		t.Errorf("残留冷却字段: kind=%q reason=%q", st.CoolKind, st.Reason)
+	}
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("清完状态后应能被 Pick 选中, got %+v", got)
+	}
+}
+
+// TestNoteTestOKKeepsSuccessStats 测试是诊断，不该污染真实请求的成功率统计。
+func TestNoteTestOKKeepsSuccessStats(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	before, _ := p.Status("u1")
+	p.NoteTestOK("u1")
+	after, _ := p.Status("u1")
+	if after.SuccessCount != before.SuccessCount {
+		t.Errorf("success_count 被测试改动: %d -> %d", before.SuccessCount, after.SuccessCount)
+	}
+	if !after.LastSuccessTime.Equal(before.LastSuccessTime) {
+		t.Errorf("last_success 被测试改动: %v -> %v", before.LastSuccessTime, after.LastSuccessTime)
+	}
+}
+
+// TestNoteTestOKUnknownUIDIsNoop 未加载的账号（池里没有）不该 panic。
+func TestNoteTestOKUnknownUIDIsNoop(t *testing.T) {
+	p := New("")
+	p.NoteTestOK("nope")
+}
