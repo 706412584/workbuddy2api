@@ -50,6 +50,10 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// Web 未命中 API 路由时的兜底处理器（管理面板的静态资源）。nil = 不提供面板。
+	Web http.Handler
+	// Admin 管理接口，挂在 /__admin/ 前缀下；自身负责本机来源校验。nil = 不提供。
+	Admin http.Handler
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -65,9 +69,11 @@ const ServiceName = "workbuddy2api"
 
 // Handler 主路由。
 type Handler struct {
-	cfg  Config
-	mux  *http.ServeMux
-	keys []APIKeySpec // 合并后的生效密钥（旧 APIKey → 不限区域项）；空 = 不鉴权
+	cfg Config
+	mux *http.ServeMux
+	// keyMu 保护 keys：管理面板能在运行期换密钥（保存后热重载），而每个请求都要读它。
+	keyMu sync.RWMutex
+	keys  []APIKeySpec // 合并后的生效密钥（旧 APIKey → 不限区域项）；空 = 不鉴权
 }
 
 // NewHandler 构建 handler。
@@ -82,11 +88,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
-	// 旧 api_key 视为「不限区域」的一项，与 api_keys 列表合并。
-	if cfg.APIKey != "" {
-		h.keys = append(h.keys, APIKeySpec{Key: cfg.APIKey, Name: "legacy"})
-	}
-	h.keys = append(h.keys, cfg.APIKeys...)
+	h.SetKeys(cfg.APIKey, cfg.APIKeys)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 协议适配：同一账号池同时服务 Anthropic（Claude Code）与 Responses（Codex）客户端。
 	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.anthropicMessages))
@@ -95,10 +97,25 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	if cfg.Admin != nil {
+		h.mux.Handle("/__admin/", cfg.Admin)
+	}
+	// "/" 是兜底模式：只有比它更具体的、上面那些 API 路径都未命中时才会走到，
+	// 因此面板不会抢走任何 API 路由。
+	if cfg.Web != nil {
+		h.mux.Handle("/", cfg.Web)
+	}
 	return h
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 面板统一走 /api 前缀：dev 下它是 vite 反代规则的锚点，单二进制下由这里剥掉。
+	// 两种部署共用同一份前端产物，不必区分。
+	// 剥离后重新派发（而非 302 重定向）：重定向对 POST 会丢方法语义。
+	if p, ok := strings.CutPrefix(r.URL.Path, "/api/"); ok {
+		r = r.Clone(r.Context())
+		r.URL.Path = "/" + p
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -106,11 +123,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // key 为 nil 表示未鉴权（未配置任何密钥）。
 type authedHandler func(w http.ResponseWriter, r *http.Request, key *APIKeySpec)
 
+// SetKeys 换用新的密钥表（密钥管理面板保存后调用）。立即生效，无需重启进程。
+func (h *Handler) SetKeys(legacy string, keys []APIKeySpec) {
+	h.keyMu.Lock()
+	defer h.keyMu.Unlock()
+	var merged []APIKeySpec
+	// 旧 api_key 视为「不限区域」的一项，与 api_keys 列表合并。
+	if legacy != "" {
+		merged = append(merged, APIKeySpec{Key: legacy, Name: "legacy"})
+	}
+	h.keys = append(merged, keys...)
+}
+
 // withAuth 校验 Bearer 密钥并把命中的 spec 传给处理器。
 // 密钥用 == 比较而非恒定时间比较：与改造前一致，不引入新的行为差异。
 func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(h.keys) == 0 {
+		h.keyMu.RLock()
+		keys := h.keys
+		h.keyMu.RUnlock()
+		if len(keys) == 0 {
 			next(w, r, nil) // 未配置密钥 = 不鉴权、不限区域
 			return
 		}
@@ -120,9 +152,12 @@ func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 			return
 		}
 		token := strings.TrimPrefix(authz, "Bearer ")
-		for i := range h.keys {
-			if h.keys[i].Key == token {
-				next(w, r, &h.keys[i])
+		for i := range keys {
+			if keys[i].Key == token {
+				// 传指针而非副本：调用方需要读到 Region/Name。keys 是本地切片头，
+				// 但底层数组与 h.keys 共享 —— 热重载换掉 h.keys 后旧数组依然存活，
+				// 本次请求手里的指针始终有效。
+				next(w, r, &keys[i])
 				return
 			}
 		}
@@ -373,6 +408,19 @@ func (h *Handler) modelList(key *APIKeySpec) []map[string]any {
 			}
 			seen[id] = true
 			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// ModelsForRegion 返回该区域可见的模型 id 列表。
+// 供管理面板「测试连接」的模型下拉框用：面板因此不必自己抄一份模型表，
+// 也不必反过来查本进程的 /v1/models。
+func (h *Handler) ModelsForRegion(r auth.Region) []string {
+	out := []string{}
+	for _, m := range h.regionModels(r) {
+		if id, ok := m["id"].(string); ok && id != "" {
+			out = append(out, id)
 		}
 	}
 	return out

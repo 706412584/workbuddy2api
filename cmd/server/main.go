@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"workbuddy2api/internal/admin"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -20,6 +23,7 @@ import (
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/web"
 )
 
 func main() {
@@ -131,7 +135,54 @@ func main() {
 		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
 	}
 
-	h := server.NewHandler(server.Config{
+	// 管理面板：账号/密钥/日志/统计都在网关进程内处理，不再需要一个另跑的 dev server。
+	// 路径一律转绝对：面板要把它们显示给用户，相对路径在界面上没有意义。
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("resolve working directory: %v", err)
+	}
+	abs := func(p string) string {
+		a, err := filepath.Abs(p)
+		if err != nil {
+			return p
+		}
+		return a
+	}
+
+	// h 先声明后赋值：admin 的新增回调要引用它，而它又需要 admin 才能构造。
+	var h *server.Handler
+	adm := admin.New(admin.Config{
+		Pool:       p,
+		Upstream:   up,
+		AuthDir:    abs(cfg.AuthDir),
+		ConfigPath: abs(*cfgPath),
+		LogPath:    abs(filepath.Join("data", "gateway.log")),
+		LoginBin:   abs(loginBin()),
+		RepoRoot:   repoRoot,
+		// 账号热重载：与启动时同一套动作，改完即时生效（旧版靠重启进程）
+		ReloadAccounts: func() (int, error) {
+			auths, err := auth.LoadDir(cfg.AuthDir)
+			if err != nil {
+				return 0, err
+			}
+			p.SyncToDir(auths)
+			p.Flush()
+			return len(auths), nil
+		},
+		// 密钥热重载：换掉 handler 里的密钥表（旧版靠重启进程）
+		ReloadKeys: func(legacy string, keys []admin.KeyEntry) {
+			in := make([]APIKeySpec, 0, len(keys))
+			for _, k := range keys {
+				in = append(in, APIKeySpec{Key: k.Key, Region: k.Region, Name: k.Name})
+			}
+			h.SetKeys(legacy, serverAPIKeys(in))
+		},
+		ModelsByRegion: func() (cn, global []string) {
+			return h.ModelsForRegion(auth.RegionCN), h.ModelsForRegion(auth.RegionGlobal)
+		},
+	})
+
+	h = server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
@@ -141,6 +192,8 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		Web:          web.Handler(),
+		Admin:        adm,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -166,6 +219,15 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// loginBin 设备码登录工具的文件名。
+// 管理面板的「添加账号」调它，按 login.sh / login.exe 的命名约定拼。
+func loginBin() string {
+	if runtime.GOOS == "windows" {
+		return "login.exe"
+	}
+	return "login"
 }
 
 // serverAPIKeys 把配置里的密钥列表转成 server 包的规范类型。

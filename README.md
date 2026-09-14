@@ -54,6 +54,9 @@ flowchart LR
     subgraph GWI["WorkBuddy2API 网关 :7863"]
         H["HTTP Handler\n鉴权 · 日志 · 换号轮转"] --> P
         H --> S
+        H --> ADMIN["管理面板 /__admin\n账号 · 密钥 · 日志 · 统计（仅本机）"]
+        ADMIN -. "热重载" .-> P
+        ADMIN -. "热重载" .-> H
         P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
         T["定时调度\n签到 09/21 · 旅行 09 · 活跃 10 · 保活 22"] --> P
@@ -64,6 +67,7 @@ flowchart LR
     P -. "状态镜像" .-> REDIS[("Upstash Redis\n可选")]
     U -->|"v2/chat/completions (SSE)"| CB["CodeBuddy\ncopilot.tencent.com"]
     U -->|"billing / auth / models"| CB
+    Browser["浏览器"] -->|"面板 UI（内嵌静态资源）"| H
 ```
 
 ## 🚀 快速开始
@@ -73,6 +77,24 @@ flowchart LR
 - **Docker + Docker Compose**（推荐部署方式，镜像内已含 `app` 低权限用户）
 - 一个（或多个）已注册的 CodeBuddy 账号，用于 OAuth 登录
 - 宿主机 Go ≥ 1.22（仅本地直接编译时需要）
+- Node ≥ 20（**仅修改前端时需要**；面板产物已入库，正常构建不必装）
+
+### 管理面板
+
+网关自带网页管理面板，与 API 同端口，**账号/密钥/日志/统计全在面板里管**：
+
+```
+http://127.0.0.1:7863/          # 面板（静态资源已编进二进制）
+```
+
+- 面板 UI 公开可访问（只是 HTML/JS，无敏感数据），但 `/__admin/*` 只接受来自
+  本机（`127.0.0.1` / `::1`）的请求 —— 它要读写 `config.json`、增删 `auths/`，
+  网关默认监听 `0.0.0.0` 时不该让局域网随手改。需要连面板就用 SSH 端口转发。
+- **改动即时生效**：增删账号、保存密钥、重置账号状态都是进程内热重载
+  （重扫 `auths/` + 换掉内存里的密钥表 + 直改账号池状态），**不重启进程、不断流**。
+  改造前那套「改完点重启、停服数秒」的做法已取消。
+- 密钥保存在 `config.json`，保存时会留一份 `config.json.bak`（含密钥，已 gitignore）。
+  面板改的是文件里的文本区间，其余字节原样保留。
 
 ### 1. 克隆并配置
 
@@ -132,6 +154,35 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
+
+### 5. 本地构建（不用 Docker）
+
+面板产物（`internal/web/dist/`）已随源码入库，因此**只改后端时一条命令就够**：
+
+```bash
+go build -o wb2api.exe ./cmd/server     # Linux/macOS: go build -o wb2api ./cmd/server
+./wb2api.exe                            # 读 ./config.json，同时提供 API 与面板
+```
+
+改了前端才需要 Node：
+
+```bash
+cd frontend
+npm install
+npm run build       # 产出 ../internal/web/dist，由 //go:embed 编进二进制
+cd .. && go build -o wb2api.exe ./cmd/server
+```
+
+**改了前端必须重新 `go build`**：产物是编译期嵌进去的，只跑 `npm run build`
+不会影响已经在跑的二进制。忘了这步的典型症状是「改了代码但页面没变」。
+
+前端开发时想要 HMR，另开一个终端：
+
+```bash
+cd frontend && npm run dev     # :7864，/api 与 /__admin 都反代到 :7863
+```
+
+此时用 `http://localhost:7864`（vite 只绑 IPv6 回环，`127.0.0.1:7864` 会 502）。
 
 ## ⚙️ 配置说明
 
@@ -563,13 +614,17 @@ cmd/
   credit/    # 积分查询工具
   signin/    # 批量签到工具
 internal/
+  admin/     # 管理接口 /__admin/*（账号/密钥/日志/统计，仅本机可访问）
   auth/      # 凭证解析 + token 刷新 + 原子写回
   pool/      # 账号池（状态机/熔断/租约/加权/持久化）
   scheduler/ # 定时签到 + 保活 + 猫猫旅行巡检
   server/    # HTTP handler + 鉴权 + 请求日志
   session/   # 会话粘性路由
   upstream/  # 上游封装（chat/billing/auth/headers/sse/payload/sanitize/idle）
+  web/       # 管理面板静态资源（dist/ 由 vite 构建产出并入库，//go:embed 编入二进制）
   redisstore/# Upstash 持久化 + Noop 降级
+
+frontend/    # 管理面板源码（React + Vite）；仅改面板时才需要 Node
 ```
 
 ## 免责声明
