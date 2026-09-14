@@ -9,13 +9,21 @@ data/
 /credit
 /wb2api
 /signin_bin
+# 同一批二进制的 Windows 构建产物（login.exe / credit.exe / wb2api.exe / signin.exe）
+# 无同名源码目录之虞，一条锚定规则即可
+/*.exe
 
 # Config with secrets (use config.example.json)
+# config.json.bak 是密钥管理面板写入前留的备份，同样含密钥，必须一并排除
+# （原子写的中间态 config.json.tmp 由下面的 *.tmp 覆盖）
 config.json
+config.json.bak
 
 # Build artifacts
 *.tmp
 __pycache__/
+# 手工备份二进制时的 ~ 后缀（/*.exe 匹配不到 wb2api.exe~）
+*~
 
 # Backups (contains auth tokens)
 backups/
@@ -23,6 +31,8 @@ backups/
 # IDE
 .idea/
 .vscode/
+# playwright MCP 的会话产物（console/page 转储）
+.playwright-mcp/
 LOOP.md
 PLAN.md
 SPEC.md
