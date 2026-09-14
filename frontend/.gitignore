@@ -1,0 +1,27 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+# 真正的构建产物输出到 internal/web/dist（见 vite.config.ts 的 OUT_DIR），
+# 那一份要进版本库 —— 没有它 go build 会因缺少 //go:embed 的目标而失败。
+# 这两条留着兜底：万一有人把 outDir 改回项目内，产物不该进版本库。
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
