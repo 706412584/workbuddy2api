@@ -92,11 +92,11 @@ const (
 
 // CheckinOutcome 单账号签到结果（供手动签到回执与日志汇总）。
 type CheckinOutcome struct {
-	UID      string         `json:"uid"`
-	Nickname string         `json:"nickname,omitempty"`
-	Status   CheckinStatus  `json:"status"`
-	Credits  *int64         `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
-	Detail   string         `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
+	UID      string        `json:"uid"`
+	Nickname string        `json:"nickname,omitempty"`
+	Status   CheckinStatus `json:"status"`
+	Credits  *int64        `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
+	Detail   string        `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
 }
 
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
@@ -202,10 +202,36 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
-func (s *Scheduler) RunCheckinNow() {
-	if _, err := s.CheckinAll(); err != nil {
+//
+// 返回一句人类可读的摘要，供面板「立即执行」展示。定时路径（Run 的分发）忽略返回值。
+func (s *Scheduler) RunCheckinNow() string {
+	out, err := s.CheckinAll()
+	if err != nil {
+		// 唯一可能的错误是 ErrBusy（与定时那趟撞车）。如实说明，不要让面板显示成"已完成"。
 		log.Printf("scheduled checkin skipped: %v", err)
+		return "未执行：" + err.Error()
 	}
+	okN, alreadyN, skipN, failN := countCheckin(out)
+	return fmt.Sprintf("%d 个账号：成功 %d · 已签到 %d · 跳过 %d · 失败 %d",
+		len(out), okN, alreadyN, skipN, failN)
+}
+
+// countCheckin 把逐账号结果汇总成四个计数。
+// 日志汇总与「立即执行」摘要共用本函数：两处若各写一遍 switch，口径迟早会分叉。
+func countCheckin(out []CheckinOutcome) (okN, alreadyN, skipN, failN int) {
+	for _, o := range out {
+		switch o.Status {
+		case CheckinOK:
+			okN++
+		case CheckinAlready:
+			alreadyN++
+		case CheckinSkipped:
+			skipN++
+		default:
+			failN++
+		}
+	}
+	return
 }
 
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
@@ -222,19 +248,16 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 
 	statuses := s.cfg.Pool.List()
 	out := make([]CheckinOutcome, 0, len(statuses))
-	var okN, alreadyN, failN, skipN int
 	for _, st := range statuses {
 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
 		if st.Disabled {
 			oc.Status, oc.Detail = CheckinSkipped, "disabled"
-			skipN++
 			out = append(out, oc)
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
-			skipN++
 			out = append(out, oc)
 			continue
 		}
@@ -252,7 +275,6 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				// 会让本可成功的签到被白白跳过）；真正过期才判定失败。
 				if a.NeedsRefresh(0) {
 					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
-					failN++
 					out = append(out, oc)
 					continue
 				}
@@ -266,7 +288,6 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// global（workbuddy.ai）无签到活动：调用恒返回 code=10001「签到活动未开启或已过期」，
 		// 只是噪音日志。跳过签到但仍走下面的余额查询——解冻靠余额恢复，不靠签到本身。
 		if a.Region() == auth.RegionGlobal {
-			// skipN 由下方 switch 统一累加（此路径还要继续查余额，不能提前 continue）。
 			oc.Status, oc.Detail = CheckinSkipped, "global 区无签到活动"
 		} else if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			if upstream.IsAlreadyCheckin(err) {
@@ -286,26 +307,16 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
 			oc.Status = CheckinFail
 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
-			failN++
 			out = append(out, oc)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
 		oc.Credits = &remain
-		switch oc.Status {
-		case CheckinOK:
-			okN++
-		case CheckinAlready:
-			alreadyN++
-		case CheckinSkipped:
-			// global 区跳过签到不算失败（上面的 switch 已在跳过时加过 skipN，
-			// 但那处是提前 continue 的路径；这里是走完余额查询的 global 路径）。
-			skipN++
-		default:
-			failN++
-		}
 		out = append(out, oc)
 	}
+	// 计数统一由 countCheckin 从结果切片算出（每条路径都先 append 再 continue，
+	// 两种算法等价）。散在循环里自增会让「日志汇总」与「立即执行摘要」两处口径分叉。
+	okN, alreadyN, skipN, failN := countCheckin(out)
 	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
 		len(statuses), okN, alreadyN, failN, skipN)
 	return out, nil
@@ -333,15 +344,19 @@ func joinDetail(existing, add string) string {
 // ② 无猫账号立即重试领养（travelAdoptForce）——对话量刚补满的新状态，不算重试，
 // 豁免 adoptTriedToday 当日防抖（旅行排程 09 点已领养过且 skip，10 点上报补满后
 // 不能依赖下一轮旅行领养，就地闭环）。
-func (s *Scheduler) RunActivityNow() {
+// 返回一句人类可读的摘要，供面板「立即执行」展示。
+func (s *Scheduler) RunActivityNow() string {
 	count := s.cfg.ActivityReportCount
 	first := true
+	var done, failed, skipped int
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			skipped++
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
+			skipped++
 			continue
 		}
 		if !first {
@@ -364,11 +379,14 @@ func (s *Scheduler) RunActivityNow() {
 			}
 		}
 		if ok < count {
+			failed++
 			continue // N 条未发满：streak 自检与领养均无意义，下个账号
 		}
+		done++
 		s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
 		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
 	}
+	return fmt.Sprintf("上报完成 %d · 失败 %d · 跳过 %d（每号 %d 条）", done, failed, skipped, count)
 }
 
 // checkActivityStreak 上报成功后回读连登天数（只读 oracle，发现静默失败）。
@@ -396,20 +414,26 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
-func (s *Scheduler) RunKeepaliveNow() {
+// 返回一句人类可读的摘要，供面板「立即执行」展示。
+func (s *Scheduler) RunKeepaliveNow() string {
+	var refreshed, failed, disabled, skipped int
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			skipped++
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
+			skipped++
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+			failed++
 			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
+					disabled++
 					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.UID8(st.UID), pool.SessionDeadThreshold())
 				}
 			}
@@ -419,5 +443,12 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
 		}
+		refreshed++
 	}
+	sum := fmt.Sprintf("刷新成功 %d · 失败 %d · 跳过 %d", refreshed, failed, skipped)
+	if disabled > 0 {
+		// 禁用是破坏性结果（要重新登录才能恢复），单列出来，别混在"失败"里被忽略。
+		sum += fmt.Sprintf(" · 新增禁用 %d", disabled)
+	}
+	return sum
 }

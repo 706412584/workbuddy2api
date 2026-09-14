@@ -7,6 +7,7 @@ import {
   getRegionModels,
   getSchedule,
   resetAccounts,
+  runScheduleTask,
   testAccount,
 } from '../api/client'
 
@@ -86,8 +87,17 @@ function fmtClock(iso: string): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-/** 定时任务排程卡：下次运行时间。全部为推算值 —— 网关不暴露调度状态。 */
-function ScheduleCard({ sched }: { sched: ScheduleStatus }) {
+/** 定时任务排程卡：下次运行时间 + 立即执行。 */
+function ScheduleCard({
+  sched,
+  running,
+  onRun,
+}: {
+  sched: ScheduleStatus
+  /** 正在触发请求的任务 key（POST 尚未返回）；执行中由 sched.tasks[].manual 反映 */
+  running: string
+  onRun: (key: ScheduleStatus['tasks'][number]['key']) => void
+}) {
   const anyConfigOnly = sched.tasks.some((t) => t.source === 'config')
   // 倒计时以响应里的服务端时刻为基准（渲染期不读时钟）；卡片 60s 一刷，分钟级够用。
   const base = new Date(sched.now).getTime()
@@ -99,7 +109,7 @@ function ScheduleCard({ sched }: { sched: ScheduleStatus }) {
         <span className="sub">下次运行</span>
         <div className="spacer" />
         <span className="dim" style={{ fontSize: 11.5 }}>
-          由面板按排程推算，非网关上报
+          时点为推算值，执行记录来自网关
         </span>
       </header>
       <div className="body">
@@ -110,55 +120,87 @@ function ScheduleCard({ sched }: { sched: ScheduleStatus }) {
               <th>时点</th>
               <th>下次</th>
               <th>本进程上次</th>
+              <th>手动执行</th>
               <th>说明</th>
+              <th />
             </tr>
           </thead>
           <tbody>
-            {sched.tasks.map((t) => (
-              <tr key={t.key}>
-                <td style={{ color: 'var(--text-strong)' }}>
-                  {t.label}
-                  {!t.enabled && <span className="badge err" style={{ marginLeft: 6 }}>已禁用</span>}
-                </td>
-                <td className="mono dim">
-                  {t.hours.length
-                    ? t.hours.map((h) => `${String(h).padStart(2, '0')}:00`).join(' ')
-                    : '—'}
-                </td>
-                <td className="mono">
-                  {t.nextRun ? (
-                    <>
-                      <span style={{ color: 'var(--text-strong)' }}>{fmtClock(t.nextRun)}</span>
-                      <span className="dim"> · 还有 {fmtLeft(new Date(t.nextRun).getTime() - base)}</span>
-                    </>
-                  ) : (
-                    <span className="dim">—</span>
-                  )}
-                </td>
-                <td className="mono dim" style={{ fontSize: 11.5 }}>
-                  {t.lastRun
-                    ? new Date(t.lastRun).toLocaleString('zh-CN', { hour12: false })
-                    : t.quiet
-                      ? '无记录'
-                      : '未跑过'}
-                </td>
-                <td className="dim" style={{ fontSize: 11.5 }}>
-                  {t.note}
-                  {t.source === 'config' && (
-                    <div style={{ color: 'var(--warn)' }}>
-                      时点取自 config.json，未与运行中的进程核对
-                    </div>
-                  )}
-                </td>
-              </tr>
-            ))}
+            {sched.tasks.map((t) => {
+              // 两处「忙」：POST 在途（running）与后台真的在跑（manual.running）。
+              // 前者是毫秒级，后者可达两分钟，都要禁掉按钮防重复触发。
+              const busy = running === t.key || !!t.manual?.running
+              return (
+                <tr key={t.key}>
+                  <td style={{ color: 'var(--text-strong)' }}>
+                    {t.label}
+                    {!t.enabled && <span className="badge err" style={{ marginLeft: 6 }}>已禁用</span>}
+                  </td>
+                  <td className="mono dim">
+                    {t.hours.length
+                      ? t.hours.map((h) => `${String(h).padStart(2, '0')}:00`).join(' ')
+                      : '—'}
+                  </td>
+                  <td className="mono">
+                    {t.nextRun ? (
+                      <>
+                        <span style={{ color: 'var(--text-strong)' }}>{fmtClock(t.nextRun)}</span>
+                        <span className="dim"> · 还有 {fmtLeft(new Date(t.nextRun).getTime() - base)}</span>
+                      </>
+                    ) : (
+                      <span className="dim">—</span>
+                    )}
+                  </td>
+                  <td className="mono dim" style={{ fontSize: 11.5 }}>
+                    {t.lastRun
+                      ? new Date(t.lastRun).toLocaleString('zh-CN', { hour12: false })
+                      : t.quiet
+                        ? '无记录'
+                        : '未跑过'}
+                  </td>
+                  <td style={{ fontSize: 11.5, maxWidth: 260 }}>
+                    {t.manual ? (
+                      <>
+                        <span className="mono dim">
+                          {new Date(t.manual.started).toLocaleString('zh-CN', { hour12: false })}
+                        </span>
+                        <div style={{ color: t.manual.running ? 'var(--warn)' : undefined }}>
+                          {t.manual.running ? '执行中…' : t.manual.summary}
+                        </div>
+                      </>
+                    ) : (
+                      <span className="dim">未手动执行过</span>
+                    )}
+                  </td>
+                  <td className="dim" style={{ fontSize: 11.5 }}>
+                    {t.note}
+                    {t.source === 'config' && (
+                      <div style={{ color: 'var(--warn)' }}>
+                        时点取自 config.json，未与运行中的进程核对
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    <button
+                      className="btn"
+                      disabled={busy}
+                      title="立即执行一次；跑完的结果显示在左侧「手动执行」列"
+                      onClick={() => onRun(t.key)}
+                    >
+                      {busy ? '执行中' : '执行'}
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
 
         <div className="dim" style={{ fontSize: 11, marginTop: 10, lineHeight: 1.7 }}>
           时点表取自网关启动时打的排程日志，只统计本次进程启动之后的执行。
           调度器只在出错或跳过时打日志，成功路径静默 —— 标「无记录」不代表没跑过，
-          而是这一趟没留下日志。所有值都由面板推算，网关不暴露调度状态。
+          而是这一趟没留下日志。时点与「本进程上次」由面板按日志推算；
+          「手动执行」是网关记录的真实运行态（重启即忘）。执行期间本卡每 3s 刷新一次。
           {anyConfigOnly && ' 标黄的任务时点取自 config.json，未与运行中的进程核对。'}
           {sched.logTruncated && ' 日志只读了末尾一块，更早的启动行可能没读到。'}
         </div>
@@ -209,8 +251,14 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
     }
   }, [])
 
-  /** 定时任务排程（推算值）。60s 一次：它只按整点变化，跟 5s 的账号轮询不同频。 */
+  /**
+   * 定时任务排程。空闲时 60s 一次（时点只按整点变化，跟 5s 的账号轮询不同频）；
+   * 有任务在跑时 3s 一次 —— 否则一趟两分钟的执行，面板要等一分钟才更新状态。
+   */
   const [sched, setSched] = useState<ScheduleStatus | null>(null)
+  /** 正在触发 POST 的任务 key（毫秒级，仅用于立刻禁用按钮） */
+  const [triggering, setTriggering] = useState('')
+  const anyRunning = !!sched?.tasks.some((t) => t.manual?.running)
   useEffect(() => {
     let cancelled = false
     const load = () =>
@@ -222,10 +270,27 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
           // 拿不到就不显示这张卡，总览页其余部分不受影响
         })
     void load()
-    const t = setInterval(load, 60_000)
+    const t = setInterval(load, anyRunning ? 3_000 : 60_000)
     return () => {
       cancelled = true
       clearInterval(t)
+    }
+  }, [anyRunning])
+
+  /**
+   * 立即执行一次任务。POST 只表示「已开始」—— 真正的执行在网关后台跑，
+   * 结果要靠轮询 sched 的 manual 字段拿到（所以这里成功后就地刷一次排程）。
+   */
+  const runTask = useCallback(async (key: ScheduleStatus['tasks'][number]['key']) => {
+    setTriggering(key)
+    setErr('')
+    try {
+      await runScheduleTask(key)
+      setSched(await getSchedule())
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setTriggering('')
     }
   }, [])
 
@@ -502,7 +567,7 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
         </div>
       </div>
 
-      {sched && <ScheduleCard sched={sched} />}
+      {sched && <ScheduleCard sched={sched} running={triggering} onRun={runTask} />}
 
       <div className="panel">
         <header>

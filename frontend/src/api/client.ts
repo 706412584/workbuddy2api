@@ -20,6 +20,7 @@ import type {
   LogTail,
   RequestStats,
   ScheduleStatus,
+  ScheduleTask,
 } from './types'
 import { PROTOCOLS } from './types'
 
@@ -346,8 +347,20 @@ export const getLogs = (lines: number) => adminJSON<LogTail>(`/__admin/logs?line
 export const getStats = (hours: number | null) =>
   adminJSON<RequestStats>(`/__admin/stats?hours=${hours ?? 'all'}`)
 
-/** 调度状态（推算值，网关不暴露）。 */
+/** 调度状态（时点与上次运行为推算值；manual 是真实的手动执行记录）。 */
 export const getSchedule = () => adminJSON<ScheduleStatus>('/__admin/schedule')
+
+/**
+ * 立即执行一次定时任务。
+ *
+ * 服务端**不等执行完**就返回（一趟全量要几十秒到两分钟），运行态由
+ * getSchedule 的 manual 字段透出 —— 触发后应转去轮询它，而不是等这个请求。
+ */
+export const runScheduleTask = (task: ScheduleTask['key']) =>
+  adminJSON<{ ok: true; task: string; label: string; msg: string }>('/__admin/schedule/run', {
+    method: 'POST',
+    body: JSON.stringify({ task }),
+  })
 
 /**
  * 测单个账号的连通性。

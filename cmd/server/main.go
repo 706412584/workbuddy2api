@@ -196,6 +196,24 @@ func main() {
 		ModelsByRegion: func() (cn, global []string) {
 			return h.ModelsForRegion(auth.RegionCN), h.ModelsForRegion(auth.RegionGlobal)
 		},
+		// 立即执行一次定时任务（面板「执行」按钮）。阻塞到跑完，由 admin 放在
+		// 后台 goroutine 里调用并把「执行中／结果」透给面板。
+		//
+		// 任务被禁用（schedule.*_enabled=false）时这里照样执行：按钮是一次性显式
+		// 动作，与「要不要按排程自动跑」是两回事。
+		RunTask: func(key string) string {
+			switch key {
+			case "checkin":
+				return sch.RunCheckinNow()
+			case "travel":
+				return sch.RunTravelNow()
+			case "activity":
+				return sch.RunActivityNow()
+			case "keepalive":
+				return sch.RunKeepaliveNow()
+			}
+			return "未知任务：" + key
+		},
 	})
 
 	h = server.NewHandler(server.Config{

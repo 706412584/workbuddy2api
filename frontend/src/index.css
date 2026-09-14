@@ -186,6 +186,9 @@ button.btn {
   font-size: 13px;
   padding: 6px 13px;
   cursor: pointer;
+  /* 按钮文字一律不换行：窄单元格（如排程表最后一列）里「执行」会被挤成上下两字。
+     换行对按钮从来没有意义，宁可让表格横向滚动。 */
+  white-space: nowrap;
 }
 
 button.btn:hover:not(:disabled) {

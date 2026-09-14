@@ -51,6 +51,12 @@ type Config struct {
 	ReloadKeys func(legacy string, keys []KeyEntry)
 	// ModelsByRegion 返回两区各自可见的模型 id，供「测试连接」的模型下拉框用。
 	ModelsByRegion func() (cn, global []string)
+	// RunTask 立即执行一次指定任务（key 见 taskKeys），阻塞到跑完并返回一句摘要。
+	// nil = 本进程未接线调度器，「立即执行」不可用。
+	//
+	// 约定为阻塞式：调用方在后台 goroutine 里跑它，好在跑的过程中把「执行中」透给面板。
+	// 摘要即结果（失败也写在摘要里，见 taskRun.Summary）。
+	RunTask func(key string) string
 }
 
 // Handler 管理接口路由。
@@ -59,11 +65,13 @@ type Handler struct {
 	mux *http.ServeMux
 	// login poll 是单次性操作（成功即消费掉 state），并发调用会互相抢，故串行化。
 	pollMu sync.Mutex
+	// runs 「立即执行」的运行态（进程内，重启即忘）。
+	runs *runTracker
 }
 
 // New 构建管理接口。
 func New(cfg Config) *Handler {
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), runs: newRunTracker()}
 
 	h.mux.HandleFunc("GET /__admin/accounts", h.listAccounts)
 	h.mux.HandleFunc("POST /__admin/accounts/import", h.importAccount)
@@ -80,6 +88,7 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /__admin/logs", h.logs)
 	h.mux.HandleFunc("GET /__admin/stats", h.stats)
 	h.mux.HandleFunc("GET /__admin/schedule", h.schedule)
+	h.mux.HandleFunc("POST /__admin/schedule/run", h.runScheduleTask)
 	h.mux.HandleFunc("GET /__admin/models", h.regionModels)
 
 	h.mux.HandleFunc("GET /__admin/apikeys", h.getKeys)

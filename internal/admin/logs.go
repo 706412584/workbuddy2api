@@ -633,6 +633,16 @@ func (h *Handler) collectSchedule(now time.Time) map[string]any {
 		if s.declared {
 			source = "log"
 		}
+		// manual 是「立即执行」的运行态；从未手动跑过为 null。
+		// 与 lastRun 是两个来源：lastRun 从日志推算（含定时那趟），manual 只记手动。
+		//
+		// 显式判空而非直接塞 snapshot(k)：后者返回的是 *taskRun，nil 指针装进 any
+		// 会得到一个「非 nil 的接口包着 nil 指针」，`v != nil` 为真 —— 调用方与测试
+		// 都会误判成「跑过」。JSON 序列化虽然都出 null，但 Go 侧语义已经错了。
+		var manual any
+		if mr := h.runs.snapshot(k); mr != nil {
+			manual = mr
+		}
 		tasks = append(tasks, map[string]any{
 			"key":     k,
 			"label":   taskLabel[k],
@@ -644,6 +654,7 @@ func (h *Handler) collectSchedule(now time.Time) map[string]any {
 			// 成功时不打日志，lastRun 因此偏旧，UI 需说明
 			"quiet":   taskQuiet[k],
 			"nextRun": nextRun,
+			"manual":  manual,
 		})
 	}
 

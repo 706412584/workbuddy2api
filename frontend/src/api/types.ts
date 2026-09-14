@@ -238,9 +238,25 @@ export interface ScheduleTask {
   quiet: boolean
   /** 下一次运行时间（ISO）；任务禁用或时点表缺失为 null */
   nextRun: string | null
+  /**
+   * 「立即执行」的运行态；从未手动跑过为 null。
+   * 与 lastRun 是两个来源：lastRun 从日志推算（含定时那趟），manual 只记手动触发。
+   */
+  manual: ManualRun | null
 }
 
-/** 调度状态（GET /__admin/schedule）。全部为推算值，网关不暴露调度状态。 */
+/** 一次手动执行的记录（进程内，重启即忘）。 */
+export interface ManualRun {
+  running: boolean
+  /** 本轮开始时刻（ISO） */
+  started: string
+  /** 本轮结束时刻（ISO）；未跑完为零值时间 */
+  finished: string
+  /** 结果摘要；执行中为空串。失败也写在这里（如「未执行：与定时那趟撞车」） */
+  summary: string
+}
+
+/** 调度状态（GET /__admin/schedule）。 */
 export interface ScheduleStatus {
   now: string
   /** 是否定位到运行中进程的启动行 */
