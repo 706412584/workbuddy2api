@@ -109,6 +109,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request, key 
 		st:             st,
 		allowedRegions: allowedRegions,
 		model:          areq.Model,
+		clientIP:       clientIPFor(h.cfg.Upstream, r),
 		writeErr:       anthropicErrWriter(),
 	})
 	if rc == nil {

@@ -66,6 +66,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request, key *APIKeyS
 		st:             st,
 		allowedRegions: allowedRegions,
 		model:          rreq.Model,
+		clientIP:       clientIPFor(h.cfg.Upstream, r),
 	})
 	if rc == nil {
 		return // 失败：forwardChat 已回错（OpenAI 格式）
