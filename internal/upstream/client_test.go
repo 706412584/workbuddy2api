@@ -26,6 +26,10 @@ func TestClassify(t *testing.T) {
 		{403, `insufficient credits`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
+		// 上游 14018 原文是复数 "Credits exhausted"（真实 body）。hardMarkers 走子串
+		// 匹配，词中间的 's' 让 "credit exhausted" 对不上，会落进下面的 429 兜底被
+		// 判成 soft_rate：余额耗尽的号只软冷却十分钟就回池反复失败，而不是停到次日 04:00。
+		{429, `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below to purchase add-on packs and get more credits: https://www.codebuddy.ai/profile/usage","requestId":"x"}}}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
 		// 限流文案（issue #28）：状态码不是 429 时也必须识别为软限流，
 		// 否则账号不会被冷却，下次请求仍会被选中。
