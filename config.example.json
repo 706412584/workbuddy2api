@@ -7,6 +7,9 @@
   ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "server": {
+    "max_body_mb": 32
+  },
   "protocol": {
     "default_model": "deepseek-v4.1-flash",
     "model_mapping": {

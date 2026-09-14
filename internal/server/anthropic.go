@@ -48,6 +48,8 @@ func anthropicErrType(status int) string {
 		return "not_found_error"
 	case http.StatusTooManyRequests:
 		return "rate_limit_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
 	case http.StatusServiceUnavailable:
 		return "overloaded_error"
 	default:
@@ -57,9 +59,8 @@ func anthropicErrType(status int) string {
 
 // anthropicMessages POST /v1/messages
 func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
-	body, err := readBody(r)
-	if err != nil {
-		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "read body: "+err.Error())
+	body, ok := h.readBodyOrFail(w, r, true)
+	if !ok {
 		return
 	}
 	var areq apicompat.AnthropicRequest
@@ -205,9 +206,8 @@ func (h *Handler) bufferAsAnthropic(w http.ResponseWriter, rc io.ReadCloser, cli
 // 上游没有 token 计数接口，故本地估算。Claude Code 用它做上下文预算，
 // 估值有偏差可接受，但绝不能报错——该端点失败会让客户端提前压缩上下文。
 func (h *Handler) countTokens(w http.ResponseWriter, r *http.Request, _ *APIKeySpec) {
-	body, err := readBody(r)
-	if err != nil {
-		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "read body: "+err.Error())
+	body, ok := h.readBodyOrFail(w, r, true)
+	if !ok {
 		return
 	}
 	var areq apicompat.AnthropicRequest

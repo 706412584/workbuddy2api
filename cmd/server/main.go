@@ -192,6 +192,7 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20,
 		Web:          web.Handler(),
 		Admin:        adm,
 	})

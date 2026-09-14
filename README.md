@@ -244,6 +244,7 @@ cd frontend && npm run dev     # :7864，/api 与 /__admin 都反代到 :7863
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新/签到/余额/模型）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
+| `server.max_body_mb` | `32` | 请求体大小上限（MB）。超限返回 **413 `request_body_too_large`**，不再静默截断喂给上游（多图/超长上下文会话请调大） |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `upstash.url` / `token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
@@ -270,7 +271,7 @@ cd frontend && npm run dev     # :7864，/api 与 /__admin 都反代到 :7863
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
 
 ## 🧠 账号池与流量治理
 
@@ -406,7 +407,7 @@ cd frontend && npm run dev     # :7864，/api 与 /__admin 都反代到 :7863
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 `server.max_body_mb`（默认 32 MB） |
 | `POST /v1/messages` | 同上 | **Anthropic Messages 协议**（Claude Code 直连）；流式/非流式 |
 | `POST /v1/messages/count_tokens` | 同上 | token 计数（**本地估算**，上游无此接口；仅用于客户端上下文预算） |
 | `POST /v1/responses` | 同上 | **OpenAI Responses 协议**（Codex CLI 直连）；流式/非流式 |
@@ -505,6 +506,19 @@ curl -s http://127.0.0.1:7863/healthz | grep -q '"service":"workbuddy2api"'
 
 - 出站请求强制 `stream:true`；SSE 帧按 OpenAI 规范**白名单重建**（`reasoning_content` 保留、工具调用按 index 合并、未知字段剥离）
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`；`error` 帧原样透传
+
+### 请求体超限（413）
+
+请求体超过 `server.max_body_mb`（默认 32 MB）时网关直接返回：
+
+```json
+{"error":{"message":"请求体超过 32 MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试","type":"api_error","code":"request_body_too_large"}}
+```
+
+该错误在**网关侧**判出，**不打上游、不罚账号、不轮转** —— 收到 413 即表示是请求体本身
+超限（多图/超长上下文场景），调大 `server.max_body_mb` 即可（`WB2A_MAX_BODY_MB` 同样生效）。
+历史版本的静默截断已废弃：8 MB 截断会把半截 JSON 喂给上游触发
+`Unmarshal chat params failed ... unexpected EOF`，网关却把责任记在账号头上（罚号 + 轮转耗尽 503）。
 
 ## 📋 请求级日志
 

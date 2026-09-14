@@ -19,9 +19,8 @@ import (
 // 错误体沿用 OpenAI 格式：Responses API 的 error 结构与 chat completions 相同
 // （{"error":{"message","type","code"}}），Codex 按此解析，无需另写一套。
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
-	body, err := readBody(r)
-	if err != nil {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request", "read body: "+err.Error())
+	body, ok := h.readBodyOrFail(w, r, false)
+	if !ok {
 		return
 	}
 	var rreq apicompat.ResponsesRequest

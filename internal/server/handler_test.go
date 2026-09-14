@@ -1491,19 +1491,71 @@ func (fillReader) Read(p []byte) (int, error) {
 // 静默截断是 2026-09-13 那次 503 的根因：截断后的残体被原样转发上游，上游回 400
 // code=11101 unexpected EOF，网关只能对调用方报 503，排查时会一路怀疑账号与限流。
 func TestReadBodyRejectsOversize(t *testing.T) {
+	const limit = 1 << 20
+
 	// 超过上限：必须报错。
-	over := &http.Request{Body: io.NopCloser(io.LimitReader(fillReader{}, maxBodyBytes+1))}
-	if _, err := readBody(over); err == nil {
+	over := &http.Request{Body: io.NopCloser(io.LimitReader(fillReader{}, limit+1))}
+	if _, err := readBody(over, limit); err == nil {
 		t.Fatal("body > limit: got nil error, want error")
 	}
 
 	// 正好等于上限：必须放行（readBody 多读 1 字节用于判定，别把边界一起拒了）。
-	exact := &http.Request{Body: io.NopCloser(io.LimitReader(fillReader{}, maxBodyBytes))}
-	body, err := readBody(exact)
+	exact := &http.Request{Body: io.NopCloser(io.LimitReader(fillReader{}, limit))}
+	body, err := readBody(exact, limit)
 	if err != nil {
 		t.Fatalf("body == limit: unexpected error %v", err)
 	}
-	if len(body) != maxBodyBytes {
-		t.Fatalf("body == limit: got %d bytes, want %d", len(body), maxBodyBytes)
+	if int64(len(body)) != limit {
+		t.Fatalf("body == limit: got %d bytes, want %d", len(body), limit)
+	}
+}
+
+// TestReadBodyOrFailTooLarge 锁定超限时的响应形态：413 + 可辨识错误码。
+// 该错误在网关侧判出，不打上游、不罚账号、不轮转，调用方据此知道要调大
+// server.max_body_mb，而不是去查账号或限流。
+func TestReadBodyOrFailTooLarge(t *testing.T) {
+	const limit = 1 << 20
+	h := &Handler{cfg: Config{MaxBodyBytes: limit}}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", io.LimitReader(fillReader{}, limit+1))
+	if _, ok := h.readBodyOrFail(rec, r, false); ok {
+		t.Fatal("oversize body: got ok=true, want false")
+	}
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: got %d, want 413", rec.Code)
+	}
+	var got struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal error body: %v", err)
+	}
+	if got.Error.Code != "request_body_too_large" {
+		t.Fatalf("error code: got %q, want request_body_too_large", got.Error.Code)
+	}
+
+	// Anthropic 协议同一边界，但错误体结构不同（type=error + error.type）。
+	rec = httptest.NewRecorder()
+	r = httptest.NewRequest(http.MethodPost, "/v1/messages", io.LimitReader(fillReader{}, limit+1))
+	if _, ok := h.readBodyOrFail(rec, r, true); ok {
+		t.Fatal("anthropic oversize body: got ok=true, want false")
+	}
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("anthropic status: got %d, want 413", rec.Code)
+	}
+	var aerr struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &aerr); err != nil {
+		t.Fatalf("unmarshal anthropic error body: %v", err)
+	}
+	if aerr.Type != "error" || aerr.Error.Type != "request_too_large" {
+		t.Fatalf("anthropic error shape: got %+v, want type=error / error.type=request_too_large", aerr)
 	}
 }

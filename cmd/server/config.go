@@ -43,6 +43,14 @@ type Config struct {
 	// Protocol 协议适配（Anthropic /v1/messages、OpenAI /v1/responses）的模型名映射。
 	Protocol ProtocolConfig `json:"protocol"`
 
+	Server struct {
+		// MaxBodyMB 请求体大小上限（单位 MB，默认 32）。
+		// 超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
+		// （截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却把责任记在账号头上）。
+		// 0/负数视为非法 → 启动报错。
+		MaxBodyMB int `json:"max_body_mb"`
+	} `json:"server"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -140,6 +148,8 @@ func Default() *Config {
 	// 协议适配的默认目标模型：deepseek-v4.1-flash 在 CN 与 global 两区都存在，
 	// 且带 thinking。用户不配 protocol 段时，Claude Code / Codex 直接可用。
 	c.Protocol.DefaultModel = "deepseek-v4.1-flash"
+	// 32MB：base64 图片膨胀 4/3，一张几 MB 的图就能把请求顶到 8MB 以上。
+	c.Server.MaxBodyMB = 32
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -210,6 +220,11 @@ func applyEnv(c *Config) {
 			c.Upstream.IdleTimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.MaxBodyMB = n
+		}
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -219,6 +234,11 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	// max_body_mb 非法（0/负数）直接报错：静默当成默认值会让用户以为配了个"不限"，
+	// 大请求却又被 413 —— 不如 fail fast 提示显式配大上限。
+	if c.Server.MaxBodyMB <= 0 {
+		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
