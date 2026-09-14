@@ -675,8 +675,8 @@ var (
 	}
 	taskNote = map[string]string{
 		"checkin":   "非 global 账号签到 + 查余额解冻（global 区无此活动）",
-		"travel":    "独立排程：领养 / 派出 / 领奖，一趟只做一个动作",
-		"activity":  "每个账号上报一次对话活跃，点亮连登",
+		"travel":    "独立排程：领养 / 派出 / 领奖，一趟只做一个动作（global 区写接口不可用，跳过）",
+		"activity":  "每个账号上报一次对话活跃，点亮连登（global 区不做 streak 自检）",
 		"keepalive": "刷新所有账号 token；session 死亡的会被禁用",
 	}
 	// 调度器只在出错/跳过时打日志，成功路径静默 —— 这几个任务的「上次」天然偏旧

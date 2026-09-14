@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -100,6 +101,111 @@ func TestRunTravelNowSummaryNoAccounts(t *testing.T) {
 	}
 	if !strings.Contains(got, "没有可巡检") {
 		t.Errorf("摘要=%q 应说明没有账号", got)
+	}
+}
+
+// TestTravelSkipsGlobalAdopt global 区的 buddy/agreement 实测恒 500（CN 同请求正常），
+// 调度器必须跳过领养而不是每趟白打 18 次必然失败的请求、报 18 条「失败」。
+func TestTravelSkipsGlobalAdopt(t *testing.T) {
+	var agreementCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "buddy/agreement") {
+			atomic.AddInt32(&agreementCalls, 1)
+			http.Error(w, `{"code":500,"msg":"internal server error"}`, 500)
+			return
+		}
+		if strings.Contains(r.URL.Path, "buddy/info") {
+			w.Write([]byte(`{"code":0,"data":{"buddy":null}}`)) // 无猫
+			return
+		}
+		http.Error(w, "not found", 404)
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGl: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	got := s.RunTravelNow()
+	if n := atomic.LoadInt32(&agreementCalls); n != 0 {
+		t.Errorf("global 账号不应调用 agreement，实际调用 %d 次", n)
+	}
+	if !strings.Contains(got, "跳过 1") {
+		t.Errorf("摘要 %q 应把 global 账号算作跳过", got)
+	}
+	if strings.Contains(got, "失败") {
+		t.Errorf("摘要 %q 不应出现失败（不是账号故障）", got)
+	}
+}
+
+// TestTravelCNStillAdopts CN 账号不受影响：仍会走 agreement 并领养。
+// 这条是上一条的对照 —— 守卫只该拦 global。
+func TestTravelCNStillAdopts(t *testing.T) {
+	var agreementCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "buddy/agreement"):
+			atomic.AddInt32(&agreementCalls, 1)
+			w.Write([]byte(`{"code":0,"msg":"OK"}`))
+		case strings.Contains(r.URL.Path, "buddy/first"):
+			w.Write([]byte(`{"code":0,"msg":"OK"}`))
+		case strings.Contains(r.URL.Path, "buddy/info"):
+			w.Write([]byte(`{"code":0,"data":{"buddy":null}}`)) // 无猫 → 走领养
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "c1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: 9999999999, Domain: "copilot.tencent.com"})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGl: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	got := s.RunTravelNow()
+	if n := atomic.LoadInt32(&agreementCalls); n != 1 {
+		t.Errorf("CN 账号应调用 agreement 1 次，实际 %d", n)
+	}
+	if !strings.Contains(got, "领养 1") {
+		t.Errorf("摘要 %q 应报领养成功", got)
+	}
+}
+
+// TestActivitySkipsGlobalStreakCheck global 区不做 streak 自检（该区端点恒 500，
+// 调了必失败，只会给每个号刷一条 WARN 噪音）。
+func TestActivitySkipsGlobalStreakCheck(t *testing.T) {
+	fastActivity(t)
+	var streakCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/report":
+			w.Write([]byte(`{"code":0,"msg":"OK"}`))
+		case strings.Contains(r.URL.Path, "growth/streak"):
+			atomic.AddInt32(&streakCalls, 1)
+			http.Error(w, `{"code":500,"msg":"internal server error"}`, 500)
+		case strings.Contains(r.URL.Path, "buddy/info"):
+			w.Write([]byte(`{"code":0,"data":{"buddy":null}}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGl: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
+
+	s.RunActivityNow()
+	if n := atomic.LoadInt32(&streakCalls); n != 0 {
+		t.Errorf("global 账号不应调用 growth/streak，实际 %d 次", n)
 	}
 }
 

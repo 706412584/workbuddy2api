@@ -165,6 +165,21 @@ func (s *Scheduler) travelAdoptForce(a *auth.Auth) {
 // 记一次当日已试后静默跳过，不再重试。force=true 时豁免当日防抖（活跃上报补满对话量后重试）。
 // 返回动作名供 RunTravelNow 汇总；调用方若只关心副作用可忽略。
 func (s *Scheduler) adoptBuddy(a *auth.Auth, force bool) string {
+	// global（workbuddy.ai）区的 buddy/agreement 实测恒 500，领养在该区不可用。
+	//
+	// 2026-09-14 用真实账号对照实测（同请求、同头，只换账号）：
+	//   CN 账号：buddy/info OK · buddy/agreement OK · growth/streak OK(days=1)
+	//   global ：buddy/info OK · buddy/agreement 500 · growth/streak 500
+	// 即：不是账号问题，也不是请求形态问题（同区只读接口正常，写接口挂）；
+	// 是该区写接口未开放或故障。同理 growth/streak 在该区也不可用。
+	//
+	// 故跳过而不报失败：这不是账号故障，报失败（"失败 18"）会让运维去查一个不存在的
+	// 问题，并每趟白打 18 次必然 500 的请求。与「global 区无签到活动」同属区域能力差异。
+	//
+	// 若将来腾讯在该区开放 buddy，删掉这行即可恢复；判定依据随之失效，故在此留验。
+	if a.Region() == auth.RegionGlobal {
+		return "跳过"
+	}
 	if !force && s.adoptTriedToday(a.UID) {
 		return "跳过" // 当日已判定门槛未达，不重试
 	}

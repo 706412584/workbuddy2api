@@ -383,8 +383,13 @@ func (s *Scheduler) RunActivityNow() string {
 			continue // N 条未发满：streak 自检与领养均无意义，下个账号
 		}
 		done++
-		s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
-		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
+		// streak 自检是只读 oracle（查「上报 200 但静默丢弃」）。global 区的
+		// growth/streak 实测恒 500（见 travel.go adoptBuddy 的对照实测），调了必失败，
+		// 白白每号打一条 WARN 噪音 —— 该区拿不到这个信号，就不假装在查。
+		if a.Region() != auth.RegionGlobal {
+			s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
+		}
+		s.travelAdoptForce(a) // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖，global 区内部自会跳过）
 	}
 	return fmt.Sprintf("上报完成 %d · 失败 %d · 跳过 %d（每号 %d 条）", done, failed, skipped, count)
 }
