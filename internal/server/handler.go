@@ -4,6 +4,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -625,9 +626,9 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, err := readBody(r)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request", "read body: "+err.Error())
 		return
 	}
 	var peek struct {
@@ -736,6 +737,36 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// maxBodyBytes 请求体上限。
+// base64 图片膨胀 4/3，一张几 MB 的图就能把请求顶到 8MB 以上，故不能设太小。
+const maxBodyBytes = 32 << 20
+
+// readBody 读取请求体；超过 maxBodyBytes 时返回错误，而不是静默截断。
+//
+// 为什么要包一层：裸 io.LimitReader 到上限即返回 EOF，io.ReadAll 会拿到一个
+// **被截断的 JSON 却无任何错误**。该残体被原样转发给上游，上游回 400
+// code=11101 "Unmarshal chat params failed with error: unexpected EOF"，
+// 网关对调用方只能报 503 —— 排查时会一路怀疑账号/限流，实际是本地截断。
+// 2026-09-13 实测：一张图即触发；截断点常落在 messages 之后，连 model 字段都
+// 读不到，于是日志 model 列与错误文案里的模型名都是空的。
+// 多读 1 字节才能区分「正好等于上限」与「超过上限」。
+func readBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxBodyBytes {
+		// 报错前先把剩余请求体读掉再返回：服务端在客户端仍在上传时就关连接，
+		// 客户端拿到的是连接重置而不是这个 413（curl 与 python urllib 均能复现，
+		// 是否读到取决于时序）—— 那等于把真实原因又藏起来，正是本次要修的问题。
+		// 排空只占带宽不占内存，且必须设上限：服务端只配了 ReadHeaderTimeout，
+		// 没有 ReadTimeout，不设限的话恶意客户端可以一直流式上传把连接占住。
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBodyBytes))
+		return nil, fmt.Errorf("request body exceeds %d MB", maxBodyBytes>>20)
+	}
+	return body, nil
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

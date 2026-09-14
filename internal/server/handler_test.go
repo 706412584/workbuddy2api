@@ -1476,3 +1476,34 @@ func TestUnknownAPIKeyRejected(t *testing.T) {
 		t.Fatalf("code=%d want 401", rec.Code)
 	}
 }
+
+// fillReader 无限产出固定字节，避免为超限测试真的分配 32MB。
+type fillReader struct{}
+
+func (fillReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// TestReadBodyRejectsOversize 锁定「超限要报错，不能静默截断」。
+// 静默截断是 2026-09-13 那次 503 的根因：截断后的残体被原样转发上游，上游回 400
+// code=11101 unexpected EOF，网关只能对调用方报 503，排查时会一路怀疑账号与限流。
+func TestReadBodyRejectsOversize(t *testing.T) {
+	// 超过上限：必须报错。
+	over := &http.Request{Body: io.NopCloser(io.LimitReader(fillReader{}, maxBodyBytes+1))}
+	if _, err := readBody(over); err == nil {
+		t.Fatal("body > limit: got nil error, want error")
+	}
+
+	// 正好等于上限：必须放行（readBody 多读 1 字节用于判定，别把边界一起拒了）。
+	exact := &http.Request{Body: io.NopCloser(io.LimitReader(fillReader{}, maxBodyBytes))}
+	body, err := readBody(exact)
+	if err != nil {
+		t.Fatalf("body == limit: unexpected error %v", err)
+	}
+	if len(body) != maxBodyBytes {
+		t.Fatalf("body == limit: got %d bytes, want %d", len(body), maxBodyBytes)
+	}
+}
