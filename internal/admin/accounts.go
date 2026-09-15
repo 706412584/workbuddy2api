@@ -354,9 +354,34 @@ func (h *Handler) testAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// runAccountTest 跑一次测试。不返回错误：失败也是一种结果，界面要原样展示原因。
+// accountTestBudget 单次连通性测试的总时长上限。
+// ChatStream 不接收 context，其头超时（120s）+ 首帧（30s）串起来最坏 150s；
+// 诊断用途等不起 —— 外层用同首帧的 goroutine+select 模式封顶。
+// 超时后内层 goroutine 仍会跑到自己的超时才退出（最多占住一条连接，低频可接受）。
+// 用 var：测试把上限缩短，否则用例要真等满预算。
+var accountTestBudget = 10 * time.Second
+
+// runAccountTest 跑一次测试并施加总时长上限。不返回错误：失败也是一种结果，界面要原样展示原因。
+func (h *Handler) runAccountTest(uid, model string) testResult {
+	started := time.Now()
+	ch := make(chan testResult, 1)
+	go func() { ch <- h.probeAccount(uid, model) }()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(accountTestBudget):
+		return testResult{
+			UID:       uid,
+			Model:     model,
+			LatencyMs: time.Since(started).Milliseconds(),
+			Message:   fmt.Sprintf("测试超过 %ds 上限：上游未在本连接上响应", int(accountTestBudget.Seconds())),
+		}
+	}
+}
+
+// probeAccount 实际探测；超时兜底由 runAccountTest 负责。
 // 用命名返回值：LatencyMs 由 defer 在出口处才填，具名才能写进真正的返回槽。
-func (h *Handler) runAccountTest(uid, model string) (res testResult) {
+func (h *Handler) probeAccount(uid, model string) (res testResult) {
 	res = testResult{UID: uid, Model: model}
 	started := time.Now()
 	defer func() { res.LatencyMs = time.Since(started).Milliseconds() }()

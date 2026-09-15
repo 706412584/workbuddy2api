@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -322,6 +323,18 @@ type Client struct {
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
 	tr := &http.Transport{
+		// 显式配置 DialContext：零值只有 KeepAlive、没有拨号超时，
+		// 对端 SYN 不回时应答时 TCP 层可挂数分钟。
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		// 上游走 h2（错误文案 "http2: timeout awaiting response headers"）；
+		// 自定义 DialContext 会关掉自动 h2，必须显式强制开启。
+		ForceAttemptHTTP2: true,
+		// ResponseHeaderTimeout 在请求体写完后才起算，握手不在其保护范围内；
+		// 缺这条则 TLS 握手黑洞可以无限挂（ChatHTTP 无总时长兜底）。
+		TLSHandshakeTimeout: 10 * time.Second,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
