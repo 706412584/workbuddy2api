@@ -2,6 +2,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,7 +155,10 @@ func (h *Handler) SetKeys(legacy string, keys []APIKeySpec) {
 }
 
 // withAuth 校验 Bearer 密钥并把命中的 spec 传给处理器。
-// 密钥用 == 比较而非恒定时间比较：与改造前一致，不引入新的行为差异。
+// 多密钥（每把可绑区域）逐把比对；比较用 ConstantTimeCompare（发现 7）：
+// == 的短路时序随前缀长度变化，公网暴露下理论上可逐字节探测 key 前缀。
+// 注意这里只对「长度相等」的候选走常量时间比较 —— 长度本身会泄漏，
+// 但不泄漏内容，且 length 无法在不填充的前提下隐藏。
 func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h.keyMu.RLock()
@@ -171,7 +175,7 @@ func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 		}
 		token := strings.TrimPrefix(authz, "Bearer ")
 		for i := range keys {
-			if keys[i].Key == token {
+			if subtle.ConstantTimeCompare([]byte(keys[i].Key), []byte(token)) == 1 {
 				// 传指针而非副本：调用方需要读到 Region/Name。keys 是本地切片头，
 				// 但底层数组与 h.keys 共享 —— 热重载换掉 h.keys 后旧数组依然存活，
 				// 本次请求手里的指针始终有效。
