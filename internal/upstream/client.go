@@ -364,8 +364,16 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+// 末尾注入 prompt_cache_key（P0 费用优化）：按账号隔离的稳定缓存键，让同一客户端
+// 对同一账号的连续请求命中上游前缀缓存。会话段从 body 自带的 conversation_id /
+// conversationId 取（本地未解析 X-Conversation-ID 头，故只走 body 源）。
 func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(a))
+	body = PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(a))
+	uid := ""
+	if a != nil {
+		uid = a.UID
+	}
+	return InjectPromptCacheKey(body, uid, "")
 }
 
 // effortsSnapshot 返回该账号所在区域的 effort 能力缓存副本；nil 表示未知（透传不降级）。
