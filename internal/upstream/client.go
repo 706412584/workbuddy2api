@@ -402,13 +402,18 @@ const (
 )
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
+// body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
+// Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
@@ -489,9 +494,15 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		// 读失败时 raw 可能为半截：不把它交给 Classify（半截 body 可能命中
+		// 余额不足等 marker，把传输层故障误判成账号问题）。
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		cancel()
+		if readErr != nil {
+			log.Printf("ERR: [upstream] chat_stream uid=%s: read error body: %v", logfmt.UID8(a.UID), readErr)
+			return nil, resp.StatusCode, nil, readErr
+		}
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 			logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
@@ -527,7 +538,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}

@@ -579,3 +579,48 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
 	}
 }
+
+// failingReader 在吐出 prefix 后返回读错误，模拟「上游回了 500 但 body 传输中断」。
+type failingReader struct {
+	prefix []byte
+	done   bool
+}
+
+func (f *failingReader) Read(p []byte) (int, error) {
+	if !f.done {
+		f.done = true
+		n := copy(p, f.prefix)
+		return n, nil
+	}
+	return 0, errors.New("connection reset by peer")
+}
+
+func (f *failingReader) Close() error { return nil }
+
+// TestDoJSONReadErrorIsNotUpstreamError body 读失败必须返回普通错误（非 *Error）：
+// 半截 body 若进了 Classify，可能命中「余额不足」等 marker 把传输层故障
+// 误判成账号问题（长冷却罚号）。回归 doJSON 的 raw, _ := io.ReadAll 吞错。
+func TestDoJSONReadErrorIsNotUpstreamError(t *testing.T) {
+	// 半截 body 刻意含 hard credit marker：若实现吞掉读错误，Classify 会判 ErrHardCredit。
+	const half = `{"code":1,"msg":"余额不足`
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 500,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       &failingReader{prefix: []byte(half)},
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+	err := c.RefreshToken(a)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	var ue *Error
+	if errors.As(err, &ue) {
+		t.Fatalf("读失败应返回普通错误而非 *Error（半截 body 不得参与 Classify），得到 Kind=%v Status=%d Msg=%q",
+			ue.Kind, ue.Status, ue.Msg)
+	}
+	if !strings.Contains(err.Error(), "read body") {
+		t.Errorf("err = %q，应说明是 body 读取失败", err)
+	}
+}
