@@ -3,12 +3,15 @@ package admin
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,11 +23,29 @@ import (
 //
 // 复用现成的 login 工具（cmd/login，设备码 OAuth），不重写登录逻辑：
 //
-//	login url [cn|global] → stdout 为授权 URL，state 落盘
-//	login poll            → stdout 为凭证 JSON（成功时自删 state）
+//	login url [cn|global] [sessionId] → stdout 为授权 URL，state 落盘
+//	login poll [sessionId]            → stdout 为凭证 JSON（成功时自删 state）
 //
 // 两次调用必须同 cwd：login 的 state 路径是盘符相对的，换目录就找不到。
 // 故这里统一把工作目录钉在仓库根。
+//
+// sessionId 由本层生成并原样回给前端，前端轮询时带回来，从而把并发登录
+// 隔离开（见 newSessionID）。不带 sid 的调用走 login 的固定 state 路径，
+// 那是 login.sh 与手工调用的老路径。
+
+// sessionIDRE 合法 sessionId 的形状：纯字母数字，长度受限。
+// 它会被 login 拼进 state 文件名，故必须挡住路径分隔符与 ..。
+// 与 cmd/login 的 sessionIDRE 是同一条规则，两侧都校验。
+var sessionIDRE = regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`)
+
+// newSessionID 生成一次性登录会话标识（16 字节随机 → 32 位 hex）。
+func newSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
 
 // loginStart 生成授权链接。
 func (h *Handler) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -38,11 +59,16 @@ func (h *Handler) loginStart(w http.ResponseWriter, r *http.Request) {
 	if body.Region == "global" {
 		region = "global"
 	}
+	sid, err := newSessionID()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "生成登录会话失败：%v", err)
+		return
+	}
 	if err := h.ensureLoginBin(); err != nil {
 		fail(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	stdout, stderr, code, err := h.runLogin("url", region)
+	stdout, stderr, code, err := h.runLogin("url", region, sid)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "启动登录工具失败：%v", err)
 		return
@@ -60,14 +86,28 @@ func (h *Handler) loginStart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, "login url 未返回授权链接：%s", strings.TrimSpace(stdout))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"region": region, "authUrl": authURL})
+	writeJSON(w, http.StatusOK, map[string]any{"region": region, "authUrl": authURL, "sessionId": sid})
 }
 
 // loginPoll 查询登录结果。未完成不是错误，回 200 + pending 让前端继续轮询。
 func (h *Handler) loginPoll(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	// 没有会话标识 = 没先点「生成授权链接」（或页面刷新丢了），或 sid 被伪造。
+	// 这种请求不能退化成 pending：前端会无限「等待浏览器完成登录」而看不出原因。
+	if !sessionIDRE.MatchString(body.SessionID) {
+		fail(w, http.StatusBadRequest, "没有进行中的登录会话，请先点「生成授权链接」")
+		return
+	}
 	// 单次性操作：成功即消费掉 state，并发调用会互相抢
 	if !h.pollMu.TryLock() {
-		writeJSON(w, http.StatusConflict, map[string]any{"status": "busy", "message": "上一次查询还没结束"})
+		// 回 200：busy 是「稍后再问」而非错误，前端据此静默跳过本轮。
+		// 回 409 会被前端的 adminJSON 当错误抛出并终止轮询。
+		writeJSON(w, http.StatusOK, map[string]any{"status": "busy", "message": "上一次查询还没结束"})
 		return
 	}
 	defer h.pollMu.Unlock()
@@ -76,7 +116,7 @@ func (h *Handler) loginPoll(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	stdout, stderr, code, err := h.runLogin("poll")
+	stdout, stderr, code, err := h.runLogin("poll", body.SessionID)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "启动登录工具失败：%v", err)
 		return
@@ -155,6 +195,10 @@ func regionOf(domain string) string {
 // 返回的 code 是 login 自己的退出码；err 只在「根本没跑起来」时非 nil（ENOENT 等），
 // 两者语义不同：前者是业务结果，后者是环境问题。
 func (h *Handler) runLogin(args ...string) (stdout, stderr string, code int, err error) {
+	// 测试注入缝：替掉子进程，避免依赖真实二进制与网络。
+	if h.cfg.RunLogin != nil {
+		return h.cfg.RunLogin(args...)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, h.cfg.LoginBin, args...)
@@ -175,6 +219,10 @@ func (h *Handler) runLogin(args ...string) (stdout, stderr string, code int, err
 
 // ensureLoginBin login 工具不存在时现场编译一次（与 login.sh 的做法一致）。
 func (h *Handler) ensureLoginBin() error {
+	// 已注入 RunLogin 时不需要真实二进制（测试环境）。
+	if h.cfg.RunLogin != nil {
+		return nil
+	}
 	if _, err := os.Stat(h.cfg.LoginBin); err == nil {
 		return nil
 	}

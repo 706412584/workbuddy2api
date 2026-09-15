@@ -2,13 +2,17 @@
 //
 // 两个子命令，由 login.sh 顺序驱动：
 //
-//	login url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
-//	              state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
-//	login poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
+//	login url  [cn|global] [sessionId] → POST /v2/plugin/auth/state?platform=CLI
+//	              拿 state+authUrl，state 落盘，stdout 打印授权 URL
+//	login poll [sessionId]             → 读 state，GET /v2/plugin/auth/token?state= 一次，
 //	              成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
 //	              stdout 打印完整 token+account JSON
 //
 // 无 PKCE（workbuddy 设备流由服务端签发 state）。
+//
+// sessionId 可选，由调用方（管理面板）生成，用来把并发的登录会话隔离开：
+// 不带时 state 落固定的 stateFile，带时落 wb2api-login-<sid>.json。
+// 面板与 login.sh 因此天然各用各的文件，不会再互相覆盖 state。
 package main
 
 import (
@@ -19,6 +23,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -33,6 +39,32 @@ const (
 	originRefererGlob  = "https://www.workbuddy.ai"
 	stateFile          = "/tmp/wb2api-login-state.json"
 )
+
+// sessionIDRE 合法 sessionId 的形状：纯字母数字，长度受限。
+// 它会被拼进文件名，故必须挡住路径分隔符与 .. —— 与 internal/admin 侧同一条规则。
+var sessionIDRE = regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`)
+
+// statePath 按 sessionId 取 state 文件路径。
+// 空 sid 沿用固定的 stateFile（login.sh 与手工调用的老路径，行为不变）；
+// 非空则落到同目录的 wb2api-login-<sid>.json，使并发登录互不覆盖。
+func statePath(sid string) string {
+	if sid == "" {
+		return stateFile
+	}
+	return filepath.Join(filepath.Dir(stateFile), "wb2api-login-"+sid+".json")
+}
+
+// parseSessionID 取可选的位置参数并校验；未提供时返回空串。
+func parseSessionID(args []string, idx int) (string, error) {
+	if len(args) <= idx {
+		return "", nil
+	}
+	sid := args[idx]
+	if !sessionIDRE.MatchString(sid) {
+		return "", fmt.Errorf("invalid sessionId %q", sid)
+	}
+	return sid, nil
+}
 
 // regionEndpoints 一个区域的上游 base 与 Origin/Referer。
 type regionEndpoints struct {
@@ -220,7 +252,7 @@ type loginState struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: login <url [cn|global] | poll>")
+		fatal("usage: login <url [cn|global] [sessionId] | poll [sessionId]>")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -231,6 +263,10 @@ func main() {
 		region := ""
 		if len(os.Args) >= 3 {
 			region = strings.ToLower(os.Args[2])
+		}
+		sid, err := parseSessionID(os.Args, 3)
+		if err != nil {
+			fatal("%v", err)
 		}
 		ep, err := regionEndpoint(region)
 		if err != nil {
@@ -250,13 +286,17 @@ func main() {
 			fatal("auth state: missing state or authUrl")
 		}
 		raw, _ := json.Marshal(loginState{State: st.State, Region: region})
-		if err := os.WriteFile(stateFile, raw, 0o600); err != nil {
+		if err := os.WriteFile(statePath(sid), raw, 0o600); err != nil {
 			fatal("write state: %v", err)
 		}
 		fmt.Println(st.AuthURL)
 
 	case "poll":
-		raw, err := os.ReadFile(stateFile)
+		sid, err := parseSessionID(os.Args, 2)
+		if err != nil {
+			fatal("%v", err)
+		}
+		raw, err := os.ReadFile(statePath(sid))
 		if err != nil {
 			fatal("read state: %v (先跑 login url)", err)
 		}
@@ -313,7 +353,7 @@ func main() {
 		}
 		oraw, _ := json.Marshal(out)
 		fmt.Println(string(oraw))
-		os.Remove(stateFile)
+		os.Remove(statePath(sid))
 
 	default:
 		fatal("unknown subcommand %q (want url|poll)", os.Args[1])

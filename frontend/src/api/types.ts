@@ -107,6 +107,8 @@ export interface AccountsResponse {
 export interface LoginStart {
   region: Region
   authUrl: string
+  /** 本次登录会话标识；轮询时必须原样带回，用于隔离并发登录。 */
+  sessionId: string
 }
 
 export type LoginPoll =
@@ -114,6 +116,7 @@ export type LoginPoll =
       status: 'ok'
       file: string
       account: { uid: string; nickname: string; region: string }
+      loaded: number
     }
   | { status: 'pending'; message: string }
   | { status: 'busy'; message: string }

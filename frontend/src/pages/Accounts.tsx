@@ -38,6 +38,8 @@ export function Accounts({ onChanged }: Props) {
   const pollTimer = useRef(0)
   /** 轮询代数：递增即作废此前所有在途响应，避免迟到响应覆盖新状态。 */
   const pollGen = useRef(0)
+  /** 本次登录会话标识，由 startLogin 返回；轮询时带回以隔离并发登录。 */
+  const sessionIdRef = useRef('')
 
   const load = useCallback(async () => {
     setBusy(true)
@@ -76,6 +78,7 @@ export function Accounts({ onChanged }: Props) {
     setLoginMsg('')
     try {
       const res = await startLogin(region)
+      sessionIdRef.current = res.sessionId
       setAuthUrl(res.authUrl)
       setPhase('waiting')
       setLoginMsg('已生成授权链接。请在浏览器打开并完成登录，本页会自动检测。')
@@ -93,11 +96,12 @@ export function Accounts({ onChanged }: Props) {
     const gen = ++pollGen.current
     pollTimer.current = window.setInterval(async () => {
       try {
-        const r = await pollLogin()
+        const r = await pollLogin(sessionIdRef.current)
         if (gen !== pollGen.current) return // 本轮已被更新的一轮取代
         if (r.status === 'ok') {
           pollGen.current++ // 作废所有在途响应
           clearInterval(pollTimer.current)
+          sessionIdRef.current = ''
           setPhase('ok')
           setLoginMsg(`已添加 ${r.account.nickname || r.account.uid}（${r.account.region}），已生效`)
           setAuthUrl('')
@@ -106,7 +110,7 @@ export function Accounts({ onChanged }: Props) {
         } else if (r.status === 'pending') {
           setLoginMsg(`等待浏览器完成登录…（${r.message}）`)
         }
-        // busy：上一次查询还没回来，静默跳过这轮
+        // busy：上一次查询还没回来，静默跳过这轮（服务端回 200 + status=busy）
       } catch (e) {
         if (gen !== pollGen.current) return
         clearInterval(pollTimer.current)
@@ -119,6 +123,7 @@ export function Accounts({ onChanged }: Props) {
   const cancelLogin = () => {
     pollGen.current++
     clearInterval(pollTimer.current)
+    sessionIdRef.current = ''
     setPhase('idle')
     setAuthUrl('')
     setLoginMsg('已取消本地轮询（上游 state 仍然有效，可稍后重新走一次）')

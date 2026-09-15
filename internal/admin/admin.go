@@ -57,6 +57,10 @@ type Config struct {
 	// 约定为阻塞式：调用方在后台 goroutine 里跑它，好在跑的过程中把「执行中」透给面板。
 	// 摘要即结果（失败也写在摘要里，见 taskRun.Summary）。
 	RunTask func(key string) string
+	// RunLogin 执行 login 工具的注入缝；nil = 真的去 exec LoginBin。
+	// 测试用它替掉子进程，语义与 runLogin 的返回值一致
+	// （code 是 login 的退出码，err 只在「根本没跑起来」时非 nil）。
+	RunLogin func(args ...string) (stdout, stderr string, code int, err error)
 }
 
 // Handler 管理接口路由。

@@ -323,7 +323,12 @@ export const startLogin = (region: 'cn' | 'global') =>
     body: JSON.stringify({ region }),
   })
 
-export const pollLogin = () => adminJSON<LoginPoll>('/__admin/login/poll', { method: 'POST' })
+/** 轮询登录结果。必须带 startLogin 返回的 sessionId，否则服务端回 400。 */
+export const pollLogin = (sessionId: string) =>
+  adminJSON<LoginPoll>('/__admin/login/poll', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId }),
+  })
 
 export const importAuth = (json: string) =>
   adminJSON<{ file: string }>('/__admin/accounts/import', {
