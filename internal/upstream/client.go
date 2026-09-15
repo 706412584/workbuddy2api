@@ -141,8 +141,17 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
+const softRateResetPattern = `将在 (.+?) 重置`
+
+// 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
+// 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
+// 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
+// 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
+var (
+	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+)
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
@@ -151,20 +160,20 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	return re.MatchString(body)
+	return reModelRateLimit.MatchString(body)
 }
 
 // ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 // 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
 // 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
+// 正则用包级预编译的 reSoftRateReset（发现 8）：本函数在每次错误分类上调用，
+// 函数体内 MustCompile 是纯浪费（模式串为常量，语义零变更）。
 func ParseSoftRateReset(body string) (time.Time, bool) {
 	if !IsModelRateLimit(body) {
 		return time.Time{}, false
 	}
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
+	m := reSoftRateReset.FindStringSubmatch(body)
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
@@ -368,8 +377,16 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+// 末尾注入 prompt_cache_key（P0 费用优化）：按账号隔离的稳定缓存键，让同一客户端
+// 对同一账号的连续请求命中上游前缀缓存。会话段从 body 自带的 conversation_id /
+// conversationId 取（本地未解析 X-Conversation-ID 头，故只走 body 源）。
 func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(a))
+	body = PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(a))
+	uid := ""
+	if a != nil {
+		uid = a.UID
+	}
+	return InjectPromptCacheKey(body, uid, "")
 }
 
 // effortsSnapshot 返回该账号所在区域的 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -707,9 +724,5 @@ func IsAlreadyCheckin(err error) bool {
 }
 
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return logfmt.Truncate(s, n)
 }

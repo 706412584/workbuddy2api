@@ -2,6 +2,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,7 +155,10 @@ func (h *Handler) SetKeys(legacy string, keys []APIKeySpec) {
 }
 
 // withAuth 校验 Bearer 密钥并把命中的 spec 传给处理器。
-// 密钥用 == 比较而非恒定时间比较：与改造前一致，不引入新的行为差异。
+// 多密钥（每把可绑区域）逐把比对；比较用 ConstantTimeCompare（发现 7）：
+// == 的短路时序随前缀长度变化，公网暴露下理论上可逐字节探测 key 前缀。
+// 注意这里只对「长度相等」的候选走常量时间比较 —— 长度本身会泄漏，
+// 但不泄漏内容，且 length 无法在不填充的前提下隐藏。
 func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h.keyMu.RLock()
@@ -171,7 +175,7 @@ func (h *Handler) withAuth(next authedHandler) http.HandlerFunc {
 		}
 		token := strings.TrimPrefix(authz, "Bearer ")
 		for i := range keys {
-			if keys[i].Key == token {
+			if subtle.ConstantTimeCompare([]byte(keys[i].Key), []byte(token)) == 1 {
 				// 传指针而非副本：调用方需要读到 Region/Name。keys 是本地切片头，
 				// 但底层数组与 h.keys 共享 —— 热重载换掉 h.keys 后旧数组依然存活，
 				// 本次请求手里的指针始终有效。
@@ -494,8 +498,10 @@ func (h *Handler) fetchDynamicModels(r auth.Region) []upstream.ModelInfo {
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 是该区域的负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+		// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
+		// NoteError 喂的是 chat 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道
+		// 健康的账号；models 拉取失败 ≠ 账号 chat 不可用。
+		// 负缓存按区域分槽（本地改造）：两区的失败互不影响对方的 5min 退避。
 		dynamicModelsCache.mu.Lock()
 		dynamicModelsCache.slot(r).lastFail = time.Now()
 		dynamicModelsCache.mu.Unlock()
@@ -652,7 +658,7 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
-			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
+			// 满载粘性号再浪费一次粘性命中往返（语义与 fail()/粘性命中-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
 			}
