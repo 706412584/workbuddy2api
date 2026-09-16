@@ -857,8 +857,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
-//   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
-//     达到 breakerThreshold 触发熔断（指数退避）。
+//   - ErrServer → 不罚账号（无冷却/熔断/NoteError，同 ErrClient 待遇），但仍轮转。
+//     上游 5xx 是「上游此刻病了」而非「这个号坏了」：喂熔断会把健康号逐批误杀。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
@@ -892,8 +892,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrServer:
-		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
-		h.cfg.Pool.NoteError(uid)
+		// 5xx 上游故障：只换号不罚账号。
+		// 上游整体故障（APISIX 502/504、网关超时）时每个账号都会失败——喂熔断计数
+		// 会把健康号逐批熔断（实测上游一次故障就把 16/22 打进冷却，healthy 掉到 4），
+		// 候选池塌缩后剩下几个号被反复选中、更快撞够阈值，恶性循环；上游恢复后
+		// 还要等最长数小时熔断到期才恢复满血。
+		// 判据：5xx 是「上游此刻病了」而不是「这个号坏了」——与 ErrClient 同待遇。
+		// 单号真坏（如对某模型持续 5xx）由 ErrSoftRate/ErrNotFound 的冷却路径兜底。
 	case upstream.ErrContentBlocked:
 		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。

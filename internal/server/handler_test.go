@@ -778,22 +778,48 @@ func TestChatTransportErrorDoesNotPenalize(t *testing.T) {
 	}
 }
 
-func TestChatHTTP5xxPenalizes(t *testing.T) {
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	// 熔断阈值 1：一次 5xx 即触发熔断（连续失败语义并入熔断器）。
-	p.SetBreaker(1, time.Hour, time.Hour)
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 500, `{"code":500}`, false
-	})
-	h := NewHandler(Config{Pool: p, Upstream: up})
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+// TestChatHTTP5xxDoesNotPenalize 上游 5xx 不罚账号（无冷却/熔断/NoteError），只换号。
+// 上游整体故障（APISIX 502/504 或 500）时每个账号都会失败；若喂熔断计数，健康号会被
+// 逐批误杀——实测一次上游故障把 16/22 打进冷却、healthy 掉到 4，且候选池塌缩后剩余
+// 账号被反复选中、更快撞够阈值。上游恢复后还要等熔断到期才满血。
+// 5xx 是「上游此刻病了」而不是「这个号坏了」，与 ErrClient 同待遇（只换号不罚）。
+func TestChatHTTP5xxDoesNotPenalize(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"500 JSON", 500, `{"code":500}`},
+		{"502 网关错误页", 502, `<html><head><title>502 Bad Gateway</title></head></html>`},
+		{"504 网关超时页", 504, `<html><head><title>504 Gateway Time-out</title></head></html>`},
 	}
-	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("http 5xx should trip breaker (cooling) with threshold=1: %+v", st)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+			// 熔断阈值 1：若误喂 NoteError 一次即熔断。
+			p.SetBreaker(1, time.Hour, time.Hour)
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				return c.status, c.body, false
+			})
+			h := NewHandler(Config{Pool: p, Upstream: up})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+			// 轮转耗尽仍回 503（客户端视角不变）；变的是账号不被罚。
+			if rec.Code != 503 {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			st, _ := p.Status("u1")
+			if st.Cooling {
+				t.Errorf("upstream 5xx should not cool the account: %+v", st)
+			}
+			if st.BreakerFails != 0 {
+				t.Errorf("upstream 5xx should not feed breaker: breaker_fails=%d", st.BreakerFails)
+			}
+			if st.ErrTotal != 0 {
+				t.Errorf("upstream 5xx should not record err_total: %d", st.ErrTotal)
+			}
+		})
 	}
 }
 
