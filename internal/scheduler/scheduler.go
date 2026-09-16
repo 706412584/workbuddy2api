@@ -256,7 +256,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
 			out = append(out, oc)
 			continue
@@ -428,7 +428,7 @@ func (s *Scheduler) RunKeepaliveNow() string {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			skipped++
 			continue
 		}

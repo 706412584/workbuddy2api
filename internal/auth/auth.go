@@ -62,6 +62,29 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
+// RefreshTokenValue 加锁读取 RefreshToken（出站/守卫一律经此取值，勿直读字段）。
+//
+// 为什么必须加锁：RefreshToken 在 a.mu 内改写 RefreshToken/AccessToken/Domain/ExpiresAt
+// （client.go「第 2 段（锁内）：校验快照一致后写回」），而调度器的「有无凭证」前置守卫
+// （checkin/keepalive/travel 的 `a.RefreshToken == ""`）在锁外直读该字段。生产上两侧
+// 真会并发：Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新，与是否有在途请求
+// 无关。无同步直读构成数据竞争，go test -race 实证（回归测试
+// scheduler.TestKeepaliveGuardRacesRefreshToken）：
+//
+//	WARNING: DATA RACE
+//	Read at ... by goroutine:
+//	  (*Scheduler).RunKeepaliveNow()  internal/scheduler/scheduler.go:654
+//	Previous write at ... by goroutine:
+//	  (*Client).RefreshToken()        internal/upstream/client.go:931
+func (a *Auth) RefreshTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.RefreshToken
+}
+
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	if a.ExpiresAt <= 0 {

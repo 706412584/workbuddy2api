@@ -56,7 +56,7 @@ func (s *Scheduler) RunTravelNow() string {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			acted["跳过"]++
 			continue
 		}
