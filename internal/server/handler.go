@@ -799,6 +799,31 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
+			// 上下文超限：立即回 400，**不轮换**。
+			//
+			// 两个理由，缺一都会造成客户端行为错误：
+			//  1. 换号毫无意义 —— 窗口是模型属性不是账号属性，每个账号都会返回
+			//     一字不差的 400。轮换只是让客户端白等 MaxRotate 倍的往返时间
+			//     （实测 3 × 9s ≈ 28s）后才拿到错误。
+			//  2. 状态码必须是 4xx。此前它走通用路径被转成 503，Anthropic 侧又映射为
+			//     "overloaded_error" —— 客户端读作「服务过载，稍后重试」，于是原样重发
+			//     同一份超长上下文，自动压缩永不触发。压缩的触发信号是 400。
+			//
+			// 消息透传上游原话（"prompt is too long: N tokens > M maximum"）：
+			// 这是 Anthropic 官方同款文案，客户端按它识别「该压缩了」。
+			if kind == upstream.ErrContextExceeded {
+				writeErrFn := o.writeErr
+				if writeErrFn == nil {
+					writeErrFn = writeOpenAIError
+				}
+				msg := upstream.ContextExceededMessage(string(respBody))
+				log.Printf("WARN: [server] context exceeded uid=%s model=%s: %s",
+					logfmt.UID8(acct.UID), o.model, msg)
+				writeErrFn(w, http.StatusBadRequest, "context_length_exceeded", msg)
+				st.status = http.StatusBadRequest
+				releaseHeld()
+				return nil
+			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
 			// 第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端。
@@ -1041,6 +1066,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 //     上游 5xx 是「上游此刻病了」而非「这个号坏了」：喂熔断会把健康号逐批误杀。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
+// ErrContextExceeded 不在此表：调用方在进入轮换前就把它拦下并直接回 400
+// （换号改变不了请求体，窗口是模型属性），故本函数不会收到该分类。
+//
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
 // 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
 //
@@ -1137,10 +1165,34 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
-			"type":    "api_error",
+			"type":    openAIErrType(status),
 			"code":    code,
 		},
 	})
+}
+
+// openAIErrType 把 HTTP 状态映射为 OpenAI 的错误类型（与 anthropicErrType 对称）。
+//
+// 为什么不能一律 api_error：客户端按 type 决定动作 —— 4xx 是「请求有问题，改请求」，
+// 5xx 是「服务有问题，稍后重试」。上下文超限若报成 api_error，客户端会当成服务故障
+// 原样重发，压缩永不触发（2026-09-18 线上实测）。
+//
+// 未列出的状态（含 5xx）保持 api_error：与改造前一致，不做无依据的变更。
+func openAIErrType(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	default:
+		return "api_error"
+	}
 }
 
 // writeBodyTooLarge 写 413 响应。

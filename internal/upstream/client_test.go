@@ -16,6 +16,30 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// TestContextExceededMessage 提取透传给客户端的文案。
+//
+// 为什么必须保住「prompt is too long: N tokens > M maximum」这个格式：
+// 下游客户端（Claude Code 等）正是按这句话识别"该压缩上下文了"，
+// 它也是 Anthropic 官方 API 的原生文案。一旦被改写成别的措辞，压缩就不会触发。
+func TestContextExceededMessage(t *testing.T) {
+	// 生产原文（2026-09-18 实测）。
+	prod := `{"code":11115,"msg":"prompt is too long: 1049589 tokens > 1048576 maximum","requestId":"x","extError":{"code":"context_length_exceeded","message":"..."}}`
+	got := ContextExceededMessage(prod)
+	if got != "prompt is too long: 1049589 tokens > 1048576 maximum" {
+		t.Errorf("got %q want 生产原文中的那段话（客户端按它触发压缩）", got)
+	}
+	// requestId / extError 等噪声不得混进客户端可见消息。
+	if strings.Contains(got, "requestId") || strings.Contains(got, "11115") {
+		t.Errorf("消息混入了上游内部字段: %q", got)
+	}
+
+	// 解析不出时给固定兜底，但必须仍然包含触发压缩所需的关键短语。
+	fallback := ContextExceededMessage(`{"extError":{"code":"context_length_exceeded"}}`)
+	if !strings.Contains(fallback, "prompt is too long") {
+		t.Errorf("兜底文案 %q 丢了触发压缩的关键短语", fallback)
+	}
+}
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		status int
@@ -54,6 +78,14 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 上下文超限（生产原文，2026-09-18 实测）：必须单独归类，**不能落进 ErrClient**。
+		// 落进 ErrClient 会让网关换 3 个号重试后回 503，Anthropic 侧再映射成
+		// "overloaded_error" —— 客户端读作「服务过载，稍后重试」，于是原样重发同一份
+		// 超长上下文，自动压缩永不触发。
+		{400, `{"code":11115,"msg":"prompt is too long: 1049589 tokens > 1048576 maximum","extError":{"code":"context_length_exceeded","message":"x"}}`, ErrContextExceeded},
+		{400, `{"extError":{"code":"context_length_exceeded"}}`, ErrContextExceeded},
+		{400, `{"code":11115,"msg":"x"}`, ErrContextExceeded},
+		{400, `PROMPT IS TOO LONG: 5 tokens > 4 maximum`, ErrContextExceeded}, // 大小写不敏感
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},

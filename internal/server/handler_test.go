@@ -856,6 +856,118 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	}
 }
 
+// TestChatContextExceededReturns400NoRotate 上下文超限必须立即回 400，且不换号。
+//
+// 这是一条**必须原样透传**的错误，三处细节缺一不可（2026-09-18 实测踩全了）：
+//   - 状态码 4xx：原先落 ErrClient → 换号重试 → 503。客户端把 5xx 读作「服务过载，
+//     稍后重试」，于是原样重发同一份超长上下文，自动压缩永不触发。
+//   - 不轮换：窗口是模型属性不是账号属性，每个账号都返回一字不差的 400，
+//     轮换只让客户端白等 3 倍往返（实测 3 × 9s ≈ 28s）。
+//   - 消息保住 "prompt is too long: N tokens > M maximum"：客户端按它触发压缩。
+func TestChatContextExceededReturns400NoRotate(t *testing.T) {
+	const prod = `{"code":11115,"msg":"prompt is too long: 1049589 tokens > 1048576 maximum","requestId":"x","extError":{"code":"context_length_exceeded","message":"..."}}`
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, prod, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400（503 会让客户端以为该重试）body=%s", rec.Code, rec.Body)
+	}
+	// 按客户端的方式断言：解析 JSON 后取 message。
+	// 序列化会把 '>' 转义成 \u003e，解析后还原 —— 真实客户端也走 JSON.parse，
+	// 故断言解析结果而非原始字节。
+	var resp struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("非 OpenAI 错误体: %v body=%s", err, rec.Body)
+	}
+	// 客户端按此文案触发上下文压缩，必须与上游原文逐字一致（含 token 数）。
+	if resp.Error.Message != "prompt is too long: 1049589 tokens > 1048576 maximum" {
+		t.Errorf("message=%q 未透传上游原文（客户端按它触发压缩）", resp.Error.Message)
+	}
+	if resp.Error.Type != "invalid_request_error" {
+		t.Errorf("type=%q want invalid_request_error（api_error 会被当成服务故障）", resp.Error.Type)
+	}
+	if resp.Error.Code != "context_length_exceeded" {
+		t.Errorf("code=%q want context_length_exceeded", resp.Error.Code)
+	}
+	if strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Errorf("被通用文案吞掉，客户端看不出是上下文问题: %s", rec.Body)
+	}
+	// 只调一次上游：不轮换。
+	if calls != 1 {
+		t.Errorf("上游调用 %d 次 want 1（换号改变不了请求体，重试纯属浪费）", calls)
+	}
+	// 账号无过错，不得受罚。
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		if st, _ := p.Status(uid); st.Cooling || st.ErrTotal != 0 {
+			t.Errorf("%s 被误罚: %+v", uid, st)
+		}
+	}
+}
+
+// TestAnthropicContextExceededIsInvalidRequest Anthropic 协议的上下文超限必须是
+// invalid_request_error，**绝不能是 overloaded_error**。
+//
+// 这条断言直接对应线上故障：原先回 503 → anthropicErrType 映射为 "overloaded_error"
+// → Claude Code 读作「服务过载，稍后重试」→ 原样重发 → 自动压缩永不触发，
+// 日志里同一请求每 10 秒重发一次、token 数一字不差、连续数十次。
+// Claude Code 触发压缩的信号是 400 + invalid_request_error。
+func TestAnthropicContextExceededIsInvalidRequest(t *testing.T) {
+	const prod = `{"code":11115,"msg":"prompt is too long: 1049589 tokens > 1048576 maximum","extError":{"code":"context_length_exceeded"}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, prod, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages",
+		strings.NewReader(`{"model":"claude-sonnet-4-5-20250929","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("非 Anthropic 错误体: %v body=%s", err, rec.Body)
+	}
+	if resp.Error.Type == "overloaded_error" {
+		t.Fatal("overloaded_error 会被 Claude Code 读作「服务过载，稍后重试」——正是它导致无限重传")
+	}
+	if resp.Error.Type != "invalid_request_error" {
+		t.Errorf("error.type=%q want invalid_request_error", resp.Error.Type)
+	}
+	if !strings.Contains(resp.Error.Message, "prompt is too long") {
+		t.Errorf("message=%q 未透传上游原文", resp.Error.Message)
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)

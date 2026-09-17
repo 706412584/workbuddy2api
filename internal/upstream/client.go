@@ -33,7 +33,11 @@ const (
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
-	ErrClient                        // 其他 4xx / 业务错误
+	// ErrContextExceeded 上下文超限（400 + context_length_exceeded / 11115）：请求体本身
+	// 超过模型窗口。**不轮换**——换账号改变不了请求体，且窗口是模型属性而非账号属性，
+	// 每个账号都会得到一模一样的结果。必须原样透传 400 给客户端，否则见下方注释。
+	ErrContextExceeded
+	ErrClient // 其他 4xx / 业务错误
 )
 
 func (k ErrKind) String() string {
@@ -52,6 +56,8 @@ func (k ErrKind) String() string {
 		return "content_blocked"
 	case ErrBadParams:
 		return "bad_params"
+	case ErrContextExceeded:
+		return "context_exceeded"
 	case ErrClient:
 		return "client"
 	default:
@@ -123,6 +129,41 @@ var contentBlockedMarkers = []string{
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 var badParamsMarkerCode = `"code":11101`
+
+// contextExceededMarker 上下文超限的识别标记（生产实测形态）：
+//
+//	{"code":11115,"msg":"prompt is too long: 1049589 tokens > 1048576 maximum",
+//	 "extError":{"code":"context_length_exceeded","message":"..."}}
+//
+// 三个标记任一命中即归类。用 extError.code 作首选（结构化、不受文案语言影响），
+// 另两个是冗余保险 —— 上游改文案时至少还能命中一个。
+const contextExceededCode = "context_length_exceeded"
+const contextExceededBizCode = `"code":11115`
+const contextExceededMsg = "prompt is too long"
+
+// contextExceededPattern 从上游 body 里提取可直接透传给客户端的错误消息。
+//
+// 只取 "prompt is too long: N tokens > M maximum" 这一段（上游原话），
+// 因为下游客户端（Claude Code 等）正是按这句话识别"该压缩上下文了"。
+// Anthropic 官方 API 的原生文案也是这个格式，故透传即可被识别。
+var contextExceededPattern = regexp.MustCompile(`prompt is too long: [^"\\]{0,120}`)
+
+// ContextExceededMessage 返回可直接回给客户端的上下文超限消息。
+// 解析失败时回退到固定文案（不含上游 requestId 等噪声，那些对客户端无意义）。
+func ContextExceededMessage(body string) string {
+	if m := contextExceededPattern.FindString(body); m != "" {
+		return strings.TrimSpace(m)
+	}
+	return "prompt is too long: this request exceeds the model's maximum context length"
+}
+
+// IsContextExceeded 报告上游 body 是否为上下文超限错误。
+func IsContextExceeded(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, contextExceededCode) ||
+		strings.Contains(body, contextExceededBizCode) ||
+		strings.Contains(lower, contextExceededMsg)
+}
 
 // alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
@@ -257,6 +298,17 @@ func Classify(status int, body string) ErrKind {
 		// 模型权限，值得再试一次）。
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
+		}
+		// 上下文超限：**必须原样透传 400**，不能吞成通用错误。
+		//
+		// 这里踩过一个坑（2026-09-18 实测）：该错误原先进 default→ErrClient，
+		// 网关换 3 个号重试后回 503，Anthropic 侧又被映射成 "overloaded_error"。
+		// 客户端（Claude Code）把 overloaded 读作「服务过载，稍后重试」，于是原样
+		// 重发同一份超长上下文 —— 日志里同一请求每 10 秒重发一次、token 数一字不差、
+		// 连续数十次，自动压缩永不触发（压缩的触发信号是 400 invalid_request_error）。
+		// 换号毫无意义：窗口是模型属性，每个账号都会得到完全相同的 400。
+		if IsContextExceeded(body) {
+			return ErrContextExceeded
 		}
 		return ErrClient
 	}
