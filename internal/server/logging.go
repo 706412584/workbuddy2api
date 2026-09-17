@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -74,6 +73,10 @@ type chatStatsReader struct {
 	chunkSeen  map[string]struct{} // thinking 切出的唯一块集合（去重）
 	chunkTotal int                 // 已切出的块总数
 	chunkBuf   strings.Builder
+
+	// guard 思考死循环判据；nil = 不检测。loopTripped 保证只报一次。
+	guard       *LoopGuard
+	loopTripped bool
 }
 
 // loopChunkLen 思考循环检测的切块长度（字节）。
@@ -107,6 +110,24 @@ func (s *chatStatsReader) noteThinking(t string) {
 // 正常行文的唯一块数应与总块数同量级。
 func (s *chatStatsReader) LoopSignal() (thinkChars, textChars, distinctChunks, totalChunks int) {
 	return s.thinkChars, s.textChars, len(s.chunkSeen), s.chunkTotal
+}
+
+// SetLoopGuard 装配思考循环判据；nil 表示不检测（默认）。
+// 由 handler 在转发前注入 —— 判据来自配置，stats reader 本身不读配置。
+func (s *chatStatsReader) SetLoopGuard(g *LoopGuard) { s.guard = g }
+
+// LoopGuardErr 在累计思考内容后判定是否命中死循环；命中返回非 nil。
+// 由 Stream 的读循环逐帧调用：一旦命中即中断上游读取，不必等流自然结束
+// （实测空转能跑 900s，等结束就失去了拦截意义）。
+func (s *chatStatsReader) LoopGuardErr() error {
+	if s.guard == nil || s.loopTripped {
+		return nil
+	}
+	if s.guard.Detect(s.thinkChars, s.textChars, len(s.chunkSeen), s.chunkTotal, time.Since(s.start)) {
+		s.loopTripped = true
+		return ErrThinkingLoop
+	}
+	return nil
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -279,33 +300,5 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	)
 }
 
-// logThinkingLoop 在流式请求结束时，若疑似思考死循环就打一行独立日志。
-//
-// 为什么不并进表格行：表格列宽固定（model 截 11 字符等），加列会破坏既有解析与测试。
-// 独立行只在命中特征时出现，正常请求零噪音。
-//
-// 判据（2026-09-13 那笔 901s/38 万 token 的实测特征）：
-//   - thinking 字符数很大（>20 万）
-//   - 正文（content）几乎为空 —— 真正的问题是"想了半天不产出"
-//   - 重复块占比高 —— 同一段思考反复出现
-//
-// 只记日志、不干预转发。用户明确选择先观测再决定是否拦截。
-func logThinkingLoop(s *chatStatsReader, st *chatStat) {
-	if !chatLogEnabled {
-		return
-	}
-	thinkChars, textChars, distinctChunks, totalChunks := s.LoopSignal()
-	// 阈值取实测样本的保守下界：那笔异常是 25 万 thinking 字符、正文 0、耗时 901s。
-	// 正常请求的 thinking 通常几千字符，远达不到 20 万。
-	if thinkChars < 200_000 || textChars > 0 {
-		return
-	}
-	// 唯一块占比：正常行文接近 1.0，循环文本会低到 0.01 量级。
-	ratio := 0.0
-	if totalChunks > 0 {
-		ratio = float64(distinctChunks) / float64(totalChunks)
-	}
-	log.Printf("thinking_loop uid=%s model=%s think_chars=%d text_chars=%d distinct_chunks=%d/%d ratio=%.3f total=%.0fs",
-		uidPrefix(st.uid), st.model, thinkChars, textChars, distinctChunks, totalChunks, ratio,
-		time.Since(st.start).Seconds())
-}
+// 思考死循环的处置已从「只记日志」升级为「切断 + 提示 + 换号重试」，
+// 观测与拦截统一由 LoopGuard（loopguard.go）承担，命中时在 forwardChat 内打 WARN 行。

@@ -231,6 +231,16 @@ func main() {
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 		Web:          web.Handler(),
 		Admin:        adm,
+		// 思考死循环处置（默认开启）：空转请求会在 40 万字符 / 0.15 唯一块占比处
+		// 被切断、追加提示后换号重试，2 次仍不行则回明确错误。
+		// 配置项为 0 时 toLoopGuard 回落到内置默认，所以 Enabled 恒定 true。
+		LoopGuard: server.LoopGuardConfig{
+			Enabled:           true,
+			MinThinkChars:     cfg.Server.LoopGuardMinThinkChars,
+			MaxDistinctRatio:  cfg.Server.LoopGuardMaxDistinctRatio,
+			MinElapsedSeconds: cfg.Server.LoopGuardMinElapsedSeconds,
+			MaxRetries:        cfg.Server.LoopGuardMaxRetries,
+		},
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -7,6 +7,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -67,24 +68,27 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request, key *APIKeyS
 		allowedRegions: allowedRegions,
 		model:          rreq.Model,
 		clientIP:       clientIPFor(h.cfg.Upstream, r),
+		stream:         rreq.Stream,
+		relay: func(w http.ResponseWriter, r io.Reader) error {
+			return h.relayResponsesStream(w, r, rreq.Model, st)
+		},
 	})
 	if rc == nil {
-		return // 失败：forwardChat 已回错（OpenAI 格式）
+		return // 失败或流式已完成：forwardChat 已按错误策略处置账号并写好响应
 	}
 	defer rc.Close()
 
-	if rreq.Stream {
-		h.streamAsResponses(w, rc, rreq.Model, st)
-		return
-	}
 	h.bufferAsResponses(w, rc, rreq.Model, &rreq, st)
 }
 
-// streamAsResponses 把上游 chat completions 的 SSE 流转换为 Responses 事件流写回客户端。
+// relayResponsesStream 把上游 chat completions 的 SSE 流转换为 Responses 事件流写回客户端。
 //
 // 事件顺序对 Codex 是硬要求：delta 必须在其 output_item.added 之后到达，
 // 且 sequence_number 需单调递增——这些由 apicompat 的状态机保证，此处只负责转发。
-func (h *Handler) streamAsResponses(w http.ResponseWriter, rc io.ReadCloser, clientModel string, st *chatStat) {
+//
+// 作为 forwardOpt.relay 注入（同 relayAnthropicStream）：转换在 forwardChat 的
+// 轮换循环内执行，思考死循环命中时返回 ErrThinkingLoop 供上层追加提示后重试。
+func (h *Handler) relayResponsesStream(w http.ResponseWriter, r io.Reader, clientModel string, st *chatStat) error {
 	hdr := w.Header()
 	hdr.Set("Content-Type", "text/event-stream")
 	hdr.Set("Cache-Control", "no-cache")
@@ -95,7 +99,7 @@ func (h *Handler) streamAsResponses(w http.ResponseWriter, rc io.ReadCloser, cli
 	st.status = http.StatusOK
 
 	state := apicompat.NewChatCompletionsToResponsesStreamState(clientModel)
-	readers := newChatChunkReader(rc)
+	readers := newChatChunkReader(r)
 
 	emit := func(evts []apicompat.ResponsesStreamEvent) bool {
 		for _, e := range evts {
@@ -116,6 +120,11 @@ func (h *Handler) streamAsResponses(w http.ResponseWriter, rc io.ReadCloser, cli
 	for {
 		ch, err := readers.next()
 		if err != nil {
+			// 思考死循环：不发 response.completed，让调用方追加提示后换号重试
+			// （发了 completed 客户端就认为本轮结束，重试内容送不到）。
+			if errors.Is(err, ErrThinkingLoop) {
+				return ErrThinkingLoop
+			}
 			break // io.EOF 或读错误：交给 finalize 收尾
 		}
 		// 上游在末帧携带 usage；据此填日志的 token 数，避免流式请求恒记 tok=-。
@@ -123,12 +132,13 @@ func (h *Handler) streamAsResponses(w http.ResponseWriter, rc io.ReadCloser, cli
 			st.toks = ch.Usage.CompletionTokens
 		}
 		if !emit(apicompat.ChatCompletionsChunkToResponsesEvents(ch, state)) {
-			return
+			return nil // 客户端断连
 		}
 	}
 	// 即便中途断流也要发 response.completed：否则 Codex 认为本轮未结束，
 	// 会把未完成的工具调用持久化进历史，毒化后续请求。
 	emit(apicompat.FinalizeChatCompletionsResponsesStream(state))
+	return nil
 }
 
 // bufferAsResponses 非流式：聚合上游后转成 Responses 响应。

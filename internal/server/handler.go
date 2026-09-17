@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -65,7 +66,51 @@ type Config struct {
 	Web http.Handler
 	// Admin 管理接口，挂在 /__admin/ 前缀下；自身负责本机来源校验。nil = 不提供。
 	Admin http.Handler
+	// LoopGuard 思考死循环判据与重试上限。Enabled=false 时完全不检测。
+	LoopGuard LoopGuardConfig
 }
+
+// LoopGuardConfig 思考死循环的检测与重试参数。
+type LoopGuardConfig struct {
+	// Enabled 关闭时完全不检测，保持原有行为。
+	Enabled bool
+	// MinThinkChars 思考字符数阈值（默认 40 万）。
+	MinThinkChars int
+	// MaxDistinctRatio 唯一块占比上限（默认 0.15）：低于此值判为重复文本。
+	MaxDistinctRatio float64
+	// MinElapsedSeconds 最早可判定的耗时秒数（默认 30），给正常长思考留空间。
+	MinElapsedSeconds int
+	// MaxRetries 命中后最多重试几次，用尽则回错误（默认 maxLoopRetries）。
+	MaxRetries int
+}
+
+// toLoopGuard 转成运行时判据。
+func (c LoopGuardConfig) toLoopGuard() *LoopGuard {
+	if !c.Enabled {
+		return nil
+	}
+	g := DefaultLoopGuard()
+	if c.MinThinkChars > 0 {
+		g.MinThinkChars = c.MinThinkChars
+	}
+	if c.MaxDistinctRatio > 0 {
+		g.MaxDistinctRatio = c.MaxDistinctRatio
+	}
+	if c.MinElapsedSeconds > 0 {
+		g.MinElapsed = time.Duration(c.MinElapsedSeconds) * time.Second
+	}
+	g.MaxRetries = c.MaxRetries
+	if g.MaxRetries <= 0 {
+		g.MaxRetries = maxLoopRetries
+	}
+	return &g
+}
+
+// maxLoopRetries 思考死循环命中后的重试上限（不含首次尝试）。
+// 取 2：实测同一账号上循环会连续复现（见 loopguard.go 的背景数据），
+// 给两次「追加提示 + 换号」的机会；仍不行说明是模型侧稳定故障，继续重试只是
+// 让客户端多等，不如尽快回明确错误。
+const maxLoopRetries = 2
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
 // 与 SoftCooldown 分流的原因：404 是上游**偶发**路径缺失，不是"本账号在限流"，
@@ -87,6 +132,8 @@ type Handler struct {
 	keys  []APIKeySpec // 合并后的生效密钥（旧 APIKey → 不限区域项）；空 = 不鉴权
 	// degrade 内容拦截误报的降级闸门（00:00 CST 每日重置，见 degrade.go）。
 	degrade degradeGate
+	// loopGuard 思考死循环判据；nil = 不检测（配置关闭时）。
+	loopGuard *LoopGuard
 }
 
 // NewHandler 构建 handler。
@@ -107,6 +154,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxBodyBytes = defaultMaxBodyBytes
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.loopGuard = cfg.LoopGuard.toLoopGuard()
 	h.SetKeys(cfg.APIKey, cfg.APIKeys)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 协议适配：同一账号池同时服务 Anthropic（Claude Code）与 Responses（Codex）客户端。
@@ -538,6 +586,13 @@ type forwardOpt struct {
 	// 各协议的客户端只认自己协议的错误体（Claude Code 读 Anthropic 的
 	// {"type":"error",...}），故允许调用方覆盖。
 	writeErr func(w http.ResponseWriter, status int, code, msg string)
+	// stream 客户端是否要流式。流式的转发在 forwardChat 内完成（思考死循环需要
+	// 「读了若干帧后」才判得出，交给调用方转发就没有重试机会了）。
+	stream bool
+	// relay 流式转发函数；nil = OpenAI SSE 透传（upstream.Stream）。
+	// Anthropic / Responses 两种协议要把 chat completions 的 SSE 转成自己的事件流，
+	// 故由调用方注入；返回 ErrThinkingLoop 时 forwardChat 会追加提示并换号重试。
+	relay func(w http.ResponseWriter, r io.Reader) error
 }
 
 // dumpReqPath WB2A_DUMP_REQ 调试开关的落盘路径。
@@ -551,6 +606,15 @@ func clientIPFor(up *upstream.Client, r *http.Request) string {
 		return ""
 	}
 	return upstream.ExtractClientIP(r)
+}
+
+// loopRatio 唯一块占比（日志用）。空流返回 0。
+func loopRatio(s *chatStatsReader) float64 {
+	_, _, distinct, total := s.LoopSignal()
+	if total == 0 {
+		return 0
+	}
+	return float64(distinct) / float64(total)
 }
 
 // sessionKey 提取会话键；未启用粘性时返回空，省去一次无谓的 JSON 解析。
@@ -591,6 +655,14 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 	st := o.st
 	tried := map[string]bool{}
 	var lastErr error
+	// loopRetries 本轮请求因思考死循环而重试的次数（不计入 MaxRotate 的账号轮换预算：
+	// 它换的是「同一个请求的再次尝试」，不是「换一个账号」）。
+	loopRetries := 0
+	// maxRetries 思考循环的重试上限（判据未装配时用常量默认）。
+	maxRetries := maxLoopRetries
+	if h.loopGuard != nil {
+		maxRetries = h.loopGuard.maxRetries()
+	}
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -718,6 +790,67 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+
+		// 流式：转发必须在轮换循环内完成 —— 思考死循环只能靠「读了若干帧之后」
+		// 才判得出来，若交给调用方转发，这里就没有重试的机会了。
+		if o.stream {
+			hdr := w.Header()
+			hdr.Set("Content-Type", "text/event-stream")
+			hdr.Set("Cache-Control", "no-cache")
+			hdr.Set("Connection", "keep-alive")
+			hdr.Set("X-Accel-Buffering", "no")
+			// 与既有语义一致：开始写流即视为 200（响应头一旦发出便无法改状态）。
+			st.status = http.StatusOK
+
+			relay := o.relay
+			if relay == nil {
+				relay = upstream.Stream
+			}
+			stats := newChatStatsReaderSince(rc, st.start)
+			stats.SetLoopGuard(h.loopGuard)
+			serr := relay(w, stats)
+			st.ttfb = stats.TTFB()
+			st.toks, _ = stats.Tokens()
+			if credit, ok := stats.Credit(); ok {
+				h.cfg.Pool.NoteModelCost(acct.UID, o.model, credit, stats.TotalTokens())
+			}
+			rc.Close()
+
+			if errors.Is(serr, ErrThinkingLoop) {
+				// 命中思考空转：切断上游流并换号重试，同时在请求体追加一条提示，
+				// 要求模型停止重复、直接给结论。
+				//
+				// 注意 Stream 命中时提前返回、不写 [DONE] —— 若写了，客户端会认为
+				// 本轮已结束并停止读取，重试的内容就送不到了。
+				//
+				// 已知代价：流式下思考内容已实时发给客户端，重试会让客户端看到两段
+				// 思考拼接。这是刻意取舍 —— 拼接的观感问题远小于挂满 15 分钟。
+				body = InjectLoopNudge(body)
+				loopRetries++
+				lastErr = ErrThinkingLoop
+				fail(acct.UID)
+				log.Printf("WARN: [server] thinking loop uid=%s model=%s think_chars=%d ratio=%.3f retry=%d/%d",
+					logfmt.UID8(acct.UID), o.model, stats.thinkChars,
+					loopRatio(stats), loopRetries, maxRetries)
+				if loopRetries > maxRetries {
+					// 重试预算用尽：跳出轮换循环，由出口统一回错误。
+					// 出口判 lastErr 决定文案 —— 预算可能因「账号池小」先被
+					// MaxRotate 耗尽，那样也必须是 thinking_loop 而非「无可用账号」。
+					break
+				}
+				continue
+			}
+			if serr != nil {
+				// 其余流错误（客户端断连、上游中断）：无法重试（响应已开始），如实记日志。
+				log.Printf("WARN: [server] stream uid=%s: %v", logfmt.UID8(acct.UID), serr)
+			}
+			// 粘性绑定与租约：流已写完，绑定成功号（多轮对话下一跳不再随机抽）。
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
+			return nil
+		}
+
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		if sessKey != "" && h.cfg.Session != nil {
@@ -726,6 +859,22 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		// 租约不在此释放：由调用方在读尽响应流后统一归还（defer）。
 		// 成本账本随流式/非流式在此收尾——见下方调用方（读尽 stats 后才有 usage）。
 		return rc
+	}
+
+	writeErr := o.writeErr
+	if writeErr == nil {
+		writeErr = writeOpenAIError
+	}
+
+	// 思考循环用尽重试预算：必须优先于下面的通用文案。
+	// 轮换预算（MaxRotate）可能先于重试预算耗尽（账号池小），若不在此分流，
+	// 客户端拿到的会是「无可用账号」—— 把人引去查账号池，而真正的故障在模型侧空转。
+	if errors.Is(lastErr, ErrThinkingLoop) {
+		writeErr(w, http.StatusServiceUnavailable, "thinking_loop",
+			"model is stuck in a thinking loop (repeated reasoning with no output); "+
+				"retried "+strconv.Itoa(maxRetries)+" times without success")
+		st.status = http.StatusServiceUnavailable
+		return nil
 	}
 
 	// 轮换耗尽有两种截然不同的原因，必须分开表述，否则会把排查方向带偏：
@@ -746,10 +895,6 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			" (账号不可用：不存在 / 冷却中 / 已禁用)"
 	} else {
 		msg += " (账号可用，但上游拒绝了每次尝试): " + lastErr.Error()
-	}
-	writeErr := o.writeErr
-	if writeErr == nil {
-		writeErr = writeOpenAIError
 	}
 	writeErr(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 	st.status = http.StatusServiceUnavailable
@@ -806,27 +951,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 		allowedRegions: allowedRegions,
 		model:          peek.Model,
 		clientIP:       clientIPFor(h.cfg.Upstream, r),
+		stream:         peek.Stream,
 	})
 	if rc == nil {
-		return // 失败：forwardChat 已按错误策略处置账号并写好响应
+		return // 失败或流式已完成：forwardChat 已按错误策略处置账号并写好响应
 	}
 
-	if peek.Stream {
-		// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
-		st.status = http.StatusOK
-		stats := newChatStatsReaderSince(rc, st.start)
-		_ = upstream.Stream(w, stats)
-		st.ttfb = stats.TTFB()
-		st.toks, _ = stats.Tokens()
-		logThinkingLoop(stats, st)
-		// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
-		// 供下次选号把免费/便宜的号排在前面。st.uid 由 forwardChat 在成功轮写入。
-		if credit, ok := stats.Credit(); ok {
-			h.cfg.Pool.NoteModelCost(st.uid, peek.Model, credit, stats.TotalTokens())
-		}
-		rc.Close()
-		return
-	}
 	resp, err := upstream.Aggregate(rc)
 	rc.Close()
 	if err != nil {

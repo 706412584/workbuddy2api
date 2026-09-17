@@ -276,9 +276,21 @@ func normalizeFrame(obj map[string]any) map[string]any {
 	return out
 }
 
+// LoopAborter 由调用方（server 的 stats reader）实现：Stream 每转发一帧后调用一次，
+// 返回非 nil 表示应中断转发（如命中思考死循环）。
+//
+// 用接口而不是在 upstream 里直接判：判据与阈值属于 server 侧策略，upstream 只提供
+// 「逐帧回调」这个机制，不引入对 server 配置的依赖。r 不实现该接口时零开销。
+type LoopAborter interface {
+	LoopGuardErr() error
+}
+
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 // 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
+//
+// r 若实现 LoopAborter，每帧转发后回调一次；返回非 nil 即中断读取并返回该错误
+// —— 思考死循环实测能空转 900s，必须中途切断而不是等流自然结束。
 func Stream(w http.ResponseWriter, r io.Reader) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -321,6 +333,8 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	// abort 逐帧检查中断条件（思考死循环）。r 不实现 LoopAborter 时为 nil，零开销。
+	abort, _ := r.(LoopAborter)
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -343,6 +357,13 @@ readLoop:
 			}
 			if fl != nil {
 				fl.Flush()
+			}
+		}
+		// 中断检查放在帧转发之后：已读到的内容照常发给客户端（不吞帧），
+		// 但不再继续读上游 —— 空转流能跑 900s，必须中途切断。
+		if abort != nil {
+			if aerr := abort.LoopGuardErr(); aerr != nil {
+				return aerr
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"

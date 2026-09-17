@@ -52,6 +52,14 @@ type Config struct {
 		// （截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却把责任记在账号头上）。
 		// 0/负数视为非法 → 启动报错。
 		MaxBodyMB int `json:"max_body_mb"`
+
+		// LoopGuard* 思考死循环判据（deepseek-v4 实测空转 900s、正文零输出）。
+		// 全部可选：0 表示用内置默认（40 万字符 / 0.15 / 30s / 2 次重试）。
+		// 判据恒开启，没有单独的开关 —— 关闭它只会让空转请求挂满 15 分钟。
+		LoopGuardMinThinkChars     int     `json:"loopguard_min_think_chars"`
+		LoopGuardMaxDistinctRatio  float64 `json:"loopguard_max_distinct_ratio"`
+		LoopGuardMinElapsedSeconds int     `json:"loopguard_min_elapsed_seconds"`
+		LoopGuardMaxRetries        int     `json:"loopguard_max_retries"`
 	} `json:"server"`
 
 	Cooldown struct {

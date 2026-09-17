@@ -6,8 +6,8 @@
 package server
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -111,16 +111,16 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request, key 
 		model:          areq.Model,
 		clientIP:       clientIPFor(h.cfg.Upstream, r),
 		writeErr:       anthropicErrWriter(),
+		stream:         areq.Stream,
+		relay: func(w http.ResponseWriter, r io.Reader) error {
+			return h.relayAnthropicStream(w, r, areq.Model, st)
+		},
 	})
 	if rc == nil {
-		return // 失败：forwardChat 已回错
+		return // 失败或流式已完成：forwardChat 已按错误策略处置账号并写好响应
 	}
 	defer rc.Close()
 
-	if areq.Stream {
-		h.streamAsAnthropic(w, rc, areq.Model, st)
-		return
-	}
 	h.bufferAsAnthropic(w, rc, areq.Model, st)
 }
 
@@ -137,9 +137,15 @@ func (h *Handler) resolveRegions(w http.ResponseWriter, model string, key *APIKe
 	return regions, true
 }
 
-// streamAsAnthropic 把上游 chat completions 的 SSE 流转换为 Anthropic 事件流写回客户端。
-// clientModel 用于在响应里回显客户端原始模型名（而非上游模型名）。
-func (h *Handler) streamAsAnthropic(w http.ResponseWriter, rc io.ReadCloser, clientModel string, st *chatStat) {
+// relayAnthropicStream 把上游 chat completions 的 SSE 流转换为 Anthropic 事件流写回客户端。
+//
+// 作为 forwardOpt.relay 注入：转换逻辑在 forwardChat 的轮换循环内执行，
+// 于是「读了几帧后才发现思考死循环」也能切断重试（st.thinkChars 由注入的
+// chatStatsReader 逐帧累计，本函数只读不写）。
+//
+// 返回 ErrThinkingLoop 表示本轮已被循环守卫切断，调用方应追加提示后重试；
+// 其余读错误（含客户端断连）返回 nil —— 收尾事件已写出，没有可重试的余地。
+func (h *Handler) relayAnthropicStream(w http.ResponseWriter, r io.Reader, clientModel string, st *chatStat) error {
 	hdr := w.Header()
 	hdr.Set("Content-Type", "text/event-stream")
 	hdr.Set("Cache-Control", "no-cache")
@@ -150,7 +156,7 @@ func (h *Handler) streamAsAnthropic(w http.ResponseWriter, rc io.ReadCloser, cli
 	st.status = http.StatusOK
 
 	state := apicompat.NewChatCompletionsToAnthropicStreamState(clientModel)
-	readers := newChatChunkReader(bufio.NewReaderSize(rc, 64*1024))
+	readers := newChatChunkReader(r)
 
 	emit := func(evts []apicompat.AnthropicStreamEvent) bool {
 		for _, e := range evts {
@@ -171,6 +177,11 @@ func (h *Handler) streamAsAnthropic(w http.ResponseWriter, rc io.ReadCloser, cli
 	for {
 		ch, err := readers.next()
 		if err != nil {
+			// 思考死循环：stats reader 逐帧判命中后中断上游读取。
+			// 此时不能发收尾事件 —— 那会让客户端认为本轮已结束并停止读取，重试的内容就送不到了。
+			if errors.Is(err, ErrThinkingLoop) {
+				return ErrThinkingLoop
+			}
 			break // io.EOF 或读错误：交给 finalize 收尾
 		}
 		// 上游在末帧携带 usage；据此填日志的 token 数，避免流式请求恒记 tok=-。
@@ -178,12 +189,13 @@ func (h *Handler) streamAsAnthropic(w http.ResponseWriter, rc io.ReadCloser, cli
 			st.toks = ch.Usage.CompletionTokens
 		}
 		if !emit(apicompat.ChatCompletionsChunkToAnthropicEvents(ch, state)) {
-			return
+			return nil // 客户端断连
 		}
 	}
 	// 即便中途断流也要发收尾事件：否则客户端会一直等 message_stop，
 	// 表现为"卡住"而不是明确的失败。
 	emit(apicompat.FinalizeChatCompletionsAnthropicStream(state))
+	return nil
 }
 
 // bufferAsAnthropic 非流式：读完上游整个流后聚合，再转成 Anthropic 响应。
