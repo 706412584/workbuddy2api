@@ -632,54 +632,70 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 }
 
 // TestChat6004ModelResetCoolsToParsedTime 端到端回归 issue #31：上游 429 + code 6004
-// +「将在 … 重置」→ 冷却 until 精确等于解析时间（而非 600s 固定基数/指数退避），
-// 且记录触发模型 → 同模型请求仍被冷却、切模型请求按豁免可选。
+// TestChat6004ModelResetCoolsToParsedTime 6004 + 重置时间 → 冷却 until 精确等于解析时间
+// （而非 600s 固定基数/指数退避），且记录触发模型 → 同模型请求仍被冷却、切模型请求按豁免可选。
+//
+// 中英文文案都要测：生产实测 6004 **全是英文**，而本用例原本只构造了中文 body，
+// 于是「解析正则只写了中文」这个 bug 在测试里完全看不出来 —— 它让模型级冷却
+// （CooldownSoftForModel）在生产中从未生效，账号被按全模型冷却。
 func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	// 用未来 5 分钟的重置时间（wall-clock）构造上游响应。
 	reset := time.Now().Add(5 * time.Minute)
 	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
-	var calls int
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
-		if authz == "Bearer at-bad" {
-			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false
-		}
-		return 200, sseOK, true
-	})
-	p := testPoolWith(
-		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
-	)
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
-	// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
-	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	langs := []struct {
+		name string
+		body string
+	}{
+		{"中文", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`},
+		// 生产原文（intl 与 cn 实测一致）。
+		{"英文", `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` + ts + ` UTC+8, alternatively, you can switch to the other models to continue using it."}`},
 	}
-	// bad 已进入 soft 冷却，until ≈ reset。
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling from 6004: %+v", st)
-	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v (diff %v)", st.Until, reset, d)
-	}
-	// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
-	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
-	// 不同模型 hy3-x 的请求应豁免冷却选中 bad（最高分）。
-	p.SetRandomSource(func(n int64) int64 { return 0 })
-	same := p.PickExcludingForModel(nil, "glm-5.3")
-	if same == nil || same.UID != "good" {
-		t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
-	}
-	diff := p.PickExcludingForModel(nil, "hy3-x")
-	if diff == nil || diff.UID != "bad" {
-		t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
+	for _, lang := range langs {
+		t.Run(lang.name, func(t *testing.T) {
+			body := lang.body
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				if authz == "Bearer at-bad" {
+					return 429, body, false
+				}
+				return 200, sseOK, true
+			})
+			p := testPoolWith(
+				&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+				&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+			)
+			p.SetCredits("bad", 2000)
+			p.SetCredits("good", 1000)
+			// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
+			h := NewHandler(Config{Pool: p, Upstream: up})
+			req := httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != 200 {
+				t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+			}
+			// bad 已进入 soft 冷却，until ≈ reset。
+			st, _ := p.Status("bad")
+			if !st.Cooling || st.CoolKind != "soft_rate" {
+				t.Fatalf("bad should be soft cooling from 6004: %+v", st)
+			}
+			if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
+				t.Errorf("until=%v want ~reset=%v (diff %v)：未按上游明说的重置时刻冷却", st.Until, reset, d)
+			}
+			// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
+			// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
+			// 不同模型 hy3-x 的请求应豁免冷却选中 bad（最高分）——
+			// 这正是上游文案里 "switch to the other models" 承诺的语义。
+			p.SetRandomSource(func(n int64) int64 { return 0 })
+			same := p.PickExcludingForModel(nil, "glm-5.3")
+			if same == nil || same.UID != "good" {
+				t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
+			}
+			diff := p.PickExcludingForModel(nil, "hy3-x")
+			if diff == nil || diff.UID != "bad" {
+				t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
+			}
+		})
 	}
 }
 

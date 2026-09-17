@@ -137,12 +137,24 @@ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
 // modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
+// 上游用它表达"该模型的使用量超限"（code 6004，msg 带重置时间），
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetPattern = `将在 (.+?) 重置`
+// softRateResetPattern 匹配 6004 文案里的重置时刻，捕获时间串。
+//
+// 两种语言的实测形态（**必须都覆盖**）：
+//   - 英文（生产实测唯一形态，intl 与 cn 均如此）：
+//     "...your usage will reset at 2026-09-18 14:04:42 UTC+8, alternatively, ..."
+//   - 中文："使用量已超出频率限制，将在 2026-09-12 18:08:12 UTC+8 重置"
+//
+// 直接用时间格式匹配而非「抓分隔符之间的任意串」：分隔符在两种语言里不同
+// （中文用「 重置」、英文用逗号），而时间格式是同一套；且英文文案的时间后可能
+// 跟逗号/句点/直接结束，靠分隔符会漏。这也是曾出过的 bug —— 原来的模式只写了
+// 中文 `将在 (.+?) 重置`，而生产日志里 6004 文案**全是英文**，于是 ResetAt 恒解析
+// 失败、模型级冷却（CooldownSoftForModel）从未生效，账号被按「全模型」冷却了，
+// 而上游明说 "you can switch to the other models to continue using it"。
+const softRateResetPattern = `(?:将在 |will reset at )(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: UTC\+8)?)`
 
 // 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
 // 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
@@ -163,7 +175,7 @@ func IsModelRateLimit(body string) bool {
 	return reModelRateLimit.MatchString(body)
 }
 
-// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// ParseSoftRateReset 从 429 body 解析重置时刻（上游 UTC+8 文案，中英文均可）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 // 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
 // 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。

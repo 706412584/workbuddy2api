@@ -91,7 +91,7 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
-// TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
+// TestParseSoftRateReset 解析上游 429 6004 msg 里的重置时刻（UTC+8 文案，中英文）。
 func TestParseSoftRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)
 	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
@@ -106,6 +106,11 @@ func TestParseSoftRateReset(t *testing.T) {
 		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
+		// 英文形态：生产实测 6004 **全是英文**（intl 与 cn 都一样），
+		// 只覆盖中文会让该解析恒失败 → 模型级冷却从不生效（见 softRateResetPattern 注释）。
+		{"英文·生产原文", `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` + ts + ` UTC+8, alternatively, you can switch to the other models to continue using it."}`, true},
+		{"英文·句末无逗号", `{"code":6004,"msg":"your usage will reset at ` + ts + ` UTC+8."}`, true},
+		{"英文·无 UTC+8 后缀", `{"code":6004,"msg":"your usage will reset at ` + ts + `, alternatively"}`, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
