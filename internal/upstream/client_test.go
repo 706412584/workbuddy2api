@@ -40,6 +40,28 @@ func TestContextExceededMessage(t *testing.T) {
 	}
 }
 
+// TestModelNotFoundMessage 提取透传给客户端的模型不存在文案。
+// 优先用上游的 displayMsg（面向用户的现成文案），且不得混入 requestId 等内部字段。
+func TestModelNotFoundMessage(t *testing.T) {
+	prod := `{"code":11102,"msg":"model [deepseek-v4] service info not found","requestId":"x","displayMsg":{"en":"The requested model is not available. Please switch to another model.","zh":"当前模型不可用，请切换其他模型后重试。"}}`
+	got := ModelNotFoundMessage(prod)
+	if got != "The requested model is not available. Please switch to another model." {
+		t.Errorf("got %q want 上游 displayMsg.en", got)
+	}
+	if strings.Contains(got, "requestId") || strings.Contains(got, "11102") {
+		t.Errorf("消息混入了上游内部字段: %q", got)
+	}
+
+	// 无 displayMsg 时退回 msg 字段。
+	if got := ModelNotFoundMessage(`{"code":11102,"msg":"model [x] service info not found"}`); !strings.Contains(got, "service info not found") {
+		t.Errorf("无 displayMsg 时应退回 msg 字段, got %q", got)
+	}
+	// 都取不到时给固定兜底。
+	if got := ModelNotFoundMessage(`{}`); got == "" {
+		t.Error("兜底文案为空")
+	}
+}
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		status int
@@ -86,6 +108,9 @@ func TestClassify(t *testing.T) {
 		{400, `{"extError":{"code":"context_length_exceeded"}}`, ErrContextExceeded},
 		{400, `{"code":11115,"msg":"x"}`, ErrContextExceeded},
 		{400, `PROMPT IS TOO LONG: 5 tokens > 4 maximum`, ErrContextExceeded}, // 大小写不敏感
+		// 模型不存在（生产原文）：必须单独归类，好让轮换耗尽时回 404 而非 503。
+		{400, `{"code":11102,"msg":"model [deepseek-v4] service info not found","displayMsg":{"en":"The requested model is not available. Please switch to another model."}}`, ErrModelNotFound},
+		{400, `model [x] service info not found`, ErrModelNotFound},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},

@@ -968,6 +968,65 @@ func TestAnthropicContextExceededIsInvalidRequest(t *testing.T) {
 	}
 }
 
+// TestChatModelNotFoundReturns404 模型不存在必须回 404，而非 503。
+//
+// 与上下文超限同类（请求侧问题被报成服务侧故障），但处置不同：这里**仍然轮换** ——
+// 模型清单是区域级的，网关静态表可能滞后于上游，对未收录的模型（不做区域限制）
+// 轮换能撞出真正提供它的区域。只是轮换耗尽后必须回 404，不能用 503 把人引去查账号池。
+func TestChatModelNotFoundReturns404(t *testing.T) {
+	const prod = `{"code":11102,"msg":"model [no-such-model] service info not found","requestId":"x","displayMsg":{"en":"The requested model is not available. Please switch to another model."}}`
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, prod, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"no-such-model","messages":[]}`)))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code=%d want 404（503 会让人去查账号池）body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("非 OpenAI 错误体: %v body=%s", err, rec.Body)
+	}
+	if resp.Error.Code != "model_not_found" {
+		t.Errorf("code=%q want model_not_found", resp.Error.Code)
+	}
+	if resp.Error.Type != "not_found_error" {
+		t.Errorf("type=%q want not_found_error", resp.Error.Type)
+	}
+	if !strings.Contains(resp.Error.Message, "switch to another model") {
+		t.Errorf("message=%q 未透传上游 displayMsg", resp.Error.Message)
+	}
+	if strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Errorf("被通用文案吞掉: %s", rec.Body)
+	}
+	// 仍然轮换：两个号都该被试过（区域发现的价值）。
+	if calls != 2 {
+		t.Errorf("上游调用 %d 次 want 2（模型清单是区域级的，轮换可能撞出提供它的区域）", calls)
+	}
+	// 账号无过错，不得受罚。
+	for _, uid := range []string{"u1", "u2"} {
+		if st, _ := p.Status(uid); st.Cooling || st.ErrTotal != 0 {
+			t.Errorf("%s 被误罚: %+v", uid, st)
+		}
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)

@@ -952,6 +952,18 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		return nil
 	}
 
+	// 模型不存在：轮换过了（撞区域，见 ErrModelNotFound 注释）仍没人能服务它，
+	// 回 404 而不是 503。503 的语义是「网关没有可用账号」，会把排查方向引向账号池；
+	// 而真相是模型名不对 / 该模型上游已下线。404 也是 OpenAI 对未知模型的标准语义
+	// （网关在模型已知时已按此回 404，这里是模型未知、只能靠上游告知的分支）。
+	if ue := (*upstream.Error)(nil); errors.As(lastErr, &ue) && ue.Kind == upstream.ErrModelNotFound {
+		msg := upstream.ModelNotFoundMessage(ue.Msg)
+		log.Printf("WARN: [server] model not found model=%s: %s", o.model, msg)
+		writeErr(w, http.StatusNotFound, "model_not_found", msg)
+		st.status = http.StatusNotFound
+		return nil
+	}
+
 	// 轮换耗尽有两种截然不同的原因，必须分开表述，否则会把排查方向带偏：
 	//   - lastErr == nil：真的没有可尝试的账号（区域无账号 / 全冷却 / 全禁用）。
 	//   - lastErr != nil：账号是好的，但每次尝试都被上游拒绝（如 400 消息格式错误）。

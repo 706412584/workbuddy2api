@@ -37,6 +37,11 @@ const (
 	// 超过模型窗口。**不轮换**——换账号改变不了请求体，且窗口是模型属性而非账号属性，
 	// 每个账号都会得到一模一样的结果。必须原样透传 400 给客户端，否则见下方注释。
 	ErrContextExceeded
+	// ErrModelNotFound 模型不存在 / 当前不提供（400 + code 11102）：同样是请求侧问题。
+	// 与 ErrContextExceeded 的区别是**仍然轮换**——模型清单是区域级的，而网关的静态表
+	// 可能滞后于上游；对未收录的模型（不做区域限制）轮换能撞出真正提供它的区域。
+	// 但轮换耗尽后必须回 404 而非 503：模型名不对不是「网关没有可用账号」。
+	ErrModelNotFound
 	ErrClient // 其他 4xx / 业务错误
 )
 
@@ -58,6 +63,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrContextExceeded:
 		return "context_exceeded"
+	case ErrModelNotFound:
+		return "model_not_found"
 	case ErrClient:
 		return "client"
 	default:
@@ -164,6 +171,41 @@ func IsContextExceeded(body string) bool {
 		strings.Contains(body, contextExceededBizCode) ||
 		strings.Contains(lower, contextExceededMsg)
 }
+
+// modelNotFoundMarker 模型不存在 / 当前区域不提供该模型（生产实测形态）：
+//
+//	{"code":11102,"msg":"model [deepseek-v4] service info not found",
+//	 "displayMsg":{"en":"The requested model is not available. Please switch to another model."}}
+//
+// 与上下文超限同类：这是**请求**的问题（模型名不对/该区不提供），不是网关或账号的问题。
+// 原先进 ErrClient → 换号重试 → 503 no_healthy_account，客户端读作「网关故障」。
+const modelNotFoundBizCode = `"code":11102`
+const modelNotFoundMarker = "service info not found"
+
+// IsModelNotFound 报告上游 body 是否为「模型不存在」。
+func IsModelNotFound(body string) bool {
+	return strings.Contains(body, modelNotFoundBizCode) ||
+		strings.Contains(strings.ToLower(body), modelNotFoundMarker)
+}
+
+// ModelNotFoundMessage 返回可直接回给客户端的模型不存在消息。
+//
+// 优先用上游的中英双语 displayMsg（对用户友好）；缺失时回退到 msg 字段；
+// 都取不到才用固定文案。不含 requestId 等内部字段。
+func ModelNotFoundMessage(body string) string {
+	if m := reModelNotFoundDisplay.FindStringSubmatch(body); len(m) > 1 {
+		return m[1]
+	}
+	if m := reModelNotFoundMsg.FindStringSubmatch(body); len(m) > 1 {
+		return m[1]
+	}
+	return "the requested model is not available; please switch to another model"
+}
+
+var (
+	reModelNotFoundDisplay = regexp.MustCompile(`"displayMsg":\{"en":"([^"]{1,200})"`)
+	reModelNotFoundMsg     = regexp.MustCompile(`"msg":"(model \[[^"]{0,120}service info not found)"`)
+)
 
 // alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
@@ -309,6 +351,11 @@ func Classify(status int, body string) ErrKind {
 		// 换号毫无意义：窗口是模型属性，每个账号都会得到完全相同的 400。
 		if IsContextExceeded(body) {
 			return ErrContextExceeded
+		}
+		// 模型不存在（11102）：归类但**仍然轮换**——见 ErrModelNotFound 的注释。
+		// 判在 ErrClient 之前，好让轮换耗尽时能回 404 而不是 503。
+		if IsModelNotFound(body) {
+			return ErrModelNotFound
 		}
 		return ErrClient
 	}
