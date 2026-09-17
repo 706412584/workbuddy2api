@@ -29,6 +29,22 @@ export interface AccountStatus {
   breaker_until?: string
 }
 
+/** 一次思考空转命中的观测记录（后端 loopguard.go 的 LoopHit） */
+export interface ThinkingLoopHit {
+  at: string
+  uid: string
+  model: string
+  /** 命中时已吐出的思考字符数（切断点） */
+  think_chars: number
+  /** 唯一块占比；停滞判据命中时它可能仍然很高 */
+  ratio: number
+  stale_chunks: number
+  /** 命中请求的上下文大小估算，与模型 context_length 对照判断占满程度 */
+  req_est_tokens: number
+  /** 第几次重试时命中（1 = 首次尝试就空转） */
+  retry: number
+}
+
 /** 对应 GET /status 的响应 */
 export interface PoolStatus {
   accounts: AccountStatus[]
@@ -39,6 +55,10 @@ export interface PoolStatus {
   in_flight_full: number
   sticky_sessions: number
   redis_mode: string
+  /** 累计空转命中次数（进程级，重启清零） */
+  thinking_loop_total: number
+  /** 近期命中记录（最多 20 条，按时间正序） */
+  thinking_loops: ThinkingLoopHit[]
 }
 
 /** 对应 GET /healthz（无鉴权） */

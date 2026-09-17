@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AccountTestResult, Health, PoolStatus, RegionModels, ScheduleStatus } from '../api/types'
+import type {
+  AccountTestResult,
+  Health,
+  PoolStatus,
+  RegionModels,
+  ScheduleStatus,
+  ThinkingLoopHit,
+} from '../api/types'
 import {
   breakerActive,
   fmtDuration,
@@ -85,6 +92,68 @@ function fmtLeft(ms: number): string {
 function fmtClock(iso: string): string {
   const d = new Date(iso)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/**
+ * 思考空转卡：近期被自动切断的空转及其上下文大小。
+ *
+ * 为什么把「上下文大小」放在显眼位置：空转实测多发生在长上下文（请求体 920KB /
+ * 约 23 万 token 时触发过一次）。列出每次的估算值，一眼就能看出是否集中在长上下文 ——
+ * 若确实如此，正解是别让上下文涨到那个区间，而不是反复重试。
+ *
+ * 「阻断」列区分是哪条判据抓的：停滞（ratio 可能仍高）还是占比。
+ * 两条都已命中时标停滞 —— 它先于占比触发，更能说明是「原地打转」而非「文本重复」。
+ */
+function ThinkingLoopsCard({ hits }: { hits: ThinkingLoopHit[] }) {
+  return (
+    <div className="panel">
+      <header>
+        <h2>思考空转</h2>
+        <span className="sub">最近 {hits.length} 次（重启清零）</span>
+        <div className="spacer" />
+        <span className="dim" style={{ fontSize: 11.5 }}>
+          命中即切断上游流、追加提示后换号重试
+        </span>
+      </header>
+      <div className="body">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>账号</th>
+              <th>模型</th>
+              <th title="命中时已吐出的思考字符数，即切断点">切断于</th>
+              <th title="原始请求体的 token 估算；与该模型 context_length 对照可判断占满程度">
+                上下文
+              </th>
+              <th title="停滞 = 连续无新内容；占比 = 唯一块占比过低">判据</th>
+              <th title="第几次重试时命中；1 表示首次尝试就空转">第几次</th>
+            </tr>
+          </thead>
+          <tbody>
+            {/* 后端按时间正序返回，倒序展示让最近的在最上面 */}
+            {[...hits].reverse().map((h, i) => (
+              <tr key={`${h.at}-${i}`}>
+                <td className="mono">{fmtTime(h.at)}</td>
+                <td className="mono">{h.uid.slice(0, 8)}</td>
+                <td className="mono">{h.model}</td>
+                <td className="mono">{fmtTokens(h.think_chars)} 字符</td>
+                <td className="mono">{fmtTokens(h.req_est_tokens)} tokens</td>
+                <td>{h.stale_chunks > 0 ? '停滞' : '占比'}</td>
+                <td className="mono">{h.retry}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/** 大数字紧凑显示：232535 → 「23.3 万」，便于一眼比较量级。 */
+function fmtTokens(n: number): string {
+  if (n >= 10000) return `${(n / 10000).toFixed(1)} 万`
+  return String(n)
 }
 
 /** 定时任务排程卡：下次运行时间 + 立即执行。 */
@@ -565,7 +634,15 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
           <div className="k">区域数</div>
           <div className="v">{regions.size}</div>
         </div>
+        <div className="stat">
+          <div className="k">思考空转</div>
+          <div className="v" title="已自动切断并重试的空转次数；重启后清零">
+            {status.thinking_loop_total}
+          </div>
+        </div>
       </div>
+
+      {status.thinking_loops.length > 0 && <ThinkingLoopsCard hits={status.thinking_loops} />}
 
       {sched && <ScheduleCard sched={sched} running={triggering} onRun={runTask} />}
 

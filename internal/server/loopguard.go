@@ -25,6 +25,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -125,6 +126,66 @@ func (g LoopGuard) Detect(thinkChars, textChars, staleChunks, distinctChunks, to
 		return true
 	}
 	return float64(distinctChunks)/float64(totalChunks) < g.MaxDistinctRatio
+}
+
+// LoopHit 一次思考空转命中的观测记录，经 /status 暴露，免去翻日志。
+type LoopHit struct {
+	At    time.Time `json:"at"`
+	UID   string    `json:"uid"`
+	Model string    `json:"model"`
+	// ThinkChars 命中时已吐出的思考字符数（切断点）。
+	ThinkChars int `json:"think_chars"`
+	// Ratio 唯一块占比。停滞判据命中时它可能仍然很高 —— 这正是主判据切换的原因，
+	// 记录它便于回看「这次是停滞抓的（ratio 高）还是占比抓的（ratio 低）」。
+	Ratio float64 `json:"ratio"`
+	// StaleChunks 命中时的停滞块数（自上次出现新块以来累积的块数）。
+	StaleChunks int `json:"stale_chunks"`
+	// ReqEstTokens 命中请求的上下文大小估算（原始请求体，不含后加的提示）。
+	// 用于验证「上下文越满越容易空转」：与 /v1/models 的 context_length 对照。
+	ReqEstTokens int `json:"req_est_tokens"`
+	// Retry 第几次重试时命中（1 = 首次尝试就空转）。
+	// 必须记：一次请求可能连续重试多次都空转，没有这个字段会看成多起独立事件。
+	Retry int `json:"retry"`
+}
+
+// loopHitsCap 保留的近期命中条数。20 条足够看出「是否集中在长上下文」这一形态，
+// 又不至于让 /status 响应膨胀（每条约 150 字节）。
+const loopHitsCap = 20
+
+// loopLog 近期空转命中的环形缓冲。
+//
+// 进程级、不持久化：这是诊断观测，重启后从零开始即可；要看跨重启的长期趋势应查
+// gateway.log（那里每条命中都有一行 WARN）。全部命中（含非空转的失败）另计。
+//
+// 不做区域过滤：空转是模型侧现象而非账号侧（实测 7 个不同账号都中过、全部同一模型），
+// 按区域切开只会让形态更难看清，而 /status 本就是管理员接口。
+type loopLog struct {
+	mu    sync.Mutex
+	total int
+	hits  []LoopHit
+}
+
+// record 追加一条命中记录，超出容量时丢弃最旧的。
+func (l *loopLog) record(h LoopHit) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.total++
+	l.hits = append(l.hits, h)
+	if len(l.hits) > loopHitsCap {
+		// 就地前移覆盖最旧一条，而非 l.hits = l.hits[1:] ——
+		// 后者只移动切片头，底层数组随 append 无限增长（诊断数据不该有这种泄漏）。
+		n := copy(l.hits, l.hits[len(l.hits)-loopHitsCap:])
+		l.hits = l.hits[:n]
+	}
+}
+
+// snapshot 返回累计命中次数与近期记录的副本（调用方持有副本，不受后续写入影响）。
+func (l *loopLog) snapshot() (total int, hits []LoopHit) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]LoopHit, len(l.hits))
+	copy(out, l.hits)
+	return l.total, out
 }
 
 // InjectLoopNudge 在请求体末尾追加一条 system 提示，要求模型停止重复思考。

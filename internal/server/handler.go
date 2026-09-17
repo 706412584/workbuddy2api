@@ -141,6 +141,8 @@ type Handler struct {
 	degrade degradeGate
 	// loopGuard 思考死循环判据；nil = 不检测（配置关闭时）。
 	loopGuard *LoopGuard
+	// loopLog 近期空转命中的环形缓冲，经 /status 暴露（免去翻日志）。
+	loopLog *loopLog
 }
 
 // NewHandler 构建 handler。
@@ -160,7 +162,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = defaultMaxBodyBytes
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), loopLog: &loopLog{}}
 	h.loopGuard = cfg.LoopGuard.toLoopGuard()
 	// 生效判据落一行启动日志：这几项只能从配置推导，出问题时（误杀/漏判）第一件
 	// 事就是确认实际生效的阈值，没有这行只能去翻配置文件猜。
@@ -270,6 +272,10 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 // status 返回账号池观测信息。绑定区域的密钥只看到该区域的账号与计数；
 // 未绑定区域的密钥看到全部（改造前行为）。
 // sticky_sessions 例外：该计数来自 router 的全局记账，不随区域过滤。
+//
+// thinking_loop_total / thinking_loops 同样是全局的（跨区域、重启清零）：
+// 空转是模型侧现象而非账号侧（实测 7 个不同账号都中过、全部同一模型），
+// 按密钥区域切开只会让形态更难看清。要看跨重启的长期趋势请查 gateway.log。
 func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
 	pred := keyRegionPred(key)
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailedWhere(pred)
@@ -281,6 +287,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	loopTotal, loopHits := h.loopLog.snapshot()
+	if loopHits == nil {
+		// nil 切片会被编码成 null，面板要额外处理；空数组更省事。
+		loopHits = []LoopHit{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":        h.cfg.Pool.ListWhere(pred),
 		"total":           total,
@@ -290,6 +301,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec
 		"in_flight_full":  inFlightFull,
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+
+		// 思考空转观测：近期命中次数与各自的上下文大小，
+		// 用于判断是否集中在长上下文（见 LoopHit 注释）。
+		"thinking_loop_total": loopTotal,
+		"thinking_loops":      loopHits,
 	})
 }
 
@@ -848,9 +864,24 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 				}
 				// req_kb / req_est_tokens 用于验证「上下文满了容易触发空转」的假设：
 				// 与 /v1/models 里该模型的 context_length 对照即可判断占满程度。
+				// 估算一次即可 —— estimateTokens 是 O(len) 逐字符扫描，日志与
+				// /status 观测共用同一个值，不要各算一遍。
+				estTokens := estimateTokens(string(origBody))
 				log.Printf("WARN: [server] thinking loop uid=%s model=%s think_chars=%d ratio=%.3f stale=%d/%d retry=%d/%d req_kb=%d req_est_tokens=%d",
 					logfmt.UID8(acct.UID), o.model, thinkChars, ratio, stale, maxStale, loopRetries, maxRetries,
-					len(origBody)>>10, estimateTokens(string(origBody)))
+					len(origBody)>>10, estTokens)
+				// 同时进环形缓冲，供 /status 查看：
+				// 「近期空转次数 + 各自上下文大小」一眼可见，不用翻日志。
+				h.loopLog.record(LoopHit{
+					At:           time.Now(),
+					UID:          acct.UID,
+					Model:        o.model,
+					ThinkChars:   thinkChars,
+					Ratio:        ratio,
+					StaleChunks:  stale,
+					ReqEstTokens: estTokens,
+					Retry:        loopRetries,
+				})
 				if loopRetries > maxRetries {
 					// 重试预算用尽：跳出轮换循环，由出口统一回错误。
 					// 出口判 lastErr 决定文案 —— 预算可能因「账号池小」先被

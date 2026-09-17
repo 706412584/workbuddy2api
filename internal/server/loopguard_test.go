@@ -608,6 +608,137 @@ func TestResponsesThinkingLoopRetries(t *testing.T) {
 	}
 }
 
+// TestLoopLogRingBuffer 环形缓冲：超容量时丢最旧的、保留最近 N 条，且不泄漏底层数组。
+//
+// 底层数组泄漏是真会发生的写法：l.hits = l.hits[1:] 只移动切片头，
+// 之后每次 append 都会在新位置写入，容量不足时重新分配 —— 老数据虽不可见，
+// 但切片头持续后移期间 append 会反复扩容。这里断言长度恒等于容量上限。
+func TestLoopLogRingBuffer(t *testing.T) {
+	var l loopLog
+	total := loopHitsCap + 5
+	for i := 0; i < total; i++ {
+		l.record(LoopHit{UID: fmt.Sprintf("u%d", i), ThinkChars: i})
+	}
+	gotTotal, hits := l.snapshot()
+	if gotTotal != total {
+		t.Errorf("total=%d want %d（累计计数不该被容量截断）", gotTotal, total)
+	}
+	if len(hits) != loopHitsCap {
+		t.Fatalf("len(hits)=%d want %d", len(hits), loopHitsCap)
+	}
+	// 最旧的 5 条被丢弃：首条应是 u5，末条是 u{total-1}。
+	if hits[0].UID != "u5" {
+		t.Errorf("首条 uid=%q want u5（最旧的应被丢弃）", hits[0].UID)
+	}
+	if last := hits[len(hits)-1]; last.UID != fmt.Sprintf("u%d", total-1) {
+		t.Errorf("末条 uid=%q want u%d", last.UID, total-1)
+	}
+	// 顺序必须是时间序：面板按此顺序展示，乱序会读成「空转忽多忽少」。
+	for i := 1; i < len(hits); i++ {
+		if hits[i].ThinkChars <= hits[i-1].ThinkChars {
+			t.Fatalf("顺序错乱: hits[%d]=%d <= hits[%d]=%d", i, hits[i].ThinkChars, i-1, hits[i-1].ThinkChars)
+		}
+	}
+}
+
+// TestLoopLogSnapshotIsCopy 快照必须与后续写入隔离 ——
+// /status 序列化期间若有新命中写入，共享底层数组会产生撕裂读（甚至 race）。
+func TestLoopLogSnapshotIsCopy(t *testing.T) {
+	var l loopLog
+	l.record(LoopHit{UID: "u1"})
+	_, snap := l.snapshot()
+	l.record(LoopHit{UID: "u2"})
+	if len(snap) != 1 || snap[0].UID != "u1" {
+		t.Errorf("快照被后续写入影响: %+v", snap)
+	}
+}
+
+// TestStatusExposesLoopLog /status 必须暴露近期空转与累计次数，
+// 且无命中时是空数组而非 null（面板不必为 null 写特例）。
+func TestStatusExposesLoopLog(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: &upstream.Client{}, LoopGuard: LoopGuardConfig{Enabled: true}})
+
+	// 无命中：total=0、数组为空。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	if body["thinking_loop_total"] != float64(0) {
+		t.Errorf("thinking_loop_total=%v want 0", body["thinking_loop_total"])
+	}
+	if hits, ok := body["thinking_loops"].([]any); !ok || len(hits) != 0 {
+		t.Errorf("thinking_loops=%v want 空数组（非 null）", body["thinking_loops"])
+	}
+
+	// 记一条后：total=1、含上下文估算。
+	h.loopLog.record(LoopHit{
+		At: time.Now(), UID: "u1", Model: "deepseek-v4.1-flash",
+		ThinkChars: 61536, Ratio: 0.218, StaleChunks: 2000,
+		ReqEstTokens: 232535, Retry: 1,
+	})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	if body["thinking_loop_total"] != float64(1) {
+		t.Errorf("thinking_loop_total=%v want 1", body["thinking_loop_total"])
+	}
+	hits, ok := body["thinking_loops"].([]any)
+	if !ok || len(hits) != 1 {
+		t.Fatalf("thinking_loops=%v want 1 条", body["thinking_loops"])
+	}
+	hit, _ := hits[0].(map[string]any)
+	if hit["req_est_tokens"] != float64(232535) {
+		t.Errorf("req_est_tokens=%v want 232535（这是判断上下文是否占满的关键字段）", hit["req_est_tokens"])
+	}
+	if hit["model"] != "deepseek-v4.1-flash" || hit["retry"] != float64(1) {
+		t.Errorf("hit=%v 缺 model/retry", hit)
+	}
+}
+
+// TestChatThinkingLoopRecordsHit 端到端：命中后必须落进环形缓冲。
+// 记录逻辑若只写日志不进缓冲，/status 会永远显示 0 —— 面板看着正常但其实没数据。
+//
+// 池里放两个号：单账号池在首轮命中后被 tried 排除、第二轮无号可选就直接退出，
+// 走不到第二次命中，测不出 retry 序号。
+func TestChatThinkingLoopRecordsHit(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, loopSSE(200), true
+	})
+	h := testLoopHandler(t, up, testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	), 1)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	total, hits := h.loopLog.snapshot()
+	// maxRetries=1：首次命中记一条，重试命中再记一条，共 2 条。
+	if total != 2 || len(hits) != 2 {
+		t.Fatalf("total=%d len=%d want 2/2（首次 + 重试各记一条）", total, len(hits))
+	}
+	if hits[0].Retry != 1 || hits[1].Retry != 2 {
+		t.Errorf("retry 序号=%d,%d want 1,2（据此区分「一次请求重试多次」与「多起独立事件」）",
+			hits[0].Retry, hits[1].Retry)
+	}
+	// 两条分属不同账号：命中的号会被 tried 排除，重试必然换号。
+	if hits[0].UID == hits[1].UID {
+		t.Errorf("两次命中都用 %s：重试没有换号", hits[0].UID)
+	}
+	if hits[0].Model != "glm-5.2" {
+		t.Errorf("记录缺 model: %+v", hits[0])
+	}
+	if hits[0].ReqEstTokens <= 0 {
+		t.Errorf("req_est_tokens=%d want >0", hits[0].ReqEstTokens)
+	}
+}
+
 // TestChatChunkReaderAbortsOnLoop chatChunkReader.next 必须把中断信号透出，
 // 否则 Anthropic / Responses 两条协议适配路径的循环守卫形同虚设
 // （它们的转发走 chatChunkReader，不经过 upstream.Stream 的读循环）。
