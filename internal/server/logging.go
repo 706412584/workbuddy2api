@@ -72,7 +72,10 @@ type chatStatsReader struct {
 	textChars  int                 // content 累计字符
 	chunkSeen  map[string]struct{} // thinking 切出的唯一块集合（去重）
 	chunkTotal int                 // 已切出的块总数
-	chunkBuf   strings.Builder
+	// lastNovel 最近一次出现新块时的 chunkTotal。当前总块数与之之差即「停滞块数」：
+	// 循环文本跑完一遍周期后不再产生新块，该差值单调增长，是空转的本质信号。
+	lastNovel int
+	chunkBuf  strings.Builder
 
 	// guard 思考死循环判据；nil = 不检测。loopTripped 保证只报一次。
 	guard       *LoopGuard
@@ -96,20 +99,27 @@ func (s *chatStatsReader) noteThinking(t string) {
 	s.chunkBuf.WriteString(t)
 	for s.chunkBuf.Len() >= loopChunkLen {
 		full := s.chunkBuf.String()
-		s.chunkSeen[full[:loopChunkLen]] = struct{}{}
+		// 必须复制：full 别名于 chunkBuf 的内部缓冲，紧随其后的 WriteString 会就地
+		// 改写它 —— 直接把 full[:loopChunkLen] 当 map 键，键的字节会随缓冲被覆盖而
+		// 改变，唯一块统计（以及依赖它的停滞判据）随之失真。
+		blk := strings.Clone(full[:loopChunkLen])
 		s.chunkTotal++
+		if _, seen := s.chunkSeen[blk]; !seen {
+			s.chunkSeen[blk] = struct{}{}
+			s.lastNovel = s.chunkTotal // 记账在自增之后：刚出现新块时停滞数为 0
+		}
 		s.chunkBuf.Reset()
 		s.chunkBuf.WriteString(full[loopChunkLen:])
 	}
 }
 
 // LoopSignal 返回思考循环的观测指标：thinking 字符数、正文（content）字符数、
-// 唯一块数、总块数。
+// 唯一块数、总块数、停滞块数（自上次出现新块以来累积的块数）。
 //
-// 判读：总块数大而唯一块数极小 → 文本在重复（循环）。
-// 正常行文的唯一块数应与总块数同量级。
-func (s *chatStatsReader) LoopSignal() (thinkChars, textChars, distinctChunks, totalChunks int) {
-	return s.thinkChars, s.textChars, len(s.chunkSeen), s.chunkTotal
+// 判读：总块数大而唯一块数极小 → 文本在重复（循环），正常行文的唯一块数应与
+// 总块数同量级；停滞块数持续增长 → 已跑完一遍循环周期，正在原地打转。
+func (s *chatStatsReader) LoopSignal() (thinkChars, textChars, distinctChunks, totalChunks, staleChunks int) {
+	return s.thinkChars, s.textChars, len(s.chunkSeen), s.chunkTotal, s.chunkTotal - s.lastNovel
 }
 
 // SetLoopGuard 装配思考循环判据；nil 表示不检测（默认）。
@@ -123,7 +133,11 @@ func (s *chatStatsReader) LoopGuardErr() error {
 	if s.guard == nil || s.loopTripped {
 		return nil
 	}
-	if s.guard.Detect(s.thinkChars, s.textChars, len(s.chunkSeen), s.chunkTotal, time.Since(s.start)) {
+	distinct, total := len(s.chunkSeen), s.chunkTotal
+	// 停滞块数：自上次出现新块以来累积的块数。lastNovel 记录的是「发现新块那一刻的
+	// 总块数」，而总块数只增不减，故该差值恒 >= 0。
+	stale := total - s.lastNovel
+	if s.guard.Detect(s.thinkChars, s.textChars, stale, distinct, total, time.Since(s.start)) {
 		s.loopTripped = true
 		return ErrThinkingLoop
 	}

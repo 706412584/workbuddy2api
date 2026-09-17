@@ -53,13 +53,17 @@ type Config struct {
 		// 0/负数视为非法 → 启动报错。
 		MaxBodyMB int `json:"max_body_mb"`
 
-		// LoopGuard* 思考死循环判据（deepseek-v4 实测空转 900s、正文零输出）。
-		// 全部可选：0 表示用内置默认（40 万字符 / 0.15 / 30s / 2 次重试）。
+		// LoopGuard* 思考死循环判据（deepseek-v4.1-flash 实测空转 900s、正文零输出）。
+		// 全部可选：0 表示用内置默认（3 万字符下限 / 0.15 / 30s / 2 次重试 / 2000 块停滞窗口）。
 		// 判据恒开启，没有单独的开关 —— 关闭它只会让空转请求挂满 15 分钟。
 		LoopGuardMinThinkChars     int     `json:"loopguard_min_think_chars"`
 		LoopGuardMaxDistinctRatio  float64 `json:"loopguard_max_distinct_ratio"`
 		LoopGuardMinElapsedSeconds int     `json:"loopguard_min_elapsed_seconds"`
 		LoopGuardMaxRetries        int     `json:"loopguard_max_retries"`
+		// LoopGuardMaxStaleChunks 停滞窗口（块数，每块 24 字节）：连续这么多块没有新
+		// 内容即判空转。默认 2000 块 = 48KB，是主判据，与循环周期长度无关。
+		// 调小会更快切断但误判面变大；调试时可临时调小以验证链路。
+		LoopGuardMaxStaleChunks int `json:"loopguard_max_stale_chunks"`
 	} `json:"server"`
 
 	Cooldown struct {

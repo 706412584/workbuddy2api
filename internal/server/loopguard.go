@@ -43,17 +43,29 @@ const loopNudgeText = "你刚才陷入了重复思考：反复检查同一件事
 
 // LoopGuard 思考循环判据。
 //
-// 三个条件同时满足才算命中（缺一不可）：
-//   - 思考字符数超过阈值：区分「长思考」与「空转」。正常请求 thinking 通常几千字符。
-//   - 正文为 0：核心判据 —— 想了半天不产出，这正是要救的场景。
-//   - 唯一块占比低：确认是重复文本，而非大篇幅的正常推理。
+// 命中要求「正文为 0」这个前提，加上下面两条判据之一：
 //
-// 阈值取实测异常的保守下界：异常样本最小 20.8 万字符，正常请求几千，
-// 默认 40 万落在两者之间，留足余量避免误杀真正需要长思考的请求。
+//   - **停滞**（主判据）：连续 MaxStaleChunks 个块没有出现任何新内容。
+//     与循环周期长度无关 —— 循环文本跑完一遍周期后就不再产生新块，所以固定的
+//     窗口对 7KB 周期和 53KB 周期一样有效。
+//   - **占比**（兜底）：唯一块占比低于阈值。覆盖「慢漂移」形态 —— 循环文本每轮
+//     略有变化（新块偶发出现，反复重置停滞计数），但整体仍在原地打转。
+//
+// 为什么停滞比占比快：占比要等文本足够长才降下来，周期越长等得越久。实测反推
+// 周期为 7.3KB / 25.4KB / 53KB，占比判据分别要 4.9 万 / 17 万 / 35 万字符才命中，
+// 而停滞判据一律在「周期 + 窗口」处命中（5.5 万 / 7.3 万 / 10 万字符）。
+// 更关键的是：占比判据在 20.8 万字符那次（周期 25.4KB、实测挂了 382 秒）根本
+// 够不到任何合理阈值，而停滞判据照样在 7.3 万字符处切断。
+//
+// 为什么用「没有新块」而不是关键词匹配：人看到的是模型反复念叨 "let me" / "ok"，
+// 但机器角度的周期是一整段 7–53KB 的推理文本。匹配关键词既脆弱又漏（换个措辞就
+// 失效），「不再产生新内容」才是这个现象的本质。
 type LoopGuard struct {
 	// Enabled 关闭时完全不检测（保留原有行为）。
 	Enabled bool
-	// MinThinkChars 思考字符数阈值。
+	// MinThinkChars 思考字符数下限：样本太小不下判断。
+	// 注意这是**下限**而非主判据 —— 设得过大会把停滞判据一起屏蔽掉
+	// （停滞需要连续 MaxStaleChunks 块，本就需要足够长的文本）。
 	MinThinkChars int
 	// MaxDistinctRatio 唯一块占比上限；占比低于此值判为重复文本。
 	MaxDistinctRatio float64
@@ -62,16 +74,20 @@ type LoopGuard struct {
 	// MaxRetries 命中后的重试上限（不含首次尝试）；<=0 表示用 maxLoopRetries。
 	// 放这里而非 handler 的常量：测试需要构造「命中即用尽」的判据来验证终态错误。
 	MaxRetries int
+	// MaxStaleChunks 停滞窗口（单位：块），连续这么多块没有新内容即判空转。
+	// 默认 2000 块 = 48KB —— 正常行文做不到 48KB 里连一个全新的 24 字节片段都没有。
+	MaxStaleChunks int
 }
 
-// DefaultLoopGuard 默认判据（用户选定 40 万 / 0.15）。
+// DefaultLoopGuard 默认判据。
 func DefaultLoopGuard() LoopGuard {
 	return LoopGuard{
 		Enabled:          true,
-		MinThinkChars:    400_000,
+		MinThinkChars:    30_000,
 		MaxDistinctRatio: 0.15,
 		MinElapsed:       30 * time.Second,
 		MaxRetries:       maxLoopRetries,
+		MaxStaleChunks:   2000, // 48KB
 	}
 }
 
@@ -84,7 +100,10 @@ func (g LoopGuard) maxRetries() int {
 }
 
 // Detect 判断给定的流式统计是否命中思考死循环。
-func (g LoopGuard) Detect(thinkChars, textChars, distinctChunks, totalChunks int, elapsed time.Duration) bool {
+//
+// staleChunks 是「自上次出现新块以来累积的块数」，由调用方维护。
+// 两条判据满足其一即命中，共同前提是正文为 0（有产出就不干预）。
+func (g LoopGuard) Detect(thinkChars, textChars, staleChunks, distinctChunks, totalChunks int, elapsed time.Duration) bool {
 	if !g.Enabled {
 		return false
 	}
@@ -101,8 +120,11 @@ func (g LoopGuard) Detect(thinkChars, textChars, distinctChunks, totalChunks int
 	if elapsed < g.MinElapsed {
 		return false
 	}
-	ratio := float64(distinctChunks) / float64(totalChunks)
-	return ratio < g.MaxDistinctRatio
+	// 停滞：连续这么多块没有新内容。窗口本身即样本下限，无需另设门槛。
+	if g.MaxStaleChunks > 0 && staleChunks >= g.MaxStaleChunks {
+		return true
+	}
+	return float64(distinctChunks)/float64(totalChunks) < g.MaxDistinctRatio
 }
 
 // InjectLoopNudge 在请求体末尾追加一条 system 提示，要求模型停止重复思考。

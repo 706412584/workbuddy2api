@@ -303,7 +303,7 @@ func TestThinkingLoopSignalDetectsRepetition(t *testing.T) {
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
-	think, text, distinct, total := r.LoopSignal()
+	think, text, distinct, total, stale := r.LoopSignal()
 	if text != 0 {
 		t.Errorf("text_chars=%d want 0（本用例无正文输出）", text)
 	}
@@ -313,6 +313,10 @@ func TestThinkingLoopSignalDetectsRepetition(t *testing.T) {
 	// 循环文本的唯一块数应远小于总块数（占比 <10%）。
 	if total == 0 || distinct*10 > total {
 		t.Errorf("distinct=%d/%d want 唯一块占比 <10%%（循环特征）", distinct, total)
+	}
+	// 纯循环文本跑完一遍周期后不再产生新块 → 停滞数应逼近总块数。
+	if stale < total/2 {
+		t.Errorf("stale=%d/%d want 停滞数占多数（循环特征）", stale, total)
 	}
 }
 
@@ -331,7 +335,7 @@ func TestThinkingLoopRatioSeparatesLoopFromNormal(t *testing.T) {
 		sb.WriteString("data: [DONE]\n\n")
 		r := newChatStatsReaderSince(strings.NewReader(sb.String()), time.Now())
 		_, _ = io.Copy(io.Discard, r)
-		_, _, distinct, total := r.LoopSignal()
+		_, _, distinct, total, _ := r.LoopSignal()
 		if total == 0 {
 			t.Fatal("no chunks")
 		}
@@ -364,7 +368,7 @@ func TestLoopSignalCountsTextOutput(t *testing.T) {
 		"data: [DONE]\n\n"
 	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
 	_, _ = io.Copy(io.Discard, r)
-	think, text, _, _ := r.LoopSignal()
+	think, text, _, _, _ := r.LoopSignal()
 	if text != len("hello world") {
 		t.Errorf("text_chars=%d want %d", text, len("hello world"))
 	}

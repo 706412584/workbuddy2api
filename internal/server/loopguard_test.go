@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,34 +17,54 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// TestLoopGuardDetect 覆盖判据的三个必要条件与各自的边界。
+// TestLoopGuardDetect 覆盖判据的边界。
 //
-// 判据（缺一不可）：思考字符超阈值、正文为 0、唯一块占比低。
-// 任何一条不满足都必须放过 —— 误杀正常长思考的代价比漏判大得多
+// 共同前提：正文为 0、样本足够、耗时够长。满足前提后两条判据取其一即命中：
+//   - 停滞：连续 MaxStaleChunks 块无新内容（主判据，与周期长度无关）
+//   - 占比：唯一块占比低（兜底，覆盖新块偶发出现的慢漂移）
+//
+// 任一前提不满足都必须放过 —— 误杀正常长思考的代价比漏判大得多
 // （漏判只损失一次请求，误杀会让正常请求无谓重试甚至报错）。
 func TestLoopGuardDetect(t *testing.T) {
 	g := DefaultLoopGuard()
 	cases := []struct {
-		name                         string
-		think, text, distinct, total int
-		elapsed                      time.Duration
-		want                         bool
+		name                                string
+		think, text, stale, distinct, total int
+		elapsed                             time.Duration
+		want                                bool
 	}{
-		{"命中：思考超阈值+无正文+高重复", 500_000, 0, 10, 20_000, time.Minute, true},
-		{"思考不足阈值", 399_999, 0, 10, 20_000, time.Minute, false},
-		{"有正文输出", 500_000, 1, 10, 20_000, time.Minute, false},
-		{"占比不够低（正常行文）", 500_000, 0, 15_000, 20_000, time.Minute, false},
-		{"耗时不足（刚开跑）", 500_000, 0, 10, 20_000, 10 * time.Second, false},
-		{"无块（还没切出完整块）", 500_000, 0, 0, 0, time.Minute, false},
+		{"命中·停滞：连续无新块", 500_000, 0, 2000, 500, 20_000, time.Minute, true},
+		{"命中·占比：新块偶发但整体打转", 500_000, 0, 100, 10, 20_000, time.Minute, true},
+		{"有正文输出", 500_000, 1, 2000, 500, 20_000, time.Minute, false},
+		{"样本不足下限", 29_999, 0, 2000, 500, 20_000, time.Minute, false},
+		{"耗时不足（刚开跑）", 500_000, 0, 2000, 500, 20_000, 10 * time.Second, false},
+		{"无块（还没切出完整块）", 500_000, 0, 0, 0, 0, time.Minute, false},
+		{"正常行文：新块持续出现且占比高", 500_000, 0, 0, 15_000, 20_000, time.Minute, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := g.Detect(c.think, c.text, c.distinct, c.total, c.elapsed)
+			got := g.Detect(c.think, c.text, c.stale, c.distinct, c.total, c.elapsed)
 			if got != c.want {
-				t.Errorf("Detect(%d,%d,%d,%d,%v)=%v want %v",
-					c.think, c.text, c.distinct, c.total, c.elapsed, got, c.want)
+				t.Errorf("Detect(think=%d,text=%d,stale=%d,distinct=%d,total=%d,%v)=%v want %v",
+					c.think, c.text, c.stale, c.distinct, c.total, c.elapsed, got, c.want)
 			}
 		})
+	}
+}
+
+// TestLoopGuardStallWindowBoundary 停滞窗口的临界值：等于窗口即命中、差一块不命中。
+// 边界写错（>= 写成 >）会让检测永远晚一个块，且没有其它测试能发现。
+//
+// 用 distinct == total（占比 1.0，即"每个块都是新的"）隔离出停滞这一条判据 ——
+// 否则占比判据会抢先命中，边界就测不到了。
+func TestLoopGuardStallWindowBoundary(t *testing.T) {
+	g := DefaultLoopGuard()
+	const total = 20_000
+	if g.Detect(500_000, 0, g.MaxStaleChunks-1, total, total, time.Minute) {
+		t.Error("停滞数 = 窗口-1 不应命中")
+	}
+	if !g.Detect(500_000, 0, g.MaxStaleChunks, total, total, time.Minute) {
+		t.Error("停滞数 = 窗口 应命中")
 	}
 }
 
@@ -51,7 +72,7 @@ func TestLoopGuardDetect(t *testing.T) {
 func TestLoopGuardDisabled(t *testing.T) {
 	g := DefaultLoopGuard()
 	g.Enabled = false
-	if g.Detect(1_000_000, 0, 1, 100_000, time.Hour) {
+	if g.Detect(1_000_000, 0, 100_000, 1, 100_000, time.Hour) {
 		t.Error("Enabled=false 仍命中")
 	}
 }
@@ -158,9 +179,10 @@ func TestLoopGuardConfigToGuard(t *testing.T) {
 		MaxDistinctRatio:  0.42,
 		MinElapsedSeconds: 7,
 		MaxRetries:        5,
+		MaxStaleChunks:    777,
 	}.toLoopGuard()
 	if g.MinThinkChars != 123_456 || g.MaxDistinctRatio != 0.42 ||
-		g.MinElapsed != 7*time.Second || g.MaxRetries != 5 {
+		g.MinElapsed != 7*time.Second || g.MaxRetries != 5 || g.MaxStaleChunks != 777 {
 		t.Errorf("显式配置未生效: %+v", *g)
 	}
 
@@ -195,8 +217,8 @@ func loopSSE(n int) string {
 	return sb.String()
 }
 
-// testLoopHandler 构造「判据极易命中」的 handler：阈值压到几百字符、耗时门槛归零，
-// 于是测试用不着造 40 万字符的流。判据本身由 TestLoopGuardDetect 单独覆盖。
+// testLoopHandler 构造「判据极易命中」的 handler：字符下限压到几百、耗时门槛归零，
+// 于是测试用不着造 48KB 的流。判据本身由 TestLoopGuardDetect / 停滞用例单独覆盖。
 //
 // MinElapsed 直接改运行时判据而非走配置：配置的秒级字段 0 表示「用默认 30s」，
 // 表达不了「不设耗时门槛」，而测试的流在毫秒内结束。
@@ -217,6 +239,89 @@ func testLoopHandler(t *testing.T, up *upstream.Client, p *pool.Pool, maxRetries
 	}
 	h.loopGuard.MinElapsed = 0
 	return h
+}
+
+// loopSSEPeriod 构造一段长周期循环的 SSE：先生成 periodBytes 的唯一内容作周期，
+// 再把它重复到 totalBytes。
+//
+// 为什么要长周期：短周期（如 60 字节）下唯一块占比会瞬间跌到 0.01，占比判据一早就
+// 命中，测不出停滞判据。实测空转的周期是 7–53KB —— 一整段推理文本在打转，
+// 不是单个短语在重复。本函数复现的正是这个形态。
+//
+// pieceSize 是每帧携带的字节数，便于用「帧数 × pieceSize」反推已送出的字符数。
+// periodBytes 需为 pieceSize 的整数倍，这样按帧切片不会在周期边界上错位。
+func loopSSEPeriod(periodBytes, totalBytes, pieceSize int) string {
+	var period strings.Builder
+	for i := 0; period.Len() < periodBytes; i++ {
+		fmt.Fprintf(&period, "step %05d inspecting module %05d before deciding the next action; ", i, i*7919)
+	}
+	p := period.String()[:periodBytes]
+
+	var sb strings.Builder
+	for written := 0; written < totalBytes; written += pieceSize {
+		off := written % periodBytes
+		b, _ := json.Marshal(p[off : off+pieceSize])
+		sb.WriteString(`data: {"choices":[{"delta":{"reasoning_content":`)
+		sb.Write(b)
+		sb.WriteString(`}}]}` + "\n\n")
+	}
+	sb.WriteString("data: [DONE]\n\n")
+	return sb.String()
+}
+
+// TestChatThinkingLoopStallCatchesShortStream 停滞判据必须在远短于旧阈值的流上命中，
+// 且必须是停滞判据（而非占比）立的功。
+//
+// 这是用户点出的那个缺口：旧判据（唯一块占比 + 40 万字符下限）在实测那次 20.8 万
+// 字符的空转上根本不触发 —— 那次挂了 382 秒、正文为零。
+//
+// 本用例用**出厂默认判据**（只把耗时门槛归零，因为测试流在毫秒内跑完），
+// 喂一段周期 24KB、总长 10 万字符的循环文本：
+//   - 停滞判据：周期跑完（24KB=1000 块）后再无新块，到 72KB 时停滞数达 2000 → 命中
+//   - 占比判据：10 万字符时占比仍有 1000/4167≈0.24 > 0.15 → 不命中
+//   - 旧判据：10 万 < 40 万字符下限 → 永不命中
+//
+// 所以关掉停滞判据后本用例必 RED（流会跑完且无任何拦截）。
+func TestChatThinkingLoopStallCatchesShortStream(t *testing.T) {
+	const (
+		periodBytes = 24000
+		totalBytes  = 100000
+		pieceSize   = 240
+		totalFrames = totalBytes / pieceSize // 417
+	)
+	var nCalls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		nCalls++
+		return 200, loopSSEPeriod(periodBytes, totalBytes, pieceSize), true
+	})
+	h := NewHandler(Config{
+		Pool: testPoolWith(
+			&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+			&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+		),
+		Upstream: up,
+		// 出厂默认判据（停滞窗口 2000 块 / 字符下限 3 万），只关掉「最早可判定耗时」。
+		LoopGuard: LoopGuardConfig{Enabled: true},
+	})
+	h.loopGuard.MinElapsed = 0
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "thinking_loop") {
+		t.Fatalf("10 万字符的长周期循环未被拦下（占比判据够不到、旧阈值也够不到）: code=%d", rec.Code)
+	}
+	// 命中点在停滞窗口处（约 7.2 万字符 = 300 帧），重试一轮共约 600 帧。
+	// 若判据失效、流跑到底，两轮就是 2×417=834 帧 —— 用这个差值证明是中途切断。
+	if n := strings.Count(body, `"reasoning_content"`); n >= 2*totalFrames {
+		t.Errorf("送出了 %d 帧（≥ 跑完两轮的 %d）：说明是跑完才判，不是中途切断", n, 2*totalFrames)
+	}
+	if nCalls != 2 {
+		t.Errorf("上游调用 %d 次 want 2（首次 + 1 次重试）", nCalls)
+	}
 }
 
 // TestChatThinkingLoopRetriesThenSucceeds 端到端锁定用户要的处置链路：

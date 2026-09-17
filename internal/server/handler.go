@@ -74,7 +74,8 @@ type Config struct {
 type LoopGuardConfig struct {
 	// Enabled 关闭时完全不检测，保持原有行为。
 	Enabled bool
-	// MinThinkChars 思考字符数阈值（默认 40 万）。
+	// MinThinkChars 思考字符数下限（默认 3 万）：样本太小不下判断。
+	// 是下限而非主判据 —— 设得过大反而会屏蔽停滞判据。
 	MinThinkChars int
 	// MaxDistinctRatio 唯一块占比上限（默认 0.15）：低于此值判为重复文本。
 	MaxDistinctRatio float64
@@ -82,6 +83,9 @@ type LoopGuardConfig struct {
 	MinElapsedSeconds int
 	// MaxRetries 命中后最多重试几次，用尽则回错误（默认 maxLoopRetries）。
 	MaxRetries int
+	// MaxStaleChunks 停滞窗口（块数，默认 2000 = 48KB）：连续这么多块没有新内容
+	// 即判空转。主判据，与循环周期长度无关。
+	MaxStaleChunks int
 }
 
 // toLoopGuard 转成运行时判据。
@@ -98,6 +102,9 @@ func (c LoopGuardConfig) toLoopGuard() *LoopGuard {
 	}
 	if c.MinElapsedSeconds > 0 {
 		g.MinElapsed = time.Duration(c.MinElapsedSeconds) * time.Second
+	}
+	if c.MaxStaleChunks > 0 {
+		g.MaxStaleChunks = c.MaxStaleChunks
 	}
 	g.MaxRetries = c.MaxRetries
 	if g.MaxRetries <= 0 {
@@ -155,6 +162,14 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.loopGuard = cfg.LoopGuard.toLoopGuard()
+	// 生效判据落一行启动日志：这几项只能从配置推导，出问题时（误杀/漏判）第一件
+	// 事就是确认实际生效的阈值，没有这行只能去翻配置文件猜。
+	if g := h.loopGuard; g != nil {
+		log.Printf("[server] 思考循环判据：停滞窗口=%d 块(%dKB) 占比<%.2f 字符下限=%d 重试=%d",
+			g.MaxStaleChunks, g.MaxStaleChunks*loopChunkLen>>10, g.MaxDistinctRatio, g.MinThinkChars, g.maxRetries())
+	} else {
+		log.Printf("[server] 思考循环判据：关闭")
+	}
 	h.SetKeys(cfg.APIKey, cfg.APIKeys)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 协议适配：同一账号池同时服务 Anthropic（Claude Code）与 Responses（Codex）客户端。
@@ -608,15 +623,6 @@ func clientIPFor(up *upstream.Client, r *http.Request) string {
 	return upstream.ExtractClientIP(r)
 }
 
-// loopRatio 唯一块占比（日志用）。空流返回 0。
-func loopRatio(s *chatStatsReader) float64 {
-	_, _, distinct, total := s.LoopSignal()
-	if total == 0 {
-		return 0
-	}
-	return float64(distinct) / float64(total)
-}
-
 // sessionKey 提取会话键；未启用粘性时返回空，省去一次无谓的 JSON 解析。
 func (h *Handler) sessionKey(body []byte) string {
 	if h.cfg.Session == nil {
@@ -658,11 +664,17 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 	// loopRetries 本轮请求因思考死循环而重试的次数（不计入 MaxRotate 的账号轮换预算：
 	// 它换的是「同一个请求的再次尝试」，不是「换一个账号」）。
 	loopRetries := 0
-	// maxRetries 思考循环的重试上限（判据未装配时用常量默认）。
+	// maxRetries / maxStale 思考循环的重试上限与停滞窗口（判据未装配时用默认）。
 	maxRetries := maxLoopRetries
+	maxStale := DefaultLoopGuard().MaxStaleChunks
 	if h.loopGuard != nil {
 		maxRetries = h.loopGuard.maxRetries()
+		maxStale = h.loopGuard.MaxStaleChunks
 	}
+	// origBody 客户端原始请求体（后续的提示词改写与循环提示都返回新切片，不改这一份），
+	// 仅在命中思考循环时用于诊断「上下文是否接近占满」。开销放在命中路径上 ——
+	// estimateTokens 是 O(len) 的逐字符扫描，不能每条请求都付。
+	origBody := body
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -829,9 +841,16 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 				loopRetries++
 				lastErr = ErrThinkingLoop
 				fail(acct.UID)
-				log.Printf("WARN: [server] thinking loop uid=%s model=%s think_chars=%d ratio=%.3f retry=%d/%d",
-					logfmt.UID8(acct.UID), o.model, stats.thinkChars,
-					loopRatio(stats), loopRetries, maxRetries)
+				thinkChars, _, distinct, total, stale := stats.LoopSignal()
+				ratio := 0.0
+				if total > 0 {
+					ratio = float64(distinct) / float64(total)
+				}
+				// req_kb / req_est_tokens 用于验证「上下文满了容易触发空转」的假设：
+				// 与 /v1/models 里该模型的 context_length 对照即可判断占满程度。
+				log.Printf("WARN: [server] thinking loop uid=%s model=%s think_chars=%d ratio=%.3f stale=%d/%d retry=%d/%d req_kb=%d req_est_tokens=%d",
+					logfmt.UID8(acct.UID), o.model, thinkChars, ratio, stale, maxStale, loopRetries, maxRetries,
+					len(origBody)>>10, estimateTokens(string(origBody)))
 				if loopRetries > maxRetries {
 					// 重试预算用尽：跳出轮换循环，由出口统一回错误。
 					// 出口判 lastErr 决定文案 —— 预算可能因「账号池小」先被
