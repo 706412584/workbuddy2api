@@ -37,6 +37,29 @@ export class ApiError extends Error {
   }
 }
 
+// ── 管理员口令（/__admin/* 的鉴权）──────────────────────────────────
+//
+// 与 apiKey 分开：apiKey 用于 /v1/* 与 /status，而 /__admin/* 能增删账号、改写密钥表，
+// 给它一把独立口令。本机访问时服务端不校验（能碰本机的人本就能直接读配置文件），
+// 所以只在局域网访问时才需要填。
+//
+// 存在模块级变量而非 React state：adminJSON 是普通函数、不在组件树里，
+// 拿不到 context。App.tsx 负责在口令变化时同步过来。
+const ADMIN_TOKEN_STORAGE = 'wb2api.admin.token'
+let adminToken = localStorage.getItem(ADMIN_TOKEN_STORAGE) ?? ''
+
+/** setAdminToken 更新口令并持久化；传空串表示清除。 */
+export function setAdminToken(v: string) {
+  adminToken = v
+  if (v) localStorage.setItem(ADMIN_TOKEN_STORAGE, v)
+  else localStorage.removeItem(ADMIN_TOKEN_STORAGE)
+}
+
+/** getAdminToken 读当前口令（供 UI 回显）。 */
+export function getAdminToken() {
+  return adminToken
+}
+
 /** 从错误响应体里提取可读信息。三种协议的错误体形状不同，逐一说实话。 */
 async function readError(res: Response): Promise<ApiError> {
   const text = await res.text().catch(() => '')
@@ -303,7 +326,13 @@ export async function chatOnce(o: Omit<StreamOpts, 'signal' | 'onDelta' | 'onRaw
 async function adminJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      // 口令始终带上：本机访问时服务端忽略它，局域网访问时必须有。
+      // 无脑带比"先探测是否本机"简单，且不会在切换访问方式时出现状态不一致。
+      ...(adminToken ? { 'X-Admin-Token': adminToken } : {}),
+      ...(init?.headers ?? {}),
+    },
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {

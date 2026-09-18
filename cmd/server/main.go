@@ -175,6 +175,8 @@ func main() {
 		LogPath:    abs(filepath.Join("data", "gateway.log")),
 		LoginBin:   abs(loginBin()),
 		RepoRoot:   repoRoot,
+		// 空 = 管理面板仅本机可访问（默认）；非空则允许局域网访问并校验该口令。
+		Token: cfg.Admin.Token,
 		// 账号热重载：与启动时同一套动作，改完即时生效（旧版靠重启进程）
 		ReloadAccounts: func() (int, error) {
 			auths, err := auth.LoadDir(cfg.AuthDir)

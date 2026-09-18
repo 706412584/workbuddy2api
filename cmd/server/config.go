@@ -129,6 +129,20 @@ type Config struct {
 		File string `json:"file"`
 	} `json:"prompt"`
 
+	Admin struct {
+		// Token 管理面板（/__admin/*）的口令。
+		//
+		// 空（默认）= 仅本机可访问 —— 与改造前行为一致。
+		// 非空 = 允许局域网访问，但非本机请求必须带 X-Admin-Token。
+		//
+		// 与 api_key 分开是刻意的：api_key 是发给客户端（IDE）的凭证，可能存在多份
+		// 副本；而 /__admin/* 能增删账号、改写密钥表。给它的凭证应当独立，
+		// 泄露 API 密钥不应等于失去账号管理权。
+		//
+		// 可用 WB2A_ADMIN_TOKEN 环境变量覆盖（容器部署时不必把口令写进文件）。
+		Token string `json:"token"`
+	} `json:"admin"`
+
 	// PromptText 解析后的系统提示词文本（custom 模式使用）。
 	PromptText string `json:"-"`
 
@@ -294,6 +308,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
+	}
+	if v := os.Getenv("WB2A_ADMIN_TOKEN"); v != "" {
+		c.Admin.Token = v
 	}
 }
 

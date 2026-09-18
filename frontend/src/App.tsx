@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { APIKeyEntry, Health, ModelList, PoolStatus } from './api/types'
-import { ApiError, getAPIKeys, getHealth, getModels, getStatus } from './api/client'
+import {
+  ApiError,
+  getAdminToken,
+  getAPIKeys,
+  getHealth,
+  getModels,
+  getStatus,
+  setAdminToken,
+} from './api/client'
 import { Overview } from './pages/Overview'
 import { Models } from './pages/Models'
 import { Playground } from './pages/Playground'
@@ -126,9 +134,49 @@ function KeyPicker({
   )
 }
 
+/**
+ * 管理员口令输入。仅局域网访问 /__admin/* 时需要；本机访问服务端不校验。
+ *
+ * 为什么独立于 API 密钥：/__admin/* 能增删账号、改写密钥表，给它一把独立凭证。
+ * 平时不占地方 —— 只有填过值、或最近一次管理请求被 401 拒绝时才展开。
+ */
+function AdminTokenPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [open, setOpen] = useState(value !== '')
+  const [show, setShow] = useState(false)
+
+  if (!open) {
+    return (
+      <button
+        className="btn"
+        title="局域网访问管理接口需要口令（config.json 的 admin.token）；本机访问不需要"
+        onClick={() => setOpen(true)}
+      >
+        管理口令
+      </button>
+    )
+  }
+  return (
+    <>
+      <input
+        type={show ? 'text' : 'password'}
+        placeholder="管理口令（本机可留空）"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ width: 200 }}
+        spellCheck={false}
+        title="对应 config.json 的 admin.token。本机访问时留空即可。"
+      />
+      <button className="btn" onClick={() => setShow((v) => !v)}>
+        {show ? '隐藏' : '显示'}
+      </button>
+    </>
+  )
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('overview')
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(KEY_STORAGE) ?? '')
+  const [adminTok, setAdminTok] = useState(() => getAdminToken())
 
   const [status, setStatus] = useState<PoolStatus | null>(null)
   const [health, setHealth] = useState<Health | null>(null)
@@ -144,21 +192,40 @@ export default function App() {
     else localStorage.removeItem(KEY_STORAGE)
   }, [apiKey])
 
+  // 口令存进 client.ts 的模块级变量（adminJSON 读它），并持久化。
+  useEffect(() => {
+    setAdminToken(adminTok)
+  }, [adminTok])
+
   // 密钥绑定的区域只有 config.json 知道（网关不回传），所以读一次面板自己的
   // /__admin/apikeys。只在挂载时读一次：apiKey 每敲一个字符就变，跟着它请求太浪费；
   // 一张表里存着全部密钥，读一次就够查任何一把。
   const [keyTable, setKeyTable] = useState<APIKeyEntry[]>([])
   const [legacyKey, setLegacyKey] = useState('')
+  // 管理接口鉴权失败的提示。与 err 分开：err 每次 refresh 都会被清掉，
+  // 而这条提示要一直留到用户填对口径为止。
+  const [adminHint, setAdminHint] = useState('')
   useEffect(() => {
     getAPIKeys()
       .then((r) => {
         setKeyTable(r.keys)
         setLegacyKey(r.legacyKey)
+        setAdminHint('')
       })
-      .catch(() => {
-        // 取不到就一律当不限区域：只是提示语措辞不同，不影响模型列表
+      .catch((e) => {
+        // 取不到就一律当不限区域：只是提示语措辞不同，不影响模型列表。
+        // 但 401/403 要明说 —— 局域网访问时这是「还没填管理口令」的唯一信号，
+        // 静默吞掉会让账号页、日志页一起空白而看不出原因。
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          setAdminHint(
+            e.status === 401
+              ? '管理口令无效（401）。请在右上角「管理口令」填入 config.json 的 admin.token。'
+              : '管理接口仅允许本机访问（403）。若要从局域网使用，请在 config.json 配置 admin.token 后重启网关。',
+          )
+        }
       })
-  }, [])
+    // adminTok 变化时重试：填完口令应当立即生效，不必手动刷新页面。
+  }, [adminTok])
 
   // healthz 不需要鉴权，所以即使没填密钥也照探——这样能区分「网关没起来」和「密钥不对」。
   //
@@ -276,6 +343,7 @@ export default function App() {
             legacyKey={legacyKey}
             onChange={setApiKey}
           />
+          <AdminTokenPicker value={adminTok} onChange={setAdminTok} />
           <button className="btn" onClick={() => void refresh(true)} disabled={busy}>
             {busy ? <span className="spin" /> : null}
             {busy ? ' 刷新中' : '刷新'}
@@ -295,6 +363,13 @@ export default function App() {
             <div className="note err">
               <span>●</span>
               <div style={{ wordBreak: 'break-word' }}>{err}</div>
+            </div>
+          )}
+
+          {adminHint && (
+            <div className="note err">
+              <span>●</span>
+              <div style={{ wordBreak: 'break-word' }}>{adminHint}</div>
             </div>
           )}
 

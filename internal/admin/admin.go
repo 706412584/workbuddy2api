@@ -6,10 +6,12 @@
 // /status 再取并集），也不必靠重启进程来让改动生效。
 //
 // 安全边界：这些接口能写文件、能起进程，而网关默认监听 0.0.0.0:7863（局域网可达），
-// 所以每一条都必须先过 isLocal。
+// 所以每一条都必须先过 ServeHTTP 的鉴权：本机无条件放行；非本机要求 admin.token。
+// 未配置 token 时非本机一律拒绝 —— 想开局域网访问必须显式配口令，没有裸奔的默认值。
 package admin
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,7 +63,19 @@ type Config struct {
 	// 测试用它替掉子进程，语义与 runLogin 的返回值一致
 	// （code 是 login 的退出码，err 只在「根本没跑起来」时非 nil）。
 	RunLogin func(args ...string) (stdout, stderr string, code int, err error)
+	// Token 管理员口令。留空 = 仅本机可访问（默认，与改造前一致）；
+	// 非空则允许局域网访问，但非本机请求必须携带 X-Admin-Token。
+	//
+	// 为什么不复用 API 密钥：API 密钥是发给客户端（IDE）的凭证，可能存在多个副本、
+	// 会出现在客户端配置里。而本组接口能增删账号、改写密钥表——给它的凭证应当独立，
+	// 泄露 API 密钥不等于失去账号管理权。
+	Token string
 }
+
+// adminTokenHeader 管理员口令的请求头。
+// 专用头而非 Authorization: Bearer —— 与 API 密钥分属两套凭证，共用同一个头
+// 会让「拿密钥当口令用」这种误配置静默生效。
+const adminTokenHeader = "X-Admin-Token"
 
 // Handler 管理接口路由。
 type Handler struct {
@@ -101,17 +115,43 @@ func New(cfg Config) *Handler {
 	return h
 }
 
-// ServeHTTP 只做一件事：把非本机的请求挡在外面。
+// ServeHTTP 是本组接口的统一入口，只做鉴权一件事。
+//
+// 两档：
+//   - 本机（127.0.0.1 / ::1）无条件放行 —— 与改造前一致。本机即可信任：
+//     能访问本机的人本就能直接读 config.json 与 auths/，加口令不增加实质防护。
+//   - 非本机（局域网）要求配置了 Token 且请求头匹配。未配置 Token 时一律拒绝，
+//     即「想开局域网就得显式配口令」，不存在误开成裸奔的路径。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !isLocal(r) {
-		fail(w, http.StatusForbidden, "账号管理仅允许本机访问")
+	if isLocal(r) {
+		h.mux.ServeHTTP(w, r)
+		return
+	}
+	if h.cfg.Token == "" {
+		fail(w, http.StatusForbidden, "账号管理仅允许本机访问（如需局域网访问，请配置 admin.token）")
+		return
+	}
+	if !h.tokenOK(r.Header.Get(adminTokenHeader)) {
+		// 401 而非 403：有口令但不对/没带，客户端据此提示"输入口令"；
+		// 403 保留给"根本没开口令"（未配置 Token）的情形，两者语义不同。
+		w.Header().Set(adminTokenHeader, "required")
+		fail(w, http.StatusUnauthorized, "管理员口令无效")
 		return
 	}
 	h.mux.ServeHTTP(w, r)
 }
 
+// tokenOK 常量时间比较口令，避免按前缀逐字节探测。
+// 注意：ConstantTimeCompare 对不同长度的输入立即返回 0，长度本身会泄漏，
+// 但内容不会 —— 与 withAuth 对 API 密钥的口径一致。
+func (h *Handler) tokenOK(got string) bool {
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(h.cfg.Token), []byte(got)) == 1
+}
+
 // isLocal 判定请求是否来自本机。
-// 网关默认绑 0.0.0.0，这层判断是「能写文件」与「任何人都能写文件」之间的唯一屏障。
 func isLocal(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

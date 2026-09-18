@@ -7,6 +7,9 @@
   ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "admin": {
+    "token": ""
+  },
   "server": {
     "max_body_mb": 32
   },
