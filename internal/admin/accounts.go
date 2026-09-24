@@ -112,7 +112,95 @@ func (h *Handler) loaded(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// importAccount 手填/粘贴凭证：字段名沿用网关的嵌套形。
+// exportAccounts 导出凭证。
+//
+// 两种粒度：带 file 参数导单个；不带则导全部。
+// **两种内容**由 include_tokens 决定（默认 false）：
+//   - false：仅元信息（uid/nickname/domain/区域/到期），**不含 token**，可安全分享
+//   - true：完整凭证（accessToken/refreshToken 明文），文件即可直接导入使用
+//
+// 安全设计：默认不导出 token，必须显式 `include_tokens=true` 才带 —— 凭证文件里的
+// accessToken/refreshToken 是账号的完全接管凭据（global 有效期 365 天），
+// 默认导出即等于「点一下就把所有号泄到磁盘上」。前端据此加二次确认。
+//
+// 导出格式与 auths/workbuddy-<uid>.json **逐字同构**（{"auth":{...},"account":{...}}），
+// 故导出文件可直接被本端点 import 回去，无需任何转换。
+func (h *Handler) exportAccounts(w http.ResponseWriter, r *http.Request) {
+	includeTokens := r.URL.Query().Get("include_tokens") == "true"
+	onlyFile := strings.TrimSpace(r.URL.Query().Get("file"))
+
+	entries, err := os.ReadDir(h.cfg.AuthDir)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "读取凭证目录失败：%v", err)
+		return
+	}
+	if onlyFile != "" && !authFileRE.MatchString(onlyFile) {
+		fail(w, http.StatusBadRequest, "非法文件名")
+		return
+	}
+
+	type exported struct {
+		File string         `json:"file"`
+		Auth map[string]any `json:"auth,omitempty"`
+		Acct map[string]any `json:"account"`
+	}
+	out := make([]exported, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !authFileRE.MatchString(name) {
+			continue
+		}
+		if onlyFile != "" && name != onlyFile {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(h.cfg.AuthDir, name))
+		if err != nil {
+			continue // 单个文件读失败不拖累整体导出
+		}
+		a, err := auth.Parse(raw)
+		if err != nil {
+			continue // 坏文件跳过（与 listAccounts 同口径）
+		}
+		item := exported{
+			File: name,
+			Acct: map[string]any{
+				"uid":          a.UID,
+				"nickname":     a.Nickname,
+				"enterpriseId": a.EnterpriseID,
+			},
+		}
+		if includeTokens {
+			item.Auth = map[string]any{
+				"accessToken":  a.AccessTokenValue(),
+				"refreshToken": a.RefreshTokenValue(),
+				"expiresAt":    a.ExpiresAt,
+				"domain":       a.DomainValue(),
+			}
+		}
+		out = append(out, item)
+	}
+	if onlyFile != "" && len(out) == 0 {
+		fail(w, http.StatusNotFound, "未找到该凭证文件：%s", onlyFile)
+		return
+	}
+	logf("导出账号 %d 个（含 token=%v）", len(out), includeTokens)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"exportedAt":    time.Now().Format(time.RFC3339),
+		"includeTokens": includeTokens,
+		"count":         len(out),
+		"accounts":      out,
+	})
+}
+
+// importAccount 导入凭证。接受两种形态：
+//
+//  1. **单个凭证**（原有行为）：`{"auth":{...},"account":{...}}` 嵌套形，
+//     或手写扁平形 `{"accessToken":...,"uid":...}`。字段名沿用网关解析器。
+//  2. **导出批量格式**（与 exportAccounts 输出同构，支持 round-trip）：
+//     `{"accounts":[{"file","auth","account"}, ...]}`。
+//     逐条导入，**部分成功不中断**——一个坏条目不该让整批失败。
+//
+// 判定方式：JSON 顶层含 `accounts` 数组即按批量处理，否则按单条（向后兼容）。
 func (h *Handler) importAccount(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		JSON string `json:"json"`
@@ -124,19 +212,20 @@ func (h *Handler) importAccount(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "缺少凭证 JSON")
 		return
 	}
-	// 先按网关的解析器验一遍：能解析才落盘，否则写进去也是个起不来的账号
-	a, err := auth.Parse([]byte(body.JSON))
-	if err != nil {
-		fail(w, http.StatusBadRequest, "JSON 解析失败：%v", err)
+
+	// 批量格式探测：顶层有 accounts 数组即按批处理。
+	var probe struct {
+		Accounts []json.RawMessage `json:"accounts"`
+	}
+	if json.Unmarshal([]byte(body.JSON), &probe) == nil && len(probe.Accounts) > 0 {
+		h.importBatch(w, probe.Accounts)
 		return
 	}
-	if strings.TrimSpace(a.UID) == "" {
-		fail(w, http.StatusBadRequest, "凭证缺少 uid")
-		return
-	}
-	file, err := h.writeAuthFile(a.UID, []byte(body.JSON))
+
+	// 单条（原有路径）
+	file, a, err := h.importOne([]byte(body.JSON))
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "写入凭证失败：%v", err)
+		fail(w, http.StatusBadRequest, "%v", err)
 		return
 	}
 	loaded, err := h.reloadAccounts()
@@ -146,6 +235,82 @@ func (h *Handler) importAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	logf("导入账号 uid=%s file=%s（池中现有 %d 个）", a.UID, file, loaded)
 	ok(w, map[string]any{"file": file, "account": h.viewOfFallback(file, a)})
+}
+
+// importBatch 逐条导入批量格式。返回成功/失败清单，部分失败不中断整批。
+func (h *Handler) importBatch(w http.ResponseWriter, accounts []json.RawMessage) {
+	type failItem struct {
+		Index int    `json:"index"`
+		Error string `json:"error"`
+	}
+	imported := make([]string, 0, len(accounts))
+	failed := make([]failItem, 0)
+	for i, raw := range accounts {
+		// 导出条目形如 {"file","auth","account"}——多一个 file 键。剥掉 file 后
+		// 即为标准凭证形态（auth.Parse 忽略未知键，故 file 在也不影响解析；
+		// 这里显式剥离是为了落盘文件干净、不把导出元数据写进 auths/）。
+		var item struct {
+			File    string          `json:"file"`
+			Auth    json.RawMessage `json:"auth"`
+			Account json.RawMessage `json:"account"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			failed = append(failed, failItem{i, "条目解析失败：" + err.Error()})
+			continue
+		}
+		var cred []byte
+		switch {
+		case len(item.Auth) > 0:
+			// 重组为嵌套形，丢弃 file 键
+			cred, _ = json.Marshal(map[string]any{
+				"auth":    json.RawMessage(item.Auth),
+				"account": json.RawMessage(item.Account),
+			})
+		default:
+			cred = raw // 扁平形：原样交给解析器
+		}
+		file, a, err := h.importOne(cred)
+		if err != nil {
+			failed = append(failed, failItem{i, err.Error()})
+			continue
+		}
+		imported = append(imported, file)
+		_ = a
+	}
+	// 有成功项才重扫；全失败时池子没变，不必扰动
+	loaded := 0
+	if len(imported) > 0 {
+		var err error
+		loaded, err = h.reloadAccounts()
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "已写入 %d 个，但重新加载失败：%v", len(imported), err)
+			return
+		}
+	}
+	logf("批量导入：成功 %d / 失败 %d（池中现有 %d 个）", len(imported), len(failed), loaded)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"imported": imported,
+		"failed":   failed,
+		"loaded":   loaded,
+	})
+}
+
+// importOne 导入单条凭证（校验 + 落盘），返回 (文件名, 解析结果, 错误)。
+// 供单条导入与批量导入共用。
+func (h *Handler) importOne(raw []byte) (string, *auth.Auth, error) {
+	// 先按网关的解析器验一遍：能解析才落盘，否则写进去也是个起不来的账号
+	a, err := auth.Parse(raw)
+	if err != nil {
+		return "", nil, fmt.Errorf("JSON 解析失败：%w", err)
+	}
+	if strings.TrimSpace(a.UID) == "" {
+		return "", nil, errors.New("凭证缺少 uid")
+	}
+	file, err := h.writeAuthFile(a.UID, raw)
+	if err != nil {
+		return "", nil, fmt.Errorf("写入凭证失败：%w", err)
+	}
+	return file, a, nil
 }
 
 // deleteAccount 删除凭证文件。只删本地文件，随后立即重扫目录让池子同步。

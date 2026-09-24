@@ -3,9 +3,11 @@ import type { AuthFileView } from '../api/types'
 import {
   ApiError,
   deleteAuth,
+  exportAccounts,
   fmtTime,
   getLoadedAccounts,
   importAuth,
+  importAuthBatch,
   listAuthFiles,
   pollLogin,
   reloadPool,
@@ -35,6 +37,10 @@ export function Accounts({ onChanged }: Props) {
   const [rescanning, setRescanning] = useState(false)
 
   const [importText, setImportText] = useState('')
+  /** 导出：是否含 token 明文（默认否，安全底线） */
+  const [exportWithTokens, setExportWithTokens] = useState(false)
+  /** 导出：限定单个文件（空 = 全部） */
+  const [exportFile, setExportFile] = useState('')
   const pollTimer = useRef(0)
   /** 轮询代数：递增即作废此前所有在途响应，避免迟到响应覆盖新状态。 */
   const pollGen = useRef(0)
@@ -131,12 +137,75 @@ export function Accounts({ onChanged }: Props) {
 
   const doImport = async () => {
     setErr('')
+    setLoginMsg('')
     try {
-      const r = await importAuth(importText)
-      setImportText('')
-      setLoginMsg(`已写入 ${r.file}，已生效`)
+      // 先探测是否为导出批量格式（顶层含 accounts 数组）——是则走批量接口，
+      // 逐条导入且部分失败不中断；否则按单条（原有行为）。
+      let isBatch = false
+      try {
+        const probe = JSON.parse(importText)
+        isBatch = Array.isArray(probe?.accounts) && probe.accounts.length > 0
+      } catch {
+        // 解析失败交给后端报明确错误（这里不抢先判）
+      }
+      if (isBatch) {
+        const r = await importAuthBatch(importText)
+        setImportText('')
+        const okN = r.imported.length
+        const failN = r.failed.length
+        setLoginMsg(
+          `批量导入：成功 ${okN} 个${
+            failN
+              ? `，失败 ${failN} 个（${r.failed
+                  .slice(0, 3)
+                  .map((f) => `#${f.index}: ${f.error}`)
+                  .join('；')}${failN > 3 ? ' …' : ''}）`
+              : ''
+          }，池中现有 ${r.loaded} 个`,
+        )
+        if (failN > 0) setErr(`有 ${failN} 条未导入，详见上方说明`)
+      } else {
+        const r = await importAuth(importText)
+        setImportText('')
+        setLoginMsg(`已写入 ${r.file}，已生效`)
+      }
       await load()
       onChanged()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /**
+   * 导出凭证。默认**不含 token**（可安全分享）；勾选后才带 token 明文，
+   * 此时二次确认 —— 文件拿到即可完全接管账号。
+   */
+  const doExport = async () => {
+    if (exportWithTokens) {
+      const ok = confirm(
+        '⚠️ 将导出 accessToken / refreshToken **明文**。\n\n' +
+          '拿到该文件即可完全接管这些账号（global 账号凭证有效期可达 365 天）。\n' +
+          '请仅在可信环境保存、传输，用完及时删除。\n\n确认导出？',
+      )
+      if (!ok) return
+    }
+    setErr('')
+    setLoginMsg('')
+    try {
+      const r = await exportAccounts(exportWithTokens, exportFile || undefined)
+      const blob = JSON.stringify(r, null, 2)
+      const name = `wb2api-accounts-${r.exportedAt.replace(/[:.]/g, '-')}${
+        exportWithTokens ? '' : '-no-token'
+      }.json`
+      const url = URL.createObjectURL(new Blob([blob], { type: 'application/json' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = name
+      a.click()
+      URL.revokeObjectURL(url)
+      setLoginMsg(
+        `已导出 ${r.count} 个账号${exportWithTokens ? '（含 token 明文）' : '（不含 token）'} → ${name}`,
+      )
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     }
@@ -305,8 +374,9 @@ export function Accounts({ onChanged }: Props) {
                     style={{ width: '100%', fontSize: 11.5 }}
                   />
                   <div className="dim" style={{ fontSize: 11.5, marginTop: 6 }}>
-                    也接受扁平形（accessToken/uid 直接在顶层）。文件名按 uid 生成，
-                    同 uid 会覆盖。
+                    也接受扁平形（accessToken/uid 直接在顶层），以及导出的批量格式
+                    （顶层含 <span className="mono">accounts</span> 数组，一次导入多个，
+                    坏条目不影响其余）。文件名按 uid 生成，同 uid 会覆盖。
                   </div>
                 </div>
                 <button className="btn primary" onClick={doImport} disabled={!importText.trim()}>
@@ -319,6 +389,60 @@ export function Accounts({ onChanged }: Props) {
               登录复用仓库根的 <span className="mono">login.exe</span>（设备码流程），
               该文件不存在时会尝试 <span className="mono">go build</span> 一次。
               此处不会代替网关做签到，签到由网关的定时任务负责。
+            </div>
+          </div>
+        </div>
+
+        <div className="panel">
+          <header>
+            <h2>导出账号</h2>
+          </header>
+          <div className="body">
+            <div className="field">
+              <label>范围</label>
+              <select
+                value={exportFile}
+                onChange={(e) => setExportFile(e.target.value)}
+                style={{ width: '100%' }}
+              >
+                <option value="">全部账号（{files.length} 个）</option>
+                {files.map((f) => (
+                  <option key={f.file} value={f.file}>
+                    {f.nickname || f.uid.slice(0, 8)} · {f.region} · {f.file}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="field">
+              <label
+                style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}
+                title="勾选后导出文件含 accessToken/refreshToken 明文，可直接用于迁移"
+              >
+                <input
+                  type="checkbox"
+                  checked={exportWithTokens}
+                  onChange={(e) => setExportWithTokens(e.target.checked)}
+                />
+                包含 token（可直接迁移到另一台机器）
+              </label>
+              <div
+                className="dim"
+                style={{ fontSize: 11.5, marginTop: 4, color: exportWithTokens ? 'var(--warn, #e65100)' : undefined }}
+              >
+                {exportWithTokens
+                  ? '⚠️ 导出文件含 token 明文，拿到即可完全接管账号 —— 只在可信环境保存。'
+                  : '默认不含 token，可安全分享/归档；但导入后需重新登录才能使用。'}
+              </div>
+            </div>
+
+            <button className="btn primary" onClick={() => void doExport()}>
+              导出 JSON
+            </button>
+
+            <div className="dim" style={{ fontSize: 11.5, marginTop: 14 }}>
+              导出格式与 <span className="mono">auths/*.json</span> 同构，
+              可直接被上面的「粘贴凭证」导回（也支持一次导入多个）。
             </div>
           </div>
         </div>

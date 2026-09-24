@@ -8,7 +8,9 @@ import type {
   APIKeyEntry,
   APIKeysResponse,
   Delta,
+  ExportResponse,
   Health,
+  ImportBatchResult,
   LoadedAccounts,
   LoginPoll,
   LoginStart,
@@ -364,6 +366,26 @@ export const importAuth = (json: string) =>
     method: 'POST',
     body: JSON.stringify({ json }),
   })
+
+/** 批量导入（导出文件 round-trip）。返回逐条结果，部分失败不中断。 */
+export const importAuthBatch = (json: string) =>
+  adminJSON<ImportBatchResult>('/__admin/accounts/import', {
+    method: 'POST',
+    body: JSON.stringify({ json }),
+  })
+
+/**
+ * 导出凭证。includeTokens=false（默认）时不含 token，可安全分享；
+ * true 时含 accessToken/refreshToken 明文 —— 拿到即可完全接管账号，调用方须二次确认。
+ * file 非空则只导该文件，否则导全部。
+ */
+export const exportAccounts = (includeTokens: boolean, file?: string) => {
+  const q = new URLSearchParams()
+  if (includeTokens) q.set('include_tokens', 'true')
+  if (file) q.set('file', file)
+  const qs = q.toString()
+  return adminJSON<ExportResponse>('/__admin/accounts/export' + (qs ? `?${qs}` : ''))
+}
 
 export const deleteAuth = (file: string) =>
   adminJSON<{ ok: boolean }>('/__admin/accounts/delete', {

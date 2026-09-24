@@ -137,6 +137,38 @@ export interface AccountsResponse {
   accounts: AuthFileView[]
 }
 
+/** 一条导出条目。includeTokens=false 时无 auth 段（不含 token）。 */
+export interface ExportedAccount {
+  file: string
+  /** 仅 includeTokens=true 时存在：含 accessToken/refreshToken 明文 */
+  auth?: {
+    accessToken: string
+    refreshToken: string
+    expiresAt: number
+    domain: string
+  }
+  account: {
+    uid: string
+    nickname: string
+    enterpriseId: string
+  }
+}
+
+/** GET /__admin/accounts/export 的响应。 */
+export interface ExportResponse {
+  exportedAt: string
+  includeTokens: boolean
+  count: number
+  accounts: ExportedAccount[]
+}
+
+/** POST /__admin/accounts/import 的批量结果。 */
+export interface ImportBatchResult {
+  imported: string[]
+  failed: { index: number; error: string }[]
+  loaded: number
+}
+
 export interface LoginStart {
   region: Region
   authUrl: string

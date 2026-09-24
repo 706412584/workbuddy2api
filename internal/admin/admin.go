@@ -99,6 +99,7 @@ func New(cfg Config) *Handler {
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), runs: newRunTracker()}
 
 	h.mux.HandleFunc("GET /__admin/accounts", h.listAccounts)
+	h.mux.HandleFunc("GET /__admin/accounts/export", h.exportAccounts)
 	h.mux.HandleFunc("POST /__admin/accounts/import", h.importAccount)
 	h.mux.HandleFunc("POST /__admin/accounts/delete", h.deleteAccount)
 	h.mux.HandleFunc("POST /__admin/accounts/test", h.testAccount)
