@@ -359,3 +359,35 @@ export interface AccountTestResult {
   /** 成功时收到的首个 SSE 事件，证明链路真的通了 */
   firstEvent?: string
 }
+
+/** 一个出站代理槽位。 */
+export interface ProxySlot {
+  id: string
+  name: string
+  /** http://user:pass@host:port 或 socks5://host:port */
+  url: string
+  /** 关闭后绑定它的账号回落直连（槽位保留，便于临时切换） */
+  enabled: boolean
+  /** 有多少账号绑定本槽位 */
+  usage?: number
+}
+
+/** GET /__admin/proxy/slots */
+export interface ProxyStatus {
+  slots: ProxySlot[]
+  /** 完整绑定表（uid → slotId）。界面据此回显每个账号当前绑定。 */
+  binds: Record<string, string>
+  /** 绑定了不存在槽位的账号（uid → 失效的槽位 id）；界面据此提示，不静默当直连 */
+  orphanBinds?: Record<string, string>
+}
+
+/** POST /__admin/proxy/test 的探测结果。 */
+export interface ProxyTestResult {
+  ok: boolean
+  /** dial = 连不上代理主机；request = 代理可达但转发失败；ok = 通过 */
+  stage: 'dial' | 'request' | 'ok'
+  dialMs?: number
+  elapsedMs?: number
+  status?: number
+  error?: string
+}

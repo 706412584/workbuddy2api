@@ -13,11 +13,12 @@ import { Overview } from './pages/Overview'
 import { Models } from './pages/Models'
 import { Playground } from './pages/Playground'
 import { Accounts } from './pages/Accounts'
+import { Proxy } from './pages/Proxy'
 import { APIKeys } from './pages/APIKeys'
 import { Logs } from './pages/Logs'
 import { Stats } from './pages/Stats'
 
-type Tab = 'overview' | 'stats' | 'accounts' | 'apikeys' | 'models' | 'playground' | 'logs'
+type Tab = 'overview' | 'stats' | 'accounts' | 'apikeys' | 'models' | 'proxy' | 'playground' | 'logs'
 
 const KEY_STORAGE = 'wb2api.admin.key'
 const POLL_MS = 5000
@@ -28,6 +29,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'accounts', label: '账号' },
   { id: 'apikeys', label: '密钥' },
   { id: 'models', label: '模型' },
+  { id: 'proxy', label: '代理' },
   { id: 'playground', label: '调试台' },
   { id: 'logs', label: '日志' },
 ]
@@ -386,6 +388,7 @@ export default function App() {
           {tab === 'accounts' && <Accounts onChanged={refresh} />}
           {tab === 'apikeys' && <APIKeys activeKey={apiKey} onChanged={refresh} />}
           {tab === 'models' && <Models models={models} keyRegion={keyRegion} />}
+          {tab === 'proxy' && <Proxy onChanged={refresh} />}
           {tab === 'playground' && <Playground apiKey={apiKey} models={models} />}
           {tab === 'logs' && <Logs />}
           {tab === 'stats' && <Stats />}

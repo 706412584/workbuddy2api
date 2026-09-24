@@ -17,6 +17,9 @@ import type {
   ModelList,
   PoolStatus,
   ProtocolId,
+  ProxySlot,
+  ProxyStatus,
+  ProxyTestResult,
   AccountTestResult,
   RegionModels,
   LogTail,
@@ -494,3 +497,20 @@ export function breakerActive(a: AccountStatus, now = Date.now()): boolean {
   if (!a.breaker_until || a.breaker_until.startsWith('0001-01-01')) return false
   return new Date(a.breaker_until).getTime() > now
 }
+
+/** 出站代理槽位与绑定。 */
+export const getProxySlots = () => adminJSON<ProxyStatus>('/__admin/proxy/slots')
+
+/** 整体保存槽位与绑定（热重载，不重启进程）。 */
+export const saveProxySlots = (slots: ProxySlot[], binds: Record<string, string>) =>
+  adminJSON<{ ok: boolean }>('/__admin/proxy/slots', {
+    method: 'POST',
+    body: JSON.stringify({ slots, binds }),
+  })
+
+/** 探测某个代理是否可用（只测连通性，不打上游、不消耗额度）。 */
+export const testProxy = (url: string) =>
+  adminJSON<ProxyTestResult>('/__admin/proxy/test', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  })

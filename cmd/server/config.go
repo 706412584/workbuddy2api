@@ -21,6 +21,23 @@ type APIKeySpec struct {
 	Name   string `json:"name"`   // 可选标识，仅用于日志
 }
 
+// ProxySlot 一个出站代理槽位。账号通过槽位 id 绑定，多个账号可共用同一槽位。
+//
+// 设计取舍（参考社区 hub 的「槽位集中管理 + 账号指向 id」）：
+// 账号直接存代理 URL 的话，多个号用同一代理时要重复填，改地址得逐个改；
+// 槽位把 URL 收敛到一处，账号只存 id。
+type ProxySlot struct {
+	// ID 槽位标识（稳定不变，账号绑定引用它）。创建时生成，改名不影响绑定。
+	ID string `json:"id"`
+	// Name 展示名（可改，仅用于界面辨认）。
+	Name string `json:"name"`
+	// URL 代理地址，形如 http://user:pass@host:port 或 socks5://host:port。
+	// 空 = 无效槽位（保存时会被拒绝）。
+	URL string `json:"url"`
+	// Enabled 关闭后绑定该槽位的账号回落直连（槽位保留，便于临时切换）。
+	Enabled bool `json:"enabled"`
+}
+
 // ProtocolConfig 协议适配（Anthropic /v1/messages、OpenAI /v1/responses）的模型名映射。
 // 客户端发的是 claude-* / gpt-* 这类名字，本网关上游只有 glm/deepseek 等，
 // 不做映射会直接拿到 code=11102（模型不存在）。
@@ -45,6 +62,15 @@ type Config struct {
 
 	// Protocol 协议适配（Anthropic /v1/messages、OpenAI /v1/responses）的模型名映射。
 	Protocol ProtocolConfig `json:"protocol"`
+
+	// ProxySlots 出站代理槽位（集中管理，供账号绑定复用）。
+	// 账号侧只存槽位 id（见 AccountProxies），故改代理地址只需改槽位一处。
+	ProxySlots []ProxySlot `json:"proxy_slots"`
+
+	// AccountProxies 账号 uid → 代理槽位 id 的绑定表。空/未列的 uid = 直连。
+	// **不放在 auths/*.json 里**：那个文件由 SaveAtomic 在每次 token 刷新后整份重写
+	// （只写固定的 auth/account 字段），绑定放进去会被刷新悄悄抹掉。
+	AccountProxies map[string]string `json:"account_proxies"`
 
 	Server struct {
 		// MaxBodyMB 请求体大小上限（单位 MB，默认 32）。

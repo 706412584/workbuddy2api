@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/proxyreg"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -51,6 +52,11 @@ type Config struct {
 	ReloadAccounts func() (int, error)
 	// ReloadKeys 让网关换用新的密钥表。
 	ReloadKeys func(legacy string, keys []KeyEntry)
+	// Registry 出站代理槽位与账号绑定的运行期注册表。nil = 代理功能不可用。
+	Registry *proxyreg.Registry
+	// ResetProxyTransports 清空代理连接池缓存（代理槽位变更后调用）。
+	// nil = 不清（测试场景）。
+	ResetProxyTransports func()
 	// ModelsByRegion 返回两区各自可见的模型 id，供「测试连接」的模型下拉框用。
 	ModelsByRegion func() (cn, global []string)
 	// ModelDetailsByRegion 返回两区模型的完整条目（含 credits 倍率/能力旗标等
@@ -116,6 +122,9 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /__admin/schedule", h.schedule)
 	h.mux.HandleFunc("POST /__admin/schedule/run", h.runScheduleTask)
 	h.mux.HandleFunc("GET /__admin/models", h.regionModels)
+	h.mux.HandleFunc("GET /__admin/proxy/slots", h.getProxySlots)
+	h.mux.HandleFunc("POST /__admin/proxy/slots", h.saveProxySlots)
+	h.mux.HandleFunc("POST /__admin/proxy/test", h.testProxy)
 
 	h.mux.HandleFunc("GET /__admin/apikeys", h.getKeys)
 	h.mux.HandleFunc("POST /__admin/apikeys", h.saveKeys)

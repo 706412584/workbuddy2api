@@ -556,6 +556,19 @@ type Client struct {
 	BillingBaseCN  string
 	ChatBaseGlobal string
 	BillingBaseGl  string
+
+	// proxyMu 保护 proxyFor：面板可在运行期改绑定（热重载），而每个出站请求都读它。
+	proxyMu sync.RWMutex
+	// proxyFor 账号 → 代理 URL 的解析函数（见 SetProxyResolver）。nil = 全部直连。
+	proxyFor func(*auth.Auth) string
+}
+
+// labelOf 日志用的账号标识（uid 前 8 位）。nil 安全。
+func labelOf(a *auth.Auth) string {
+	if a == nil {
+		return "<nil>"
+	}
+	return logfmt.UID8(a.UID)
 }
 
 // newDialer 构造出站拨号器（参数集中于此，供测试回读断言）。
@@ -569,8 +582,12 @@ func newDialer() *net.Dialer {
 	}
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
-func New() *Client {
+// newBaseTransport 构造出站 Transport 骨架（不含代理）。proxy 非空时挂代理
+// （http/https 走 Transport.Proxy，socks5 走自定义 DialContext）。
+//
+// New() 与代理池共用本函数，保证「直连」与「走代理」的超时/连接池参数**逐字一致**
+// ——否则两种形态会有两套不同的超时行为，排查时极易误判。
+func newBaseTransport(proxy *proxyConfig) *http.Transport {
 	tr := &http.Transport{
 		// 显式配置 DialContext：零值只有 KeepAlive、没有拨号超时，
 		// 对端 SYN 不回时应答时 TCP 层可挂数分钟。
@@ -595,6 +612,15 @@ func New() *Client {
 		// 仅为未配置时的默认；生产取值以 config.json 为准。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
+	if proxy != nil {
+		proxy.apply(tr)
+	}
+	return tr
+}
+
+// New 生产默认值。配置连接池减少 TLS 握手。
+func New() *Client {
+	tr := newBaseTransport(nil)
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -666,8 +692,10 @@ const (
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+//
+// a 为该请求所属账号，用于选取绑定的代理（nil = 直连，与调用方无账号的场景兼容）。
+func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error) {
+	resp, err := c.clientFor(a, c.HTTP).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -733,7 +761,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 IO（锁外）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return err
 	}
@@ -784,7 +812,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 	c.ChatHeaders(req, a, clientIP)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
-	resp, err := c.chatHTTP().Do(req)
+	resp, err := c.clientFor(a, c.chatHTTP()).Do(req)
 	if err != nil {
 		cancel()
 		log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
@@ -871,7 +899,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.clientFor(a, c.HTTP).Do(req)
 	if err != nil {
 		return nil, err
 	}

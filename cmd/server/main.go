@@ -18,6 +18,7 @@ import (
 	"workbuddy2api/internal/admin"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/proxyreg"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -25,6 +26,22 @@ import (
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/web"
 )
+
+// proxyRegistry 出站代理槽位与账号绑定的运行期注册表。
+// 包级变量是因为 admin 面板要在运行期读写它（热重载），而 admin 的 Config 是值传递的
+// 函数注入缝，不便携带状态；与本仓库既有做法（degradeGate 等进程级状态）一致。
+var proxyRegistry *proxyreg.Registry
+
+// slotsToRegistry 把 config 的槽位定义转成注册表类型。
+// 两种类型分开是刻意的：config 侧带 json tag 供配置文件读写，注册表侧是纯运行期模型，
+// 各自演进互不影响（避免改注册表内部结构时牵动配置文件格式）。
+func slotsToRegistry(in []ProxySlot) []proxyreg.Slot {
+	out := make([]proxyreg.Slot, 0, len(in))
+	for _, s := range in {
+		out = append(out, proxyreg.Slot{ID: s.ID, Name: s.Name, URL: s.URL, Enabled: s.Enabled})
+	}
+	return out
+}
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -91,6 +108,15 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 出站代理：把 config 的槽位/绑定装进运行期注册表，并接线到 upstream 的解析缝。
+	// 解析函数每次出站都调用 → 面板改绑定后无需重启（配合 ResetProxyTransportCache）。
+	proxyRegistry = proxyreg.New(slotsToRegistry(cfg.ProxySlots), cfg.AccountProxies)
+	up.SetProxyResolver(func(a *auth.Auth) string {
+		if a == nil {
+			return ""
+		}
+		return proxyRegistry.Resolve(a.UID)
+	})
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -195,6 +221,8 @@ func main() {
 			}
 			h.SetKeys(legacy, serverAPIKeys(in))
 		},
+		Registry:             proxyRegistry,
+		ResetProxyTransports: upstream.ResetProxyTransportCache,
 		ModelsByRegion: func() (cn, global []string) {
 			return h.ModelsForRegion(auth.RegionCN), h.ModelsForRegion(auth.RegionGlobal)
 		},

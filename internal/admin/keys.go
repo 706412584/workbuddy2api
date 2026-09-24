@@ -326,39 +326,11 @@ func (h *Handler) saveKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 一致性断言：结果须能解析，且除这两个键外与原配置逐字段相同。
-	var after, before map[string]any
-	if err := json.Unmarshal([]byte(text), &after); err != nil {
-		fail(w, http.StatusInternalServerError, "内部错误：编辑结果不是合法 JSON，已放弃写入（%v）", err)
-		return
-	}
-	if err := json.Unmarshal(raw, &before); err != nil {
-		fail(w, http.StatusInternalServerError, "内部错误：原配置无法解析（%v）", err)
-		return
-	}
-	expected := make(map[string]any, len(before)+2)
-	for k, v := range before {
-		expected[k] = v
-	}
-	expected["api_key"] = legacyKey
-	expected["api_keys"] = toAny(keys)
-	if !reflect.DeepEqual(after, expected) {
-		fail(w, http.StatusInternalServerError, "内部错误：编辑结果与预期不一致，已放弃写入（config.json 未被修改）")
-		return
-	}
-
-	backup := h.cfg.ConfigPath + ".bak"
-	if err := os.WriteFile(backup, raw, 0o600); err != nil {
-		fail(w, http.StatusInternalServerError, "写备份失败：%v", err)
-		return
-	}
-	tmp := h.cfg.ConfigPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(text), 0o600); err != nil {
-		fail(w, http.StatusInternalServerError, "写入失败：%v", err)
-		return
-	}
-	if err := os.Rename(tmp, h.cfg.ConfigPath); err != nil {
-		fail(w, http.StatusInternalServerError, "替换 config.json 失败：%v", err)
+	// 一致性断言 + 落盘（共用 helper，与代理配置保存同强度保护）
+	expected := map[string]any{"api_key": legacyKey, "api_keys": toAny(keys)}
+	backup, err := h.persistConfigEdits(raw, text, expected)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 
@@ -376,4 +348,47 @@ func (h *Handler) saveKeys(w http.ResponseWriter, r *http.Request) {
 		"backup":     backup,
 		"keyCount":   n,
 	})
+}
+
+// persistConfigEdits 校验并落盘 config.json 的编辑结果，返回备份文件路径。
+//
+// 两道保护（与 saveKeys 原有逻辑同强度，抽出来供代理配置复用）：
+//  1. **一致性断言**：结果须能解析为 JSON，且与原配置**除 expected 里列出的键外**
+//     逐字段相同 —— 防止 setTopLevelValue 的文本编辑意外改动其他键。
+//     config.json 写坏会让网关直接起不来，宁可本次保存失败。
+//  2. **先备份再原子替换**：写 <path>.bak（原始内容）→ 写 .tmp → rename。
+//     rename 是原子的，进程崩溃也不会留下半截配置。
+//
+// expected 是「本次要改的键 → 期望值」；其余键必须与原配置完全一致。
+func (h *Handler) persistConfigEdits(raw []byte, edited string, expected map[string]any) (string, error) {
+	var after, before map[string]any
+	if err := json.Unmarshal([]byte(edited), &after); err != nil {
+		return "", fmt.Errorf("内部错误：编辑结果不是合法 JSON，已放弃写入（%v）", err)
+	}
+	if err := json.Unmarshal(raw, &before); err != nil {
+		return "", fmt.Errorf("内部错误：原配置无法解析（%v）", err)
+	}
+	want := make(map[string]any, len(before)+len(expected))
+	for k, v := range before {
+		want[k] = v
+	}
+	for k, v := range expected {
+		want[k] = v
+	}
+	if !reflect.DeepEqual(after, want) {
+		return "", fmt.Errorf("内部错误：编辑结果与预期不一致，已放弃写入（config.json 未被修改）")
+	}
+
+	backup := h.cfg.ConfigPath + ".bak"
+	if err := os.WriteFile(backup, raw, 0o600); err != nil {
+		return "", fmt.Errorf("写备份失败：%v", err)
+	}
+	tmp := h.cfg.ConfigPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(edited), 0o600); err != nil {
+		return "", fmt.Errorf("写入失败：%v", err)
+	}
+	if err := os.Rename(tmp, h.cfg.ConfigPath); err != nil {
+		return "", fmt.Errorf("替换 config.json 失败：%v", err)
+	}
+	return backup, nil
 }
