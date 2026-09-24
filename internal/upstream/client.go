@@ -237,7 +237,9 @@ const modelRateLimitCode = "6004"
 // 中文 `将在 (.+?) 重置`，而生产日志里 6004 文案**全是英文**，于是 ResetAt 恒解析
 // 失败、模型级冷却（CooldownSoftForModel）从未生效，账号被按「全模型」冷却了，
 // 而上游明说 "you can switch to the other models to continue using it"。
-const softRateResetPattern = `(?:将在 |will reset at )(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: UTC\+8)?)`
+// 前缀 (?i) 不可省：上游大小写不保证（实测见过 "Your Usage Will RESET AT …"），
+// 无该标志时大小写变体漏匹配 → 退回指数退避而非对齐上游重置墙钟。
+const softRateResetPattern = `(?i)(?:将在 |will reset at )(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: UTC\+8)?)`
 
 // 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
 // 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
