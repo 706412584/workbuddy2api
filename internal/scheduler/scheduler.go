@@ -355,7 +355,7 @@ func (s *Scheduler) RunActivityNow() string {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			skipped++
 			continue
 		}

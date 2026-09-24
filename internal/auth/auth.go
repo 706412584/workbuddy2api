@@ -48,7 +48,18 @@ const (
 const globalSuffix = ".workbuddy.ai"
 
 // Region 返回账号所属区域。domain 为空视为 CN（向后兼容旧凭证）。
+//
+// 持 a.mu：Domain 由 RefreshToken 在锁内改写，锁外读构成数据竞争
+// （见 AccessTokenValue 注释）。调用方**不得**已持 a.mu（sync.Mutex 不可重入）。
 func (a *Auth) Region() Region {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.regionLocked()
+}
+
+// regionLocked Region 的无锁内部实现：仅限**已持 a.mu** 的调用方使用
+// （sync.Mutex 不可重入，锁内再调 Region() 会自锁）。
+func (a *Auth) regionLocked() Region {
 	d := strings.ToLower(strings.TrimSpace(a.Domain))
 	if d == strings.TrimPrefix(globalSuffix, ".") || strings.HasSuffix(d, globalSuffix) {
 		return RegionGlobal
@@ -85,8 +96,44 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
+//
+// 为什么必须加锁：RefreshToken 在 a.mu 内改写 AccessToken/RefreshToken/Domain/ExpiresAt，
+// 而所有出站请求头构造（ChatHeaders / BillingHeaders / FetchModels / RefreshHeaders）
+// 与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
+// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
+// 就是池内同一个对象）。无同步直读构成数据竞争，go test -race 实证：
+//
+//	WARNING: DATA RACE
+//	Write at ... by goroutine:
+//	  (*Client).RefreshToken()  internal/upstream/client.go
+//	Previous read at ... by goroutine:
+//	  (*Client).ChatHeaders()   internal/upstream/headers.go
+func (a *Auth) AccessTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.AccessToken
+}
+
+// DomainValue 加锁读取 Domain（同 AccessTokenValue：RefreshToken 在锁内改写它）。
+func (a *Auth) DomainValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Domain
+}
+
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
+// 持 a.mu：ExpiresAt 由 RefreshToken 在锁内改写。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.ExpiresAt <= 0 {
 		return true
 	}

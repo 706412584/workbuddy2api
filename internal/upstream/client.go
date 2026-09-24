@@ -224,6 +224,11 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
+// refreshTokenExpiresInMax 可接受的 refresh 响应 expiresIn 量级上限（10 年）。
+// 上游实测恒为 5184000（60d），超量级值只会是脏数据——照写会把 ExpiresAt 推到
+// 荒谬未来，NeedsRefresh 永假 → token 永不刷新反而真过期失效。
+const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
+
 // softRateResetPattern 匹配 6004 文案里的重置时刻，捕获时间串。
 //
 // 两种语言的实测形态（**必须都覆盖**）：
@@ -563,19 +568,44 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 }
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
-// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
+// 调用方负责 SaveAtomic。
+//
+// 两段式（网络 IO 移出锁）：旧实现全程持 a.mu 跨 HTTP 往返，30s 网络超时期间
+// 所有出站请求头构造（ChatHeaders/CommonHeaders 都要经 Region()/AccessTokenValue()
+// 取值）会被该锁堵住，一个账号刷新即拖住整池并发。现改为「锁内读快照 →
+// 锁外 IO → 锁内写回」，与 auth.mu 契约（只保护字段读写、不覆盖 IO）一致。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	// 第 1 段（锁内）：读快照。
 	a.Lock()
-	defer a.Unlock()
-	if strings.TrimSpace(a.RefreshToken) == "" {
+	rtSnapshot := a.RefreshToken
+	atBefore := a.AccessToken
+	a.Unlock()
+	if strings.TrimSpace(rtSnapshot) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
+	// chatBase 经 Region() 取值——此刻未持锁，安全。
 	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	req, err := http.NewRequest(http.MethodPost, url, nil)
 	if err != nil {
 		return err
 	}
-	c.RefreshHeaders(req, a)
+	// RefreshHeaders 读 a 的 domain/uid 等字段注入请求头：锁内取一份逐字段拷贝
+	// （不拷贝 sync.Mutex，避免 vet copylocks），用该副本构造头。
+	a.Lock()
+	hdrSnapshot := auth.Auth{
+		AccessToken:  a.AccessToken,
+		RefreshToken: rtSnapshot,
+		ExpiresAt:    a.ExpiresAt,
+		Domain:       a.Domain,
+		UID:          a.UID,
+		EnterpriseID: a.EnterpriseID,
+		Nickname:     a.Nickname,
+		DeviceToken:  a.DeviceToken,
+	}
+	a.Unlock()
+	c.RefreshHeaders(req, &hdrSnapshot)
+
+	// 网络 IO（锁外）。
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -589,6 +619,14 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
 	}
+	// 第 2 段（锁内）：校验快照一致后写回。
+	a.Lock()
+	defer a.Unlock()
+	// 锁外期间另一刷新已完成（两 token 同时 rotate）→ 新 token 已生效，本次结果
+	// 不必再写，避免无意义覆盖与 ExpiresAt 抖动。
+	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
+		return nil
+	}
 	a.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
 		a.RefreshToken = tok.RefreshToken
@@ -597,7 +635,9 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		a.Domain = tok.Domain
 	}
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	if tok.ExpiresIn > 0 {
+	// 超过 10 年的 expiresIn 按脏值处理保留旧值：照写会把 ExpiresAt 推到荒谬未来
+	// → NeedsRefresh 永假 → token 永不刷新反而真过期失效。
+	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil
@@ -662,7 +702,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err

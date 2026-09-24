@@ -158,8 +158,10 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
 	c.CommonHeaders(req, a)
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
+	// （见 auth.AccessTokenValue 注释）。
+	if at := a.AccessTokenValue(); at != "" {
+		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
@@ -174,8 +176,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
@@ -251,7 +253,8 @@ func ExtractClientIP(r *http.Request) string {
 //     显式覆写 UA 的形态，不带 CLI 段）；
 //  3. 两者皆空 → 保持现状不设置（Go 客户端自带默认 UA）。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照（同 ChatHeaders：keepalive 可在 a.mu 内改写）。
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	if c != nil && c.UserAgent != "" {
@@ -266,8 +269,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)
