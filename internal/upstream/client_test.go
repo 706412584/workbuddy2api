@@ -538,12 +538,16 @@ func TestBasesByRegion(t *testing.T) {
 
 // TestEffortsCacheIsolatedByRegion 两个区域的 effort 缓存必须互不覆盖：
 // FetchModels 只替换所查账号区域的槽位。
+//
+// 两域路径不同（CN /console/... vs global /v3/config，见 modelsPathFor），
+// 故 fake 按路径分发；两区返回同一模型但档位不同，以区分来源。
 func TestEffortsCacheIsolatedByRegion(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
-		if strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models") {
-			// 两区返回同一模型但档位不同，以区分来源。
+		isCN := strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models")
+		isGlobal := strings.HasSuffix(r.URL.Path, "/v3/config")
+		if isCN || isGlobal {
 			efforts := `["low","high"]`
-			if strings.Contains(r.Header.Get("Referer"), "workbuddy.ai") {
+			if isGlobal {
 				efforts = `["medium"]`
 			}
 			return jsonResp(200, `{"code":0,"data":{"models":[

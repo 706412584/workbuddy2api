@@ -1028,6 +1028,10 @@ func TestChatModelNotFoundReturns404(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
+	// 清动态模型缓存：本用例依赖静态表（upstream.New() 无 fake，FetchModels 失败
+	// 进负缓存 → 回落静态表，其中含 glm-5.2）。若前一用例留下的缓存仍有效，
+	// 本用例会拿到那份缓存而非静态表。
+	resetModelsCache()
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()

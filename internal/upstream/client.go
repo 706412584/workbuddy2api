@@ -811,19 +811,60 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
-// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
+// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens 与展示用元数据）。
+//
+// 除 ID/尺寸外全部为**展示字段**，不参与选号与路由决策：
+// 上游两域下发同一套字段（credits/description/vendor/tags/能力旗标），
+// 此前只取 4 个，其余丢弃；现全量透出供客户端与面板展示。
 type ModelInfo struct {
 	ID            string
 	Name          string
 	ContextWindow int64    // = maxInputTokens
 	MaxTokens     int64    // = maxOutputTokens
 	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
+
+	// Credits 积分倍率原文（如 "x0.11 credits" / "x0.00"），**仅展示不参与选号**。
+	// 空串 = 上游未下发（非对话模型如图像/视频），与 "x0.00"（真免费）语义不同，
+	// 展示侧必须区分：空 → 不显示，x0.00 → 显示免费。
+	Credits string
+	// Description 模型描述（优先中文 descriptionZh，回落英文 descriptionEn）。
+	Description string
+	// Vendor 供应商标识（如 "f"），仅展示。
+	Vendor string
+	// Tags 模型标签（如 ["craft"]），仅展示。
+	Tags []string
+	// IsDefault 是否为该区默认模型。
+	IsDefault bool
+
+	// 能力旗标：供客户端按需选择（多模态/推理/工具调用）。
+	SupportsImages    bool
+	SupportsReasoning bool
+	SupportsToolCall  bool
+	// CanDisableThinking 推理模型是否允许关闭思考（false 时思考恒开）。
+	CanDisableThinking bool
 }
 
-// FetchModels 调上游动态模型接口。
+// modelsPathFor 按账号区域返回模型目录端点路径。
+//
+// 两域**路径不同**（2026-09 实测）：
+//   - CN  → /console/enterprises/personal/models
+//   - global → /v3/config（同一路径 /console/... 在 global 是 HTTP 500 APISIX 错误页
+//     ——这是 intl 侧动态模型长期不可用的根因，此前靠 staticModelsGlobal 兜底，
+//     代价是拿不到 credits 等元数据）
+//
+// 两域响应结构同构（data.models[] + data.agents[]，agent name 均为 "cli"），
+// 故解析链共用，仅路径分叉。
+func (c *Client) modelsPathFor(a *auth.Auth) string {
+	if a != nil && a.Region() == auth.RegionGlobal {
+		return "/v3/config"
+	}
+	return "/console/enterprises/personal/models"
+}
+
+// FetchModels 调上游动态模型接口（按账号区域自动选路径，见 modelsPathFor）。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + "/console/enterprises/personal/models"
+	url := c.chatBase(a) + c.modelsPathFor(a)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -842,26 +883,69 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
-				Reasoning       struct {
-					Effort           string   `json:"effort"`
-					SupportedEfforts []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
-		} `json:"data"`
+	out, err := parseModels(raw)
+	if err != nil {
+		return nil, err
 	}
+	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
+	// 只替换该账号所在区域的槽位，另一区域的缓存保持不变。
+	cache := make(map[string][]string, len(out))
+	for _, mi := range out {
+		if len(mi.Efforts) > 0 {
+			cache[mi.ID] = mi.Efforts
+		}
+	}
+	c.effortsMu.Lock()
+	if c.efforts == nil {
+		c.efforts = make(map[auth.Region]map[string][]string, 2)
+	}
+	c.efforts[a.Region()] = cache
+	c.effortsMu.Unlock()
+	return out, nil
+}
+
+// modelsEnvelope 上游模型目录响应信封（CN /console/... 与 global /v3/config 同构）。
+type modelsEnvelope struct {
+	Code int `json:"code"`
+	Data struct {
+		Models []modelEntry `json:"models"`
+		Agents []struct {
+			Name   string   `json:"name"`
+			Models []string `json:"models"`
+		} `json:"agents"`
+	} `json:"data"`
+}
+
+// modelEntry 上游单个模型条目。两域字段同名同义；零值即未下发（展示侧据此省略，
+// **不编造**——尤其 Credits 缺失≠免费）。
+type modelEntry struct {
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	Credits            string   `json:"credits"`
+	DescriptionZh      string   `json:"descriptionZh"`
+	DescriptionEn      string   `json:"descriptionEn"`
+	Vendor             string   `json:"vendor"`
+	Tags               []string `json:"tags"`
+	IsDefault          bool     `json:"isDefault"`
+	MaxInputTokens     int64    `json:"maxInputTokens"`
+	MaxOutputTokens    int64    `json:"maxOutputTokens"`
+	Disabled           bool     `json:"disabled"`
+	SupportsImages     bool     `json:"supportsImages"`
+	SupportsReasoning  bool     `json:"supportsReasoning"`
+	SupportsToolCall   bool     `json:"supportsToolCall"`
+	CanDisableThinking bool     `json:"canDisableThinking"`
+	Reasoning          struct {
+		Effort           string   `json:"effort"`
+		SupportedEfforts []string `json:"supportedEfforts"`
+	} `json:"reasoning"`
+}
+
+// parseModels 解析模型目录响应（两域共用）：
+// 以 cli agent 的 models 名单为准（该名单是客户端实际可用的对话模型面），
+// 逐 id 从 data.models 取元数据；disabled 条目剔除；名单外的模型不透出
+// （global 实测 25 个 models 中仅 22 个在 cli 名单内，其余非对话面）。
+func parseModels(raw []byte) ([]ModelInfo, error) {
+	var env modelsEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
@@ -878,55 +962,41 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(cliIDs) == 0 {
 		return nil, fmt.Errorf("no cli agent models found")
 	}
-	dynMap := make(map[string]struct {
-		ID              string
-		Name            string
-		MaxInputTokens  int64
-		MaxOutputTokens int64
-		Disabled        bool
-		Efforts         []string
-	}, len(env.Data.Models))
+	byID := make(map[string]modelEntry, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
+		byID[m.ID] = m
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
-		m, ok := dynMap[id]
+		m, ok := byID[id]
 		if !ok || m.Disabled {
 			continue
 		}
+		// 描述优先中文（面板/客户端面向中文用户），回落英文；都空则留空不编造。
+		desc := m.DescriptionZh
+		if strings.TrimSpace(desc) == "" {
+			desc = m.DescriptionEn
+		}
 		out = append(out, ModelInfo{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.MaxInputTokens,
-			MaxTokens:     m.MaxOutputTokens,
-			Efforts:       m.Efforts,
+			ID:                 m.ID,
+			Name:               m.Name,
+			ContextWindow:      m.MaxInputTokens,
+			MaxTokens:          m.MaxOutputTokens,
+			Efforts:            m.Reasoning.SupportedEfforts,
+			Credits:            m.Credits,
+			Description:        desc,
+			Vendor:             m.Vendor,
+			Tags:               m.Tags,
+			IsDefault:          m.IsDefault,
+			SupportsImages:     m.SupportsImages,
+			SupportsReasoning:  m.SupportsReasoning,
+			SupportsToolCall:   m.SupportsToolCall,
+			CanDisableThinking: m.CanDisableThinking,
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
-	// 只替换该账号所在区域的槽位，另一区域的缓存保持不变。
-	cache := make(map[string][]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
-		}
-	}
-	c.effortsMu.Lock()
-	if c.efforts == nil {
-		c.efforts = make(map[auth.Region]map[string][]string, 2)
-	}
-	c.efforts[a.Region()] = cache
-	c.effortsMu.Unlock()
 	return out, nil
 }
 

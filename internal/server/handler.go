@@ -538,6 +538,16 @@ func (h *Handler) ModelsForRegion(r auth.Region) []string {
 	return out
 }
 
+// formatCredits 归一化上游积分倍率原文为展示串（如 "x0.11"）。
+// 上游形态不统一："x0.05 credits" / "x0.11" / "x0.00 credits" 等，统一去掉
+// "credits" 后缀与空白。返回空串表示**上游未下发**（非对话模型如图像/视频），
+// 调用方据此省略字段——缺失 ≠ 免费，不可写成 "x0.00"。
+func formatCredits(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimSpace(strings.TrimSuffix(s, "credits"))
+	return s
+}
+
 // regionModels 单个区域的模型列表：动态接口优先，失败回落该区域的静态表。
 func (h *Handler) regionModels(r auth.Region) []map[string]any {
 	if infos := h.fetchDynamicModels(r); len(infos) > 0 {
@@ -550,9 +560,45 @@ func (h *Handler) regionModels(r auth.Region) []map[string]any {
 				"owned_by":          "workbuddy",
 				"context_length":    mi.ContextWindow,
 				"max_output_tokens": mi.MaxTokens,
+				// region 标明本条来自哪个上游区域。**必要**：同名模型两区倍率可能
+				// 不同（实测 deepseek-v4.1-flash：CN x0.11 / global x0.00），
+				// 无此字段则倍率无法归属区域；modelList 去重后同名只留一条，
+				// 面板要展示两区差异需经 /__admin/models 的分区视图。
+				"region": string(r),
 			}
 			if mi.ContextWindow == 0 {
 				entry["context_length"] = 131072 // 兜底
+			}
+			// 展示字段按「上游下发才写」的规则合入：零值省略，不编造。
+			if mi.Name != "" {
+				entry["name"] = mi.Name
+			}
+			if c := formatCredits(mi.Credits); c != "" {
+				entry["credits"] = c // 积分倍率（如 "x0.11"），仅展示不参与选号
+			}
+			if mi.Description != "" {
+				entry["description"] = mi.Description
+			}
+			if mi.Vendor != "" {
+				entry["vendor"] = mi.Vendor
+			}
+			if len(mi.Tags) > 0 {
+				entry["tags"] = mi.Tags
+			}
+			if mi.IsDefault {
+				entry["is_default"] = true
+			}
+			if mi.SupportsImages {
+				entry["supports_images"] = true
+			}
+			if mi.SupportsReasoning {
+				entry["supports_reasoning"] = true
+				if mi.CanDisableThinking {
+					entry["can_disable_thinking"] = true
+				}
+			}
+			if mi.SupportsToolCall {
+				entry["supports_tool_call"] = true
 			}
 			out = append(out, entry)
 		}
