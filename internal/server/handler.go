@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -125,6 +126,13 @@ const maxLoopRetries = 2
 // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
 const notFoundCooldown = 60 * time.Second
 
+// wafCooldownBase WAF 403 软冷却基数（60s 起；抖动 ±25% 后落 [45s,75s]，
+// 实际进入 Cooldown 后再按 softStreak 指数、封顶 soft_rate_max）。
+// 与 SoftCooldown 分流的原因：WAF 403 是 IP/指纹维频控，信号比 429「账号级限流」
+// 轻（账号本身健康），但比 404 重（带粘性会连环）；60s 级的快速避让已足够让频控
+// 窗口滑过，指数升级由 Cooldown 既有机制接管。
+const wafCooldownBase = 60 * time.Second
+
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -143,6 +151,9 @@ type Handler struct {
 	loopGuard *LoopGuard
 	// loopLog 近期空转命中的环形缓冲，经 /status 暴露（免去翻日志）。
 	loopLog *loopLog
+	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
+	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
+	wafIP wafIPGate
 }
 
 // NewHandler 构建 handler。
@@ -597,6 +608,9 @@ func (h *Handler) fetchDynamicModels(r auth.Region) []upstream.ModelInfo {
 
 // forwardOpt 转发所需的请求级上下文，由各协议的 handler 组装后交给 forwardChat。
 type forwardOpt struct {
+	// ctx 调用方请求上下文，仅用于轮转退避的可取消等待（客户端断连即终止轮转，
+	// 不再换号打上游）。nil = 退避不可取消（测试便利；生产三入口都传 r.Context()）。
+	ctx context.Context
 	// pickPred 账号谓词（模型区域 ∩ 密钥区域）；nil = 不过滤。
 	pickPred func(*auth.Auth) bool
 	// sessKey 会话键（取自客户端原始请求体，未加区域前缀）；空 = 不走粘性。
@@ -654,6 +668,10 @@ func (h *Handler) sessionKey(body []byte) string {
 // 它们的差异只在请求体构造与响应渲染，而选号、在途租约、token 刷新、错误分类处置、
 // 粘性重绑这些语义必须完全一致，故集中于此，避免三处各写一份而产生行为漂移。
 func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) io.ReadCloser {
+	ctx := o.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// 会话粘性：解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
 	stickyUID := ""
@@ -794,6 +812,9 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			fail(acct.UID)
+			if !rotateBackoff(i, ctx) {
+				break // ctx 取消：终止轮转（传输层错误换号退避）
+			}
 			continue
 		}
 		if status >= 400 {
@@ -840,6 +861,17 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), o.model)
 			fail(acct.UID)
+			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
+			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，说明 IP 被拦而非账号）
+			// 则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP，加重风控。
+			// 账号级软冷却已在上方 applyErrorPolicy 照常记账（单号偶发 403 仍冷却），
+			// IP 级状态只改变「是否继续轮转」——协同不叠加。
+			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+				break
+			}
+			if !rotateBackoff(i, ctx) {
+				break // ctx 取消：终止轮转（分类错误换号退避）
+			}
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -963,6 +995,23 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		st.status = http.StatusNotFound
 		return nil
 	}
+	// WAF 拦截：状态码保持 503（网关侧无可用账号，与「上游拒绝」同族），只把
+	// code/msg 换成可读文案。IP 级激活时说明「出口 IP 被拦、轮转已止损、换号不换 IP」。
+	// 有上游原文时原文优先（透传语义，见下方统一分支），此处只在原文为空时兜底。
+	if ue := (*upstream.Error)(nil); errors.As(lastErr, &ue) && ue.Kind == upstream.ErrWafBlock {
+		code, msg := "waf_blocked", "upstream firewall blocked the request; retry after the block window expires"
+		if h.wafIP.active() {
+			code = "waf_ip_blocked"
+			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
+		}
+		if s := strings.TrimSpace(ue.Msg); s != "" {
+			msg = s // 上游原文优先：不编造、不覆盖（客户端按原文排查）
+		}
+		log.Printf("WARN: [server] waf blocked model=%s code=%s", o.model, code)
+		writeErr(w, http.StatusServiceUnavailable, code, msg)
+		st.status = http.StatusServiceUnavailable
+		return nil
+	}
 
 	// 轮换耗尽有两种截然不同的原因，必须分开表述，否则会把排查方向带偏：
 	//   - lastErr == nil：真的没有可尝试的账号（区域无账号 / 全冷却 / 全禁用）。
@@ -1031,6 +1080,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 	pickPred := regionAllowed(allowedRegions)
 
 	rc := h.forwardChat(w, body, forwardOpt{
+		ctx:            r.Context(),
 		pickPred:       pickPred,
 		sessKey:        h.sessionKey(body),
 		key:            key,
@@ -1059,6 +1109,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 	if credit, total, ok := usageCreditTotal(resp); ok {
 		h.cfg.Pool.NoteModelCost(st.uid, peek.Model, credit, total)
 	}
+}
+
+// rotateBackoff 轮转间指数退避 + 抖动：第 i 次轮转失败（continue 换号前）等待
+// backoffAfter(i)（500ms·2^i 封顶 8s，±25% 抖动），ctx 取消（客户端断连/优雅停机）
+// 返回 false——调用方立即终止轮转（客户端已走，换号重试无意义）。
+// 退避是「换号前歇一下」让上游频控窗口滑过；正常单号请求（首次成功）不经过本函数，零开销。
+func rotateBackoff(i int, ctx context.Context) bool {
+	d := backoffAfter(i)
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	if !sleepCtx(ctx, d) {
+		log.Printf("WARN: [server] rotate backoff aborted: ctx cancelled")
+		return false
+	}
+	return true
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
@@ -1107,6 +1173,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+	case upstream.ErrWafBlock:
+		// WAF 403（无业务信封的拦截形态）：账号级软冷却，**不 Disable**——WAF 403
+		// 是 IP/指纹维频控信号（被拦后账号本身仍健康），罚过即走、到期自愈。
+		// 基数经 jitterDur 抖动（复用 backoff.go 单一抖动来源，防多账号同相位
+		// 冷却到期再聚团）；指数升级/封顶由 Cooldown(CoolSoft) 既有机制接管。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "waf 403")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

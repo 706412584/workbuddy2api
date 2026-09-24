@@ -783,3 +783,125 @@ func TestChatHeadersRacesRefreshToken(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestIsWafBlocked WAF 403 形态判定的直接回归（Classify 的 WAF 层）：
+// 只认 403 + 无业务信封；带信封/其他状态码一律 false。
+func TestIsWafBlocked(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{403, "", true},
+		{403, "<html>blocked</html>", true},
+		{403, "Forbidden", true},
+		{403, `{"code":1}`, false},                // 有 "code": 字段
+		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（该文案走既有分类）
+		{402, "", false},                          // 非 403
+		{429, "", false},
+		{500, "<html>gateway</html>", false},
+	}
+	for _, c := range cases {
+		if got := IsWafBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsWafBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestClassifyWafBlock Classify 对 WAF 403 的分流：无信封 403 → ErrWafBlock；
+// 带信封的 403 仍走各自既有分类（不劫持业务 403）。
+func TestClassifyWafBlock(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   ErrKind
+	}{
+		{"空体 403", 403, ``, ErrWafBlock},
+		{"HTML 拦截页", 403, `<html><body>403 Forbidden</body></html>`, ErrWafBlock},
+		{"纯文本 403", 403, `Forbidden`, ErrWafBlock},
+		{"非信封 JSON", 403, `{"message":"blocked by waf"}`, ErrWafBlock},
+		{"带 code 信封不劫持", 403, `{"code":60001,"msg":"quota exceeded"}`, ErrHardCredit},
+		{"带 code 未知业务", 403, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		{"非 403 无信封", 400, `bad request`, ErrClient},
+		{"429 空体", 429, ``, ErrSoftRate},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Classify(c.status, c.body); got != c.want {
+				t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+			}
+		})
+	}
+}
+
+// TestParseRetryAfter Retry-After / retry-after-ms / x-ratelimit-reset 头解析
+// （有效/缺失/非法三形态）。
+func TestParseRetryAfter(t *testing.T) {
+	t.Run("retry-after seconds", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "30")
+		if d, ok := ParseRetryAfter(h); !ok || d != 30*time.Second {
+			t.Fatalf("ParseRetryAfter(30)=%v,%v want 30s,true", d, ok)
+		}
+	})
+	t.Run("retry-after-ms", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After-Ms", "1500")
+		if d, ok := ParseRetryAfter(h); !ok || d != 1500*time.Millisecond {
+			t.Fatalf("ParseRetryAfter(1500ms)=%v,%v want 1.5s,true", d, ok)
+		}
+	})
+	t.Run("x-ratelimit-reset epoch seconds", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(90*time.Second).Unix()))
+		d, ok := ParseRetryAfter(h)
+		if !ok || d < 80*time.Second || d > 100*time.Second {
+			t.Fatalf("ParseRetryAfter(epoch+90s)=%v,%v want ~90s", d, ok)
+		}
+	})
+	t.Run("x-ratelimit-reset epoch millis", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(45*time.Second).UnixMilli()))
+		d, ok := ParseRetryAfter(h)
+		if !ok || d < 35*time.Second || d > 55*time.Second {
+			t.Fatalf("ParseRetryAfter(epochMilli+45s)=%v,%v want ~45s", d, ok)
+		}
+	})
+	t.Run("missing headers", func(t *testing.T) {
+		if d, ok := ParseRetryAfter(http.Header{}); ok || d != 0 {
+			t.Fatalf("missing headers must return 0,false, got %v,%v", d, ok)
+		}
+	})
+	t.Run("invalid values", func(t *testing.T) {
+		for _, v := range []string{"abc", "", "-5", "1.5", "0"} {
+			h := http.Header{}
+			h.Set("Retry-After", v)
+			if d, ok := ParseRetryAfter(h); ok {
+				t.Errorf("Retry-After=%q must be rejected, got %v", v, d)
+			}
+		}
+	})
+	t.Run("oversized sanity cap", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "999999") // > retryAfterSanity(2h)
+		if d, ok := ParseRetryAfter(h); ok {
+			t.Errorf("oversized Retry-After must fall back, got %v", d)
+		}
+	})
+	t.Run("expired reset epoch", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(-time.Minute).Unix()))
+		if d, ok := ParseRetryAfter(h); ok {
+			t.Errorf("expired reset must be rejected, got %v", d)
+		}
+	})
+	t.Run("priority retry-after first", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "10")
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(300*time.Second).Unix()))
+		if d, ok := ParseRetryAfter(h); !ok || d != 10*time.Second {
+			t.Fatalf("Retry-After must take priority, got %v,%v", d, ok)
+		}
+	})
+}

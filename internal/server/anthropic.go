@@ -103,6 +103,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request, key 
 	}
 
 	rc := h.forwardChat(w, chatBody, forwardOpt{
+		ctx:            r.Context(),
 		pickPred:       regionAllowed(allowedRegions),
 		sessKey:        h.sessionKey(body),
 		key:            key,

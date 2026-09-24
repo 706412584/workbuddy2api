@@ -42,6 +42,11 @@ const (
 	// 可能滞后于上游；对未收录的模型（不做区域限制）轮换能撞出真正提供它的区域。
 	// 但轮换耗尽后必须回 404 而非 503：模型名不对不是「网关没有可用账号」。
 	ErrModelNotFound
+	// ErrWafBlock 403 + 非业务信封体（APISIX WAF 拦截页/空体/纯文本）→ 账号软冷却
+	// + 轮转退避。判据是「无业务信封」：带 code/msg 的 403（11140 request illegal
+	// 等）走各自既有分类，不受影响。此前该形态落 ErrClient 兜底 → 只换号不罚
+	// → 连环 403 放大请求量。
+	ErrWafBlock
 	ErrClient // 其他 4xx / 业务错误
 )
 
@@ -65,6 +70,8 @@ func (k ErrKind) String() string {
 		return "context_exceeded"
 	case ErrModelNotFound:
 		return "model_not_found"
+	case ErrWafBlock:
+		return "waf_block"
 	case ErrClient:
 		return "client"
 	default:
@@ -77,6 +84,11 @@ type Error struct {
 	Kind   ErrKind
 	Status int
 	Msg    string
+	// RetryAfter 上游明示的等待时长（Retry-After 秒 / retry-after-ms /
+	// x-ratelimit-reset 头解析，见 ParseRetryAfter）。零值 = 上游未明示，
+	// 冷却时长回落调用方计算值。挂载点选在 Error 信封：Kind 决定「罚不罚」，
+	// RetryAfter 决定「罚多久」，同为上游响应的一等公民。
+	RetryAfter time.Duration
 }
 
 func (e *Error) Error() string {
@@ -186,6 +198,98 @@ const modelNotFoundMarker = "service info not found"
 func IsModelNotFound(body string) bool {
 	return strings.Contains(body, modelNotFoundBizCode) ||
 		strings.Contains(strings.ToLower(body), modelNotFoundMarker)
+}
+
+// hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
+// `"code":` 或 `"msg":` 字段）。WAF 403 判定（IsWafBlocked）用「无业务信封」
+// 区分 APISIX WAF 拦截页（HTML/空体/纯文本）与上游业务层 403（带 code/msg
+// 信封，正常走既有分类）。不做 JSON 解析：信封存在性只需字段名命中——
+// 畸形 JSON 但含 `"msg":` 字样仍按业务响应保守处理（宁漏判 WAF 也不误罚
+// 业务 403，后者有各自的权威分类）。
+func hasBusinessEnvelope(body string) bool {
+	return strings.Contains(body, `"code":`) || strings.Contains(body, `"msg":`)
+}
+
+// IsWafBlocked 报告 403 响应是否为 WAF 拦截形态：HTTP 403 且 body 无业务信封
+// （无 `"code":`/`"msg":` JSON 字段——HTML 拦截页、空体、纯文本均命中）。
+// 带业务信封的 403（11140 request illegal 等）仍走既有分类链，不受影响。
+func IsWafBlocked(status int, body string) bool {
+	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
+}
+
+// retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
+// retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset
+// （epoch 秒或毫秒，取 now+ 剩余量）。大小写不敏感（http.Header.Get 已归一）。
+var retryAfterHeaderCandidates = []string{"Retry-After", "Retry-After-Ms", "X-Ratelimit-Reset"}
+
+// retryAfterSanity 解析结果的上限（超过视为上游异常值丢弃，回落本地计算），
+// 与 pool 的 softRateMax 默认 2h 同量级（上游不该明示比冷却封顶更长的等待）。
+const retryAfterSanity = 2 * time.Hour
+
+// ParseRetryAfter 从限流/拦截响应头解析上游明示的等待时长：依次尝试
+// Retry-After（整数秒）→ retry-after-ms（整数毫秒）→ x-ratelimit-reset
+// （纯数字按 epoch 秒/毫秒推断）。任一头缺失/非法/非正/超上限则尝试下一头；
+// 全部不可用返回 false（调用方回落既有计算值，绝不臆造等待时长）。
+func ParseRetryAfter(h http.Header) (time.Duration, bool) {
+	for _, name := range retryAfterHeaderCandidates {
+		v := strings.TrimSpace(h.Get(name))
+		if v == "" {
+			continue
+		}
+		if !isAllDigits(v) {
+			continue // 非纯数字（如 HTTP-Date）不解析，宁缺毋滥
+		}
+		n, ok := parseRetryNumber(v, name)
+		if !ok {
+			continue
+		}
+		if n <= 0 || n > retryAfterSanity {
+			continue // 非正/异常大：丢弃（回落本地计算）
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+// isAllDigits 报告 s 是否为纯数字（前置快筛，免 strconv 之后再判语义）。
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseRetryNumber 按头名口径把纯数字串折算成时长。x-ratelimit-reset 是
+// epoch 时刻而非时长：秒口径（10 位）与毫秒口径（13 位）都按「now+ 该时刻
+// 的剩余量」折算，已在过去则不可用。位数不足（8 位以下）无法判定 epoch
+// 语义的丢弃（宁缺毋滥：该族实践发 epoch，短串多半是序号之类的误用头）。
+func parseRetryNumber(v, headerName string) (time.Duration, bool) {
+	// 上限 16 位防 int64 溢出（超过 epoch 毫秒的现实量级必非法）。
+	if len(v) > 16 {
+		return 0, false
+	}
+	var n int64
+	for _, r := range v {
+		n = n*10 + int64(r-'0')
+	}
+	switch headerName {
+	case "Retry-After":
+		return time.Duration(n) * time.Second, true
+	case "Retry-After-Ms":
+		return time.Duration(n) * time.Millisecond, true
+	default: // X-Ratelimit-Reset：epoch → 剩余量
+		sec := n
+		if len(v) >= 12 { // 毫秒口径（13 位）；11 位边界按秒（误判代价是多算 1000 倍）
+			sec = n / 1000
+		}
+		remain := time.Until(time.Unix(sec, 0))
+		return remain, true
+	}
 }
 
 // ModelNotFoundMessage 返回可直接回给客户端的模型不存在消息。
@@ -331,6 +435,13 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status >= 500 {
 		return ErrServer
+	}
+	// WAF 403（无业务信封的拦截形态）：判在内容策略/参数错误/通用 4xx 之前——
+	// 这些层只认带文案的 body，WAF 空体/HTML 永远不会命中它们的 marker，
+	// 但落 ErrClient 兜底的代价是「只换号不罚」，连环 403 会放大请求量。
+	// 带信封的 403 在上方各层已有权威分类，不受影响。
+	if IsWafBlocked(status, body) {
+		return ErrWafBlock
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
