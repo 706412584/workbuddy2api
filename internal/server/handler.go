@@ -538,6 +538,15 @@ func (h *Handler) ModelsForRegion(r auth.Region) []string {
 	return out
 }
 
+// ModelDetailsForRegion 返回该区域模型的完整条目（含 credits/能力旗标等展示字段）。
+//
+// 与 ModelsForRegion 的区别：后者只要 id（供「测试连接」下拉框），本函数要全字段
+// （供面板并排展示两区差异）。**两区必须分别取**：同名模型倍率可能不同
+// （实测 deepseek-v4.1-flash：CN x0.11 / global x0.00），合并后无法区分归属。
+func (h *Handler) ModelDetailsForRegion(r auth.Region) []map[string]any {
+	return h.regionModels(r)
+}
+
 // formatCredits 归一化上游积分倍率原文为展示串（如 "x0.11"）。
 // 上游形态不统一："x0.05 credits" / "x0.11" / "x0.00 credits" 等，统一去掉
 // "credits" 后缀与空白。返回空串表示**上游未下发**（非对话模型如图像/视频），

@@ -295,12 +295,19 @@ func (h *Handler) regionModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cn, global := h.cfg.ModelsByRegion()
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"cn":        cn,
 		"global":    global,
 		"reachable": true,
 		"degraded":  len(cn) == 0 || len(global) == 0,
-	})
+	}
+	// 完整条目（含 credits 倍率等展示字段）：面板据此并排展示两区差异。
+	// 与 cn/global 的 id 数组并存而非替换——「测试连接」下拉框仍用 id 数组。
+	if h.cfg.ModelDetailsByRegion != nil {
+		dcn, dglobal := h.cfg.ModelDetailsByRegion()
+		resp["details"] = map[string]any{"cn": dcn, "global": dglobal}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ── 单账号连通性测试 ────────────────────────────────────────────────

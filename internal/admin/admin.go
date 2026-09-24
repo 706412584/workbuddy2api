@@ -53,6 +53,13 @@ type Config struct {
 	ReloadKeys func(legacy string, keys []KeyEntry)
 	// ModelsByRegion 返回两区各自可见的模型 id，供「测试连接」的模型下拉框用。
 	ModelsByRegion func() (cn, global []string)
+	// ModelDetailsByRegion 返回两区模型的完整条目（含 credits 倍率/能力旗标等
+	// 展示字段），供面板并排展示两区差异。nil = 不提供详情（面板仅显示 id）。
+	//
+	// 与 ModelsByRegion 分开是刻意的：前者是「有哪些 id」的轻量视图（下拉框够用），
+	// 后者带元数据。**两区分别返回而非合并**——同名模型倍率可能不同
+	// （实测 deepseek-v4.1-flash：CN x0.11 / global x0.00），合并即丢失归属。
+	ModelDetailsByRegion func() (cn, global []map[string]any)
 	// RunTask 立即执行一次指定任务（key 见 taskKeys），阻塞到跑完并返回一句摘要。
 	// nil = 本进程未接线调度器，「立即执行」不可用。
 	//

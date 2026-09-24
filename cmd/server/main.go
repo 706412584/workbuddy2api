@@ -198,6 +198,9 @@ func main() {
 		ModelsByRegion: func() (cn, global []string) {
 			return h.ModelsForRegion(auth.RegionCN), h.ModelsForRegion(auth.RegionGlobal)
 		},
+		ModelDetailsByRegion: func() (cn, global []map[string]any) {
+			return h.ModelDetailsForRegion(auth.RegionCN), h.ModelDetailsForRegion(auth.RegionGlobal)
+		},
 		// 立即执行一次定时任务（面板「执行」按钮）。阻塞到跑完，由 admin 放在
 		// 后台 goroutine 里调用并把「执行中／结果」透给面板。
 		//

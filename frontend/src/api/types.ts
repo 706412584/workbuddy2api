@@ -76,6 +76,19 @@ export interface ModelInfo {
   owned_by: string
   context_length: number
   max_output_tokens?: number
+  /** 本条来自哪个上游区域（同名模型两区倍率可能不同） */
+  region?: string
+  /** 积分倍率，已归一化（如 "x0.11"）。缺失 = 上游未下发，**不等于免费** */
+  credits?: string
+  name?: string
+  description?: string
+  vendor?: string
+  tags?: string[]
+  is_default?: boolean
+  supports_images?: boolean
+  supports_reasoning?: boolean
+  supports_tool_call?: boolean
+  can_disable_thinking?: boolean
 }
 
 export interface ModelList {
@@ -175,6 +188,15 @@ export interface RegionModels {
   reachable: boolean
   /** 缺少某区域的绑定密钥，该区域列表是不限区域密钥的并集（可能含另一区模型） */
   degraded: boolean
+  /**
+   * 两区模型的完整条目（含 credits 倍率等展示字段）。
+   * 后端未提供时为 undefined —— 面板退化为仅显示 id。
+   * 两区分别返回而非合并：同名模型倍率可能不同，合并即丢失归属。
+   */
+  details?: {
+    cn: ModelInfo[]
+    global: ModelInfo[]
+  }
 }
 
 /** 网关日志尾部（GET /__admin/logs）。 */
