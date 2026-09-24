@@ -558,25 +558,41 @@ type Client struct {
 	BillingBaseGl  string
 }
 
+// newDialer 构造出站拨号器（参数集中于此，供测试回读断言）。
+// Timeout 10s：对端 SYN 不回时应答时快速失败轮转换号，不干等系统 TCP 重传窗口。
+// KeepAlive 15s（原 30s）：默认 Dialer 2h 才发首个探测，NAT 黑洞里连接半死仍会被
+// 复用；15s 周期让死连接在 15~30s 内被内核掐掉（RST/ETIMEDOUT），复用侧立即感知。
+func newDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
+}
+
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
 	tr := &http.Transport{
 		// 显式配置 DialContext：零值只有 KeepAlive、没有拨号超时，
 		// 对端 SYN 不回时应答时 TCP 层可挂数分钟。
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: newDialer().DialContext,
 		// 上游走 h2（错误文案 "http2: timeout awaiting response headers"）；
 		// 自定义 DialContext 会关掉自动 h2，必须显式强制开启。
+		//
+		// 注：上游 fork 的 3d9a4cc 主张「禁 h2」（置空 TLSNextProto，理由是半死
+		// h2 流复用）。本地与之结论相反且已在生产跑通，故**保持开启**——两边都
+		// 自称有实证，本地日志从未出现该错误，不做无证据的反向切换。
 		ForceAttemptHTTP2: true,
 		// ResponseHeaderTimeout 在请求体写完后才起算，握手不在其保护范围内；
 		// 缺这条则 TLS 握手黑洞可以无限挂（ChatHTTP 无总时长兜底）。
 		TLSHandshakeTimeout: 10 * time.Second,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
+		// IdleConnTimeout 90s→30s：上游常态性掐闲置连接，90s 池里的连接多半
+		// 已死；复用侧仍有 15s keepalive 兜底识别。
+		IdleConnTimeout: 30 * time.Second,
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
+		// 注意：本值在 main.go 会被 config `header_timeout_seconds` 覆盖，此处
+		// 仅为未配置时的默认；生产取值以 config.json 为准。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{

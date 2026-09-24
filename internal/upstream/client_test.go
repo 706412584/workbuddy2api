@@ -905,3 +905,30 @@ func TestParseRetryAfter(t *testing.T) {
 		}
 	})
 }
+
+// TestTransportHardeningValues 锁定连接层加固的取值（防止无意回退）：
+// keepalive 15s / idle 30s（上游 3d9a4cc 的安全子集，两边无分歧的部分）；
+// h2 **保持开启**（本地结论与上游 fork 相反，见 New() 注释，不做无证据切换）。
+func TestTransportHardeningValues(t *testing.T) {
+	c := New()
+	tr, ok := c.ChatHTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("ChatHTTP.Transport is not *http.Transport")
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 must stay true（本地结论：不加则全部上游流量退化 HTTP/1.1）")
+	}
+	if tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout=%v want 30s（上游常态性掐闲置连接，90s 池里的多半已死）", tr.IdleConnTimeout)
+	}
+	if tr.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout=%v want 10s", tr.TLSHandshakeTimeout)
+	}
+	dialer := newDialer()
+	if dialer.KeepAlive != 15*time.Second {
+		t.Errorf("dialer.KeepAlive=%v want 15s（默认 2h 探测太晚，半死连接会被复用）", dialer.KeepAlive)
+	}
+	if dialer.Timeout != 10*time.Second {
+		t.Errorf("dialer.Timeout=%v want 10s", dialer.Timeout)
+	}
+}
