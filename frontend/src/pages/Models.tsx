@@ -49,6 +49,33 @@ function CreditsBadge({ credits }: { credits?: string }) {
   )
 }
 
+/**
+ * 跨区别名提示：说明「同名模型在另一区用的是另一个 id」。
+ *
+ * 存在的意义是消除面板上的重复行歧义：Hy4 在 cn 叫 `hy4-preview`（x0.29）、
+ * global 叫 `hy4-preview-f`（x0.00），两行展示名都是 "Hy4 preview"，
+ * 不标注就会被当成两个不同的模型。
+ *
+ * 措辞刻意写成「同名模型在 X 为 Y」而不是「X 侧为 Y」：区域徽标是按**本行 id**
+ * 判定的，本行 id 不在对区名单里时徽标是灰的。写成「X 侧为 Y」会与灰徽标打架。
+ */
+function AliasNote({ alias }: { alias: { region: string; id: string; credits?: string } }) {
+  return (
+    <span className="dim" style={{ fontSize: 11 }}>
+      同名模型在 {alias.region} 为 <span className="mono">{alias.id}</span>
+      {alias.credits !== undefined && (
+        <>
+          （
+          <span style={{ color: alias.credits === 'x0.00' ? 'var(--ok, #2e7d32)' : 'inherit' }}>
+            {alias.credits === 'x0.00' ? '免费' : alias.credits}
+          </span>
+          ）
+        </>
+      )}
+    </span>
+  )
+}
+
 /** 能力旗标：只显示有值的，紧凑排布。 */
 function Caps({ m }: { m: ModelInfo }) {
   const caps: string[] = []
@@ -95,6 +122,53 @@ export function Models({ models, keyRegion }: Props) {
     for (const m of regionModels?.details?.cn ?? []) cn.set(m.id, m)
     for (const m of regionModels?.details?.global ?? []) global.set(m.id, m)
     return { cn, global }
+  }, [regionModels])
+
+  /**
+   * 跨区别名：同一展示名在两区用了**不同的 id**。
+   *
+   * 实测 Hy4 —— cn 是 `hy4-preview`（x0.29），global 是 `hy4-preview-f`（x0.00）。
+   * 面板的倍率列按 id 关联两区，故这类模型会渲染成两行、倍率看似互不相干，
+   * 而两行的展示名又完全相同，用户看到的就是「两个一模一样的 Hy4 preview」。
+   *
+   * 只在**两区倍率不同**时标注：倍率相同则解释价值为零（如 kimi-k3-1 / kimi-k3
+   * 都是 x1.62），标注只会制造噪音。同理，两区都未下发倍率的（auto / default-model）
+   * 自然被排除——undefined === undefined。
+   *
+   * 同名 id 在一区内不唯一时放弃配对（歧义不猜，宁可少标）。实测 global 的
+   * `deepseek-v4.1-flash` 与 `deepseek-v4.1-flash-sg` 共用展示名
+   * "Deepseek-V4.1-Flash"，正属此列。
+   */
+  const crossRegionAlias = useMemo(() => {
+    const out = new Map<string, { region: string; id: string; credits?: string }>()
+    const details = regionModels?.details
+    if (!details) return out
+    const cnList = details.cn ?? []
+    const globalList = details.global ?? []
+    const globalIDs = new Set(globalList.map((m) => m.id))
+    const groupByName = (list: ModelInfo[]) => {
+      const m = new Map<string, ModelInfo[]>()
+      for (const x of list) {
+        if (!x.name) continue
+        const arr = m.get(x.name)
+        if (arr) arr.push(x)
+        else m.set(x.name, [x])
+      }
+      return m
+    }
+    const cnByName = groupByName(cnList)
+    const globalByName = groupByName(globalList)
+    for (const c of cnList) {
+      if (!c.name || globalIDs.has(c.id)) continue // 两区同 id：无需别名
+      const cnGroup = cnByName.get(c.name) ?? []
+      const globalGroup = globalByName.get(c.name) ?? []
+      if (cnGroup.length !== 1 || globalGroup.length !== 1) continue // 无对应或歧义
+      const g = globalGroup[0]
+      if (c.credits === g.credits) continue // 倍率相同：无解释价值
+      out.set(c.id, { region: 'global', id: g.id, credits: g.credits })
+      out.set(g.id, { region: 'cn', id: c.id, credits: c.credits })
+    }
+    return out
   }, [regionModels])
 
   const rows = useMemo(() => {
@@ -181,6 +255,8 @@ export function Models({ models, keyRegion }: Props) {
                   const hasDetails = regionModels?.details !== undefined
                   // 单区模型直接显示该区倍率；两区都有则并排显示（可能不同）
                   const bothRegions = cn && global && hasDetails
+                  // 该 id 在另一区的对应 id（仅当跨区 id 不同且倍率有差异时存在）
+                  const alias = crossRegionAlias.get(m.id)
                   return (
                     <tr key={m.id}>
                       <td className="mono" style={{ color: 'var(--text-strong)' }}>
@@ -221,7 +297,15 @@ export function Models({ models, keyRegion }: Props) {
                             <CreditsBadge credits={globalDet?.credits} />
                           </div>
                         ) : (
-                          <CreditsBadge credits={(cnDet ?? globalDet)?.credits} />
+                          // 有跨区别名时改用纵向堆叠：倍率一行、提示一行。
+                          // 横排会被窄列挤成从句中折断，可读性差。
+                          <div
+                            className="row"
+                            style={{ flexDirection: alias ? 'column' : 'row', flexWrap: 'nowrap', gap: alias ? 2 : 8, alignItems: 'flex-start' }}
+                          >
+                            <CreditsBadge credits={(cnDet ?? globalDet)?.credits} />
+                            {alias && <AliasNote alias={alias} />}
+                          </div>
                         )}
                       </td>
                       <td className="mono">{fmtTokens(m.context_length)}</td>
@@ -245,6 +329,8 @@ export function Models({ models, keyRegion }: Props) {
           {regionModels.details
             ? ' 两区都有的模型并排显示各自倍率 —— 同名模型两区倍率可能不同（如 deepseek-v4.1-flash 在 cn 与 global 就不一样）。'
             : ''}
+          {crossRegionAlias.size > 0 &&
+            ' 少数模型两区用了不同的 id（如 Hy4：cn 是 hy4-preview、global 是 hy4-preview-f），会各自成行，行内已注明同名模型在对区的 id 与倍率；注意区域徽标只按本行 id 判定，故这类行会有一枚徽标是灰的。'}
           <b>「—」表示上游未下发倍率，不等于免费</b>（图像/视频类模型常见）。
           {regionModels.degraded &&
             ' 缺少某区域的绑定密钥，该区域一列取自「不限区域」密钥的并集，可能把另一区的模型也算进来 —— 仅供参考。'}
