@@ -514,6 +514,31 @@ export ANTHROPIC_API_KEY=<你的 cn 或 global 密钥>
 
 ## 部署运维
 
+### 预编译二进制（Release）
+
+不想装 Go / Docker 时，直接从 [Releases](https://github.com/706412584/workbuddy2api/releases) 下载对应平台压缩包：
+
+| 平台 | 包名 |
+|---|---|
+| Linux x86_64 | `wb2api-<tag>-linux-amd64.tar.gz` |
+| Linux ARM64 | `wb2api-<tag>-linux-arm64.tar.gz` |
+| Windows x86_64 | `wb2api-<tag>-windows-amd64.zip` |
+
+每个包内含 5 个二进制：**wb2api**（主服务）、**login**、**credit**、**signin_bin**、**activity**（一次性活跃上报触发器）。解压后单层目录，Windows 版带 `.exe` 后缀。
+
+```bash
+# 校验产物（在包所在目录）
+sha256sum -c SHA256SUMS
+tar -xzf wb2api-v1.0.0-linux-amd64.tar.gz
+cd wb2api-v1.0.0-linux-amd64
+cp /path/to/config.example.json config.json   # 填好 api_key 等
+./wb2api -config config.json
+```
+
+**注意**：包内**不含** `login.sh` / `signin.sh` / `credit.sh` 与 `config.json`——这三个脚本在仓库根目录（`.sh` 在 Windows 下需 Git-Bash / WSL），配置文件请从 `config.example.json` 复制后自行填写。
+
+发布由 `.github/workflows/release.yml` 完成：打 `v*` tag 自动构建并建 Release；也可在 Actions 页手动触发（手动触发只产 artifact，不建 Release，用于预演）。
+
 ### Docker 镜像
 
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
@@ -559,9 +584,10 @@ export ANTHROPIC_API_KEY=<你的 cn 或 global 密钥>
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **预编译产物由 GitHub Actions 构建**：打 `v*` tag 触发 `.github/workflows/release.yml`，产出 linux/amd64、linux/arm64、windows/amd64 三个平台的原生二进制包（各含 `wb2api` / `login` / `credit` / `signin_bin` / `activity`）并附 `SHA256SUMS`；容器镜像由 `.github/workflows/build.yml` 多架构构建推送 ghcr.io。两者均由仓库内工作流生成，非手工上传
+- **产物可校验**：每个 Release 附 `SHA256SUMS`，下载后在该目录执行 `sha256sum -c SHA256SUMS` 即可核对。`go.sum` 仅约束 Go 模块依赖
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
+- **自行构建仍受支持**：不信任预编译产物时，按上文「源码构建」本地编译（`go build ./...`），或 `docker compose build` 自建镜像
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界

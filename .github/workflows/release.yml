@@ -1,0 +1,160 @@
+# release.yml 多平台原生二进制发布（linux amd64/arm64 + windows amd64）。
+#
+# 与 build.yml 的分工：build.yml 管**容器**（多架构镜像 → ghcr.io + amd64 离线 tar），
+# 本工作流管**裸机原生二进制**（解压即用，不依赖 Docker）。两者互不覆盖。
+#
+# 触发：
+#   - push v* tag  → 构建 + 建 GitHub Release（附全部平台包 + SHA256SUMS）
+#   - workflow_dispatch → 只构建、只产 Actions artifact，**不建 Release**
+#     （预演用：想验证工作流能否跑通而不产生正式发布时走这条）
+#
+# 不跑 go test：仓库基线存在 2 个已知失败用例（TestPickAntiThunderingHerd、
+# TestChatStatsReaderTokensFromUsage），把测试设为发布门禁会让每次发布永久卡死。
+# 测试留给 build.yml 之外的 CI，本工作流只负责「能编译出可用产物」。
+name: Release Binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# 权限按作业拆分（最小权限）：
+#   build   只需读源码 → contents: read
+#   release 需读产物 + 建 Release → actions: read + contents: write
+# 显式声明 permissions 后未列出的 scope 一律为 none，故不能只靠默认值。
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    strategy:
+      # 一个平台失败不取消其余平台：便于一次性看清全部平台的编译状况。
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, ext: '',    fmt: tar.gz }
+          - { goos: linux,   goarch: arm64, ext: '',    fmt: tar.gz }
+          - { goos: windows, goarch: amd64, ext: '.exe', fmt: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      # go-version-file 让 CI 与仓库声明的 Go 版本（go.mod 的 go 1.22.5）强一致，
+      # 避免 runner 默认版本漂移导致「本地能编、CI 编不过」。
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 版本号：tag 触发取 tag 名，手动触发取 dev-<短 sha>。
+      # is_release 控制 release 作业是否执行（手动触发不发布）。
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 五个二进制一次编齐。命令与 README「源码构建」章节、Dockerfile 第 8-11 行
+      # 逐字一致（同一套 -trimpath -ldflags="-s -w" CGO_ENABLED=0）。
+      # Windows 的 .exe 后缀由 Go 自动追加，但这里显式拼 ext 以保证产物名确定。
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          while IFS=: read -r name pkg; do
+            CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "dist/${name}${EXT}" "$pkg"
+          done <<'EOF'
+          wb2api:./cmd/server
+          login:./cmd/login
+          credit:./cmd/credit
+          signin_bin:./cmd/signin
+          activity:./cmd/activity
+          EOF
+          ls -l dist
+
+      # 打成单层目录的压缩包（wb2api-v1.0.0-linux-amd64/wb2api），
+      # 避免解压时把二进制散落到当前目录。
+      - name: Package
+        id: pkg
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="wb2api-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$NAME"
+          cp dist/* "$NAME/"
+          if [[ "${{ matrix.fmt }}" == "zip" ]]; then
+            zip -r "${NAME}.zip" "$NAME"
+            echo "file=${NAME}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${NAME}.tar.gz" "$NAME"
+            echo "file=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.file }}
+          path: ${{ steps.pkg.outputs.file }}
+          if-no-files-found: error
+          # 包内含可执行文件，90 天（默认）足够；需要长期留存看 Release。
+          retention-days: 90
+
+  # 仅在 tag 触发时执行：汇总各平台产物 + 生成校验和 + 建 Release。
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    permissions:
+      actions: read # download-artifact 读本工作流产物所需
+      contents: write # 建 Release / 上传资产所需
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # 校验和：README「发布来源与合规边界」曾写「无产物校验和」，
+      # 现补上，便于下载方验证产物未被篡改。
+      #
+      # 两个已实测的坑，写法不能随意改：
+      #  1. 不能用 `./*`——sha256sum 逐字回显参数，会写出 `./wb2api-...` 前缀，
+      #     校验方在别处跑 `sha256sum -c` 时因路径不符全部失败。
+      #  2. 不能用 `*`——SHA256SUMS 自身也匹配 `*`。本工作流可重跑（补发资产），
+      #     重跑时它已存在，会被写进自己的清单，而其内容又随清单变化，
+      #     下载方校验必然失败。故显式限定 `wb2api-*`。
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum wb2api-* > SHA256SUMS
+          cat SHA256SUMS
+          # 防呆：包个数须与 build 矩阵的平台数一致（当前 3）。少一个即说明
+          # download-artifact 没取全，此时宁可让发布失败，也不要发出残缺的 Release。
+          # **加平台时必须同步改这里的数字。**
+          test "$(wc -l < SHA256SUMS)" -eq 3
+
+      # 幂等：Release 已存在（重跑工作流 / 补发资产）则只覆盖上传，不报错中断。
+      #
+      # GH_REPO 必须显式给：本作业**没有 checkout**（发布不需要克隆源码），
+      # 而 gh 默认靠当前目录的 git remote 推断仓库——没有工作副本时推断失败。
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
