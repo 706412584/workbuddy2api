@@ -13,6 +13,15 @@ type CoolKind int
 const (
 	CoolHard CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
 	CoolSoft                 // 429 → 短冷却
+	// CoolSafety 403 + 11140 内容安全封控（ErrSafetyBanned）→ 长冷却。
+	//
+	// 与 CoolHard 的共性是「长且不参与指数退避」，但两者的**恢复出口不同**：
+	//   - CoolHard 由签到解冻（ReenableIfCredits）：余额恢复 = 账号恢复；
+	//   - CoolSafety 不被签到解冻——余额与内容安全风控无关，签到成功不能证明
+	//     该号 chat 通道已解封。恢复出口只剩「冷却到期」「面板重置」「测试连接通过」。
+	// 同样不参与全冷却兜底（pickEarliestExpiryLocked 与 CoolHard 一同排除）：
+	// 兜底选到它只会再吃一个 403，白费一轮并放大请求量。
+	CoolSafety
 )
 
 func (k CoolKind) String() string {
@@ -21,6 +30,8 @@ func (k CoolKind) String() string {
 		return "hard_credit"
 	case CoolSoft:
 		return "soft_rate"
+	case CoolSafety:
+		return "safety_banned"
 	}
 	return "unknown"
 }
@@ -80,6 +91,13 @@ type entry struct {
 	// 运行态语义（不持久化，与 inFlight 同语义）：重启清零可接受——重启后首个 keepalive
 	// 成功即清计数，误判号不会因重启前的历史累积被继续追杀。
 	sessionDeadFails int
+	// safetyBannedFails 连续 ErrSafetyBanned（403 + 11140 + request illegal）计数，
+	// 语义与 sessionDeadFails 同构：内容审核可能按账号判（账号级终态，该罚），
+	// 也可能被某条用户内容触发（对所有账号都命中）——后者若一次即长冷却，
+	// 一个用户就能在几分钟内把整池账号逐个罚停。故连续 safetyBannedThreshold
+	// 次才判为账号级。运行态语义（不持久化，与 inFlight/sessionDeadFails 同）。
+	// 由 pool.NoteSafetyBanned 累计，见 state.go。
+	safetyBannedFails int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
@@ -241,8 +259,18 @@ const sessionDeadThreshold = 3
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"
 
+// safetyBannedThreshold 连续 ErrSafetyBanned（403 + 11140 + request illegal）达到该次数
+// 才判为账号级内容安全封控。取 3 与 sessionDeadThreshold 同口径：既容忍「某条用户内容
+// 触发审核」这类请求侧命中（不因一两次误伤杀号），又能让真正的账号级封控在几次尝试内
+// 被摘出池子。注意尝试次数不等于请求数——同一请求内 `tried` 会排除已失败的号，
+// 故阈值 3 通常需跨 3 个请求达成（其间该号由 45~75s 的短冷却挡在轮换之外）。
+const safetyBannedThreshold = 3
+
 // SessionDeadThreshold 暴露连续 12153 的禁用阈值（供 scheduler 日志/运维文档引用）。
 func SessionDeadThreshold() int { return sessionDeadThreshold }
+
+// SafetyBannedThreshold 暴露连续 11140 的判定阈值（供 server 日志引用）。
+func SafetyBannedThreshold() int { return safetyBannedThreshold }
 
 // softStreakShiftMax 软冷却退避的最大左移位数（防 1<<streak 溢出成负数/零）。
 // 无论 streak 累积多少，封顶逻辑总会先生效，此值只是溢出兜底。

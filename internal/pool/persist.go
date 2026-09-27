@@ -83,8 +83,7 @@ func (p *Pool) RestoreFromSnapshot() {
 	log.Printf("[pool] 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
-// Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
-// 必须在成功 Pick 后调用；调用方负责 defer Release。
+// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘。
 func (p *Pool) startFlusher() {
 	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
 	go func() {
@@ -92,6 +91,13 @@ func (p *Pool) startFlusher() {
 		defer t.Stop()
 		for range t.C {
 			p.mu.Lock()
+			if p.frozen {
+				// 已冻结（零停机交接的旧进程）：停写。此时新进程已接管同一个
+				// state.json，旧进程继续落盘会用自己的内存快照覆盖新进程刚写入的
+				// 状态——交接窗口内旧进程状态只会更旧，覆盖即数据回退。
+				p.mu.Unlock()
+				continue
+			}
 			if p.dirty.Swap(false) {
 				p.saveLocked()
 			}
@@ -103,9 +109,24 @@ func (p *Pool) startFlusher() {
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
+	if p.frozen {
+		p.mu.Unlock()
+		return
+	}
 	if p.dirty.Swap(false) {
 		p.saveLocked()
 	}
+	p.mu.Unlock()
+}
+
+// FreezePersist 冻结落盘：此后 Flush 与后台 flusher 都不再写 state.json。
+//
+// 专供零停机交接：新进程接管监听后，旧进程必须立刻停写，否则它退出前的那次
+// Flush 会把交接窗口内**自己那份较旧的内存状态**写回，覆盖新进程已落盘的更新状态。
+// 只影响持久化，不影响服务：旧进程继续把在途请求跑完。
+func (p *Pool) FreezePersist() {
+	p.mu.Lock()
+	p.frozen = true
 	p.mu.Unlock()
 }
 

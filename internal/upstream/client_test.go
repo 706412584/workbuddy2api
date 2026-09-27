@@ -94,6 +94,14 @@ func TestClassify(t *testing.T) {
 		{400, `unapproved channel`, ErrContentBlocked},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
+		// 账号级内容安全封控（403 + 11140 + request illegal，2026-09-27 生产原文）：
+		// 必须与下面同码的限流文案分开——11140 是复用码，只看 code 会把限流判成封禁。
+		{403, `{"code":11140,"msg":"request illegal","requestId":"x","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试"}}`, ErrSafetyBanned},
+		{403, `{"code":11140,"msg":"Request Illegal"}`, ErrSafetyBanned}, // msg 大小写不敏感
+		// 同码不同义：11140 的限流形态仍归 ErrSoftRate（softRateMarkers 先接住）。
+		{403, `{"code":11140,"msg":"The model provider is rate-limiting requests."}`, ErrSoftRate},
+		// 非 403 的 11140 request illegal 不判封控（形态必须完整），落通用 4xx。
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
 		// 这是"发给上游的 body 有问题"（网关截断已由 413 消灭，剩余为客户端畸形 JSON），
 		// 换了账号也一样 400，不罚号。具体词优先于通用 4xx。

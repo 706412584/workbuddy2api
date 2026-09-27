@@ -694,6 +694,10 @@ func firstFrame(rc io.Reader) (firstEvent, message string, ok bool) {
 
 // parseUpstreamError 从上游错误体里取业务码与文案。
 // 逐层取第一个非空值，对应原先的 e?.error?.data?.code ?? e?.code ?? 0。
+//
+// msg 与 message 都要取：上游业务信封用 `"msg"`（如 {"code":11140,"msg":"request illegal"}），
+// 而 OAuth/billing 侧的报错用 `"message"`。只认 message 会让业务信封的文案丢失，
+// 使 diagnoseUpstreamCode 拿不到判据（11140 的封控/限流两种形态正是靠 msg 区分的）。
 func parseUpstreamError(raw []byte) (code int, message string) {
 	var e map[string]any
 	if json.Unmarshal(raw, &e) != nil {
@@ -701,7 +705,8 @@ func parseUpstreamError(raw []byte) (code int, message string) {
 	}
 	errObj, _ := e["error"].(map[string]any)
 	data, _ := errObj["data"].(map[string]any)
-	return firstInt(data["code"], e["code"]), firstStr(data["message"], errObj["message"], e["message"])
+	return firstInt(data["code"], e["code"]),
+		firstStr(data["message"], data["msg"], errObj["message"], errObj["msg"], e["message"], e["msg"])
 }
 
 func firstInt(vals ...any) int {
@@ -744,6 +749,15 @@ func diagnoseUpstreamCode(code int, message string) string {
 		return "模型不存在（11102）。该模型不在本账号所属区域的模型表里 —— 例如 intl 区没有 deepseek-v4-flash / deepseek-v4-pro。"
 	case 11133:
 		return "模型拒绝了请求参数（11133）。该模型对请求格式有额外要求，换一个模型通常就能通 —— 不代表账号有问题。"
+	case 11140:
+		// 11140 是复用码：限流与安全封控都用它，靠 msg 区分（见 upstream.IsSafetyBanned）。
+		if strings.Contains(strings.ToLower(message), "request illegal") {
+			return "账号级内容安全封控（11140 request illegal）。上游对**这个账号**的 chat 通道返回「内容未通过安全审核」，" +
+				"与请求内容无关（最小探针同样被拒），重新登录也不会解除。该账号已被网关长冷却（默认 6 小时），" +
+				"期间不再参与轮换；到期后自动回到池中，也可在面板「重置」或测试连通后立即恢复。" +
+				"若持续被拒，请到上游官网提交申诉。"
+		}
+		return "上游限流（11140）。该模型此刻繁忙，账号本身没问题，稍后重试。"
 	case 6004:
 		return "上游限流（6004）。该模型此刻繁忙，账号本身没问题，稍后重试。"
 	default:

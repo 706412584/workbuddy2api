@@ -133,6 +133,20 @@ const notFoundCooldown = 60 * time.Second
 // 窗口滑过，指数升级由 Cooldown 既有机制接管。
 const wafCooldownBase = 60 * time.Second
 
+// safetyBannedCooldown 账号级内容安全封控（403 + 11140 + request illegal）的冷却时长。
+//
+// 为什么是 6 小时而不是像 WAF 那样的分钟级：WAF 403 是 IP/指纹维频控，账号本身健康，
+// 几十秒后换号就能过；而本形态是**账号级**判定，2026-09-27 实测同一账号持续被拒
+// 超过 15 小时、重新登录（换 session）也不解除。分钟级冷却只会让它在几十分钟后回到池中
+// 再吃一轮 403，把每个正常请求拖掉一个 MaxRotate 名额。
+//
+// 为什么是「长冷却」而不是 Disable：Disable 是终态，只能靠面板手工复活；而本形态有
+// 自愈可能（上游风控窗口滑动后自行放行），且它未必是「账号坏了」——用户的某条内容
+// 就足以触发。长冷却给出自愈出口，同时用足够长的窗口把死号挡在池外。
+//
+// 抖动 ±25%（复用 jitterDur）：风控常批量命中多个账号，齐步走到期会再次聚团撞墙。
+const safetyBannedCooldown = 6 * time.Hour
+
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -1068,6 +1082,19 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		return nil
 	}
 
+	// 账号级内容安全封控：轮换耗尽时若最后一个错误是它，必须给出「账号被上游风控」
+	// 的明确文案，而不是通用分支的「账号可用，但上游拒绝了每次尝试」——那句会把排查
+	// 方向引向请求体/参数，而真相在账号侧（2026-09-27 面板显示「上游错误 11140」时
+	// 就是这种误导）。状态码仍 503：对客户端而言本轮确实没有可用账号。
+	if ue := (*upstream.Error)(nil); errors.As(lastErr, &ue) && ue.Kind == upstream.ErrSafetyBanned {
+		msg := "account blocked by upstream content-safety review (403 code=11140 request illegal); " +
+			"the account was put on a long cooldown and will not be retried until it expires"
+		log.Printf("WARN: [server] safety-banned exhausted model=%s: %s", o.model, msg)
+		writeErr(w, http.StatusServiceUnavailable, "account_safety_banned", msg)
+		st.status = http.StatusServiceUnavailable
+		return nil
+	}
+
 	// 轮换耗尽有两种截然不同的原因，必须分开表述，否则会把排查方向带偏：
 	//   - lastErr == nil：真的没有可尝试的账号（区域无账号 / 全冷却 / 全禁用）。
 	//   - lastErr != nil：账号是好的，但每次尝试都被上游拒绝（如 400 消息格式错误）。
@@ -1186,18 +1213,24 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 七条路径，各司其职：
+// 八条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
 //     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
 //     封顶 soft_rate_max，记录触发模型供切模型豁免）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrSafetyBanned → CooldownSafetyBanned(safetyBannedCooldown 固定 6h)：账号级内容安全
+//     封控，长冷却。**不 Disable**——该形态有自愈可能（风控窗口滑动），且未必是账号坏了
+//     （用户单条内容即可触发）；长冷却既给自愈出口，又把死号挡在池外。不走指数退避、不喂熔断。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrServer → 不罚账号（无冷却/熔断/NoteError，同 ErrClient 待遇），但仍轮转。
 //     上游 5xx 是「上游此刻病了」而非「这个号坏了」：喂熔断会把健康号逐批误杀。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
+//
+// ErrSafetyBanned 与 ErrContentBlocked 都带「内容审核」语义但方向相反，不可合并：
+// 前者 403 账号侧终态（本函数罚），后者 400 请求侧误报（本函数不罚，走降级重试）。
 //
 // ErrContextExceeded 不在此表：调用方在进入轮换前就把它拦下并直接回 400
 // （换号改变不了请求体，窗口是模型属性），故本函数不会收到该分类。
@@ -1234,6 +1267,22 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 基数经 jitterDur 抖动（复用 backoff.go 单一抖动来源，防多账号同相位
 		// 冷却到期再聚团）；指数升级/封顶由 Cooldown(CoolSoft) 既有机制接管。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "waf 403")
+	case upstream.ErrSafetyBanned:
+		// 账号级内容安全封控（403 + 11140 + request illegal）。
+		//
+		// 两段式，与 ErrSessionDead 的连续计数同构：
+		//   - 未达阈值 → 短冷却（safetyBannedCooldown 的一个软冷却），把该号暂时移出
+		//     轮换，既不放大请求量，也不因「某条用户内容触发审核」而误罚整池；
+		//   - 达阈值（连续 safetyBannedThreshold 次）→ 长冷却（CooldownSafetyBanned）。
+		// 计数的清零出口见 pool.ClearSafetyBanned（成功/测试通过/重置/人工复活）。
+		if h.cfg.Pool.NoteSafetyBanned(uid) {
+			d := jitterDur(safetyBannedCooldown)
+			log.Printf("WARN: [server] safety-banned uid=%s model=%s: 连续 %d 次 11140 request illegal — 长冷却 %s",
+				logfmt.UID8(uid), model, pool.SafetyBannedThreshold(), d.Round(time.Second))
+			h.cfg.Pool.CooldownSafetyBanned(uid, d, "11140 request illegal")
+			return
+		}
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "11140 request illegal (pending)")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

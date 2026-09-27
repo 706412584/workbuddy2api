@@ -153,6 +153,30 @@ func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 
+// CooldownSafetyBanned 账号级内容安全封控（403 + 11140 + request illegal）的专用冷却入口。
+//
+// 与 Cooldown 的两点差异，都是刻意为之：
+//  1. **不走指数退避**。该形态不是「频率/用量」信号，退避放大没有意义；上游也没有
+//     明示恢复时刻，任何时长都是猜。故按调用方给定的固定 d 冷却，并复用 jitterDur
+//     抖动打散多账号同相位（风控往往是批量命中，齐步走到期会再次聚团撞墙）。
+//  2. **不发熔断信号**。熔断器的指数升级（30m→1h→2h→6h）是给「反复失败的病态号」
+//     设计的，而本形态一次触发就已经是终态——再叠一层数小时的熔断只会让恢复出口
+//     更难走（熔断不被签到/重置之外的路径清）。账号已经在长冷却里，无需第二把锁。
+//
+// 清 softRateModel：与 Cooldown 同理，避免上一次 6004 的模型豁免痕迹泄漏到本次
+// 账号级冷却上（否则换模型请求会错误绕过）。
+func (p *Pool) CooldownSafetyBanned(uid string, d time.Duration, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.until = time.Now().Add(d)
+		e.coolKind = CoolSafety
+		e.reason = reason
+		e.softRateModel = ""
+		p.dirty.Store(true)
+	}
+}
+
 // nextDay4AM 返回 now 之后最近的一个 04:00（与 now 同一时区）。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，
 // 该窗内触发的硬冷却等当天签到即可恢复；返回次日会白冷约一天。

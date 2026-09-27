@@ -15,6 +15,8 @@ type Pool struct {
 	byUID   map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
+	// frozen 冻结落盘（FreezePersist 置位，见其注释）。持 p.mu 读写。
+	frozen bool
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter

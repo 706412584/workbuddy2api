@@ -58,7 +58,46 @@ func (p *Pool) ClearSessionDead(uid string) {
 	}
 }
 
-// ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数，
+// NoteSafetyBanned 记录一次 ErrSafetyBanned（403 + 11140 + request illegal）连续计数。
+//
+// **为什么不一次就上长冷却**：上游该响应的 displayMsg 是「内容未通过安全审核」，
+// 而内容审核同时存在「按账号判」与「按内容判」两种触发面。2026-09-27 实测证明前者
+// 存在（同一 body 换健康账号即 200、最小探针同样 403、重登不解除）；但后者同样可能
+// ——若某条用户内容对所有账号都触发审核，一次即长冷却会让**一个用户**在几分钟内
+// 把整个池逐个罚停（每次请求可轮换到 MaxRotate 个账号）。
+// 故与 sessionDeadFails 同构：连续累计到 safetyBannedThreshold 才判为账号级终态，
+// 期间用短冷却把该号暂时移出轮换，既不放大请求量，也不因单条内容误伤整池。
+//
+// 返回 true 表示本次已达阈值（调用方据此施加长冷却）；阈值达成后计数清零，
+// 下一轮从零重新累计（若长冷却到期后仍持续命中，会再次快速触顶）。
+func (p *Pool) NoteSafetyBanned(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.safetyBannedFails++
+	if e.safetyBannedFails < safetyBannedThreshold {
+		return false
+	}
+	e.safetyBannedFails = 0
+	return true
+}
+
+// ClearSafetyBanned 清连续 11140 计数——账号被证明 chat 通道可用的时刻调用：
+// chat 成功（NoteSuccess）、面板测试通过（NoteTestOK）、面板重置（Reset）、
+// 人工复活（ReviveDisabled）。**不含** token refresh：刷新只证明凭证有效，
+// 与内容安全风控无关（签到/余额接口对该形态全程正常，见 ReenableIfCredits 注释）。
+func (p *Pool) ClearSafetyBanned(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.safetyBannedFails = 0
+	}
+}
+
+// ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数 + 连续 11140 计数，
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
 // 直到被本方法复活。不存在的 uid 为空操作。
@@ -69,6 +108,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+		e.safetyBannedFails = 0
 		p.dirty.Store(true)
 	}
 }
@@ -78,12 +118,18 @@ func (p *Pool) ReviveDisabled(uid string) {
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
 // softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
 // 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
+//
+// **CoolSafety 例外**：内容安全封控（403 + 11140）与余额无关，签到/余额接口全程正常
+// 也可能持续被拒（2026-09-27 实测该号签到正常、chat 连续 403 达 15 小时）。若在此
+// 一并清掉，签到任务每天 09:00/21:00 会把封控号重新放回池中，恰好制造它最擅长的
+// 那类失败。故保留其冷却，等它自然到期或由面板重置/测试连接通过解除。
 // 调用方必须已持有 p.mu。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		if remain > 0 && !e.disabled {
+		stillCooling := e.coolKind == CoolSafety && !e.until.IsZero() && time.Now().Before(e.until)
+		if remain > 0 && !e.disabled && !stillCooling {
 			p.reviveCoolingLocked(e, remain)
 		} else {
 			e.credits = remain
@@ -159,6 +205,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.safetyBannedFails = 0
 		p.dirty.Store(true)
 	}
 }
@@ -203,12 +250,15 @@ func (p *Pool) Reset(uid string, includeDisabled bool) (before, after string) {
 	}
 
 	e.until = time.Time{}
+	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
+	e.softRateModel = ""
 	e.breakerUntil = time.Time{}
 	e.fails = 0
 	e.retryCount = 0
 	e.sessionDeadFails = 0
+	e.safetyBannedFails = 0
 	if includeDisabled {
 		e.disabled = false
 	}
@@ -242,6 +292,7 @@ func (p *Pool) NoteTestOK(uid string) {
 	e.fails = 0
 	e.retryCount = 0
 	e.sessionDeadFails = 0
+	e.safetyBannedFails = 0
 	p.dirty.Store(true)
 }
 

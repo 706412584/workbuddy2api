@@ -168,7 +168,8 @@ func (p *Pool) pick(tried map[string]bool, reqModel string, pred func(*auth.Auth
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
-// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
+// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）与 CoolSafety（内容安全封控号）
+// 同样排除——前者调了必 402，后者调了必 403，都是浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 // pred（可 nil）同样作用于兜底：区域受限请求在全员冷却时不得越区兜底。
@@ -181,8 +182,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, pred func(*auth.A
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
 		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		if (e.coolKind == CoolHard || e.coolKind == CoolSafety) && !e.until.IsZero() && now.Before(e.until) {
+			continue // 余额耗尽号 / 内容安全封控号不参与兜底：前者必 402，后者必 403
 		}
 		if p.inFlightFull(e) {
 			continue

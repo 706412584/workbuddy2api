@@ -1153,6 +1153,67 @@ func TestFlushIdempotentWhenClean(t *testing.T) {
 	}
 }
 
+// TestFreezePersistStopsFlush 冻结后 Flush 不得写盘 —— 这是零停机交接的关键约束：
+// 新进程已接管同一个 state.json，旧进程退出前若再落盘，会用自己那份较旧的内存状态
+// 覆盖新进程刚写入的状态（数据回退）。
+func TestFreezePersistStopsFlush(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 10)
+	p.Flush() // 先落一次，确认文件存在且可写
+
+	// 模拟新进程改写了状态文件。
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":99}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 旧进程冻结后再改内存并 Flush：文件必须保持新进程写的内容。
+	p.FreezePersist()
+	p.SetCredits("u1", 1)
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "99") {
+		t.Fatalf("冻结后仍写盘，覆盖了新进程的状态：%s", raw)
+	}
+}
+
+// TestFreezePersistStopsBackgroundFlusher 后台 flusher 同样必须停写。
+func TestFreezePersistStopsBackgroundFlusher(t *testing.T) {
+	old := flushInterval
+	flushInterval = 20 * time.Millisecond
+	defer func() { flushInterval = old }()
+
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 10)
+	p.Flush()
+
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":99}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.FreezePersist()
+	p.SetCredits("u1", 1) // 置 dirty，诱使后台 flusher 写盘
+
+	// 等几个 flush 周期。
+	time.Sleep(200 * time.Millisecond)
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "99") {
+		t.Fatalf("冻结后后台 flusher 仍写盘：%s", raw)
+	}
+}
+
 func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 	// stateFp 的父路径是一个普通文件（非目录）→ MkdirAll/WriteFile 必失败，
 	// root 也不可绕过，可靠地触发落盘失败路径。
@@ -1396,6 +1457,83 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 	p.Cooldown("h2", CoolHard, 2*time.Hour, "x")
 	if got := p.Pick(); got != nil {
 		t.Fatalf("all-hard should return nil, got %+v", got)
+	}
+}
+
+// TestFallbackSkipsSafetyBanned 内容安全封控（CoolSafety）号不参与兜底：
+// 调了必 403，白费一轮轮换并把请求量放大。
+func TestFallbackSkipsSafetyBanned(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "banned"})
+	p.CooldownSafetyBanned("banned", time.Hour, "11140 request illegal")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("safety-banned account must not be fallback-picked, got %+v", got)
+	}
+}
+
+// TestSafetyBannedNotRevivedByCheckin 签到解冻不得清掉内容安全封控：
+// 该形态与余额无关（2026-09-27 实测签到/余额接口全程正常，chat 仍持续 403）。
+// 若在此被清，签到任务每天两次会把封控号放回池中反复撞墙。
+func TestSafetyBannedNotRevivedByCheckin(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSafetyBanned("u1", time.Hour, "11140 request illegal")
+	p.ReenableIfCredits("u1", 500) // 签到成功 + 余额充足
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "safety_banned" {
+		t.Fatalf("checkin must not clear CoolSafety: %+v", st)
+	}
+	if st.Credits != 500 {
+		t.Errorf("credits=%d want 500（余额仍应回填）", st.Credits)
+	}
+	// 对照组：普通硬冷却照旧被签到解冻。
+	p.Add(&auth.Auth{UID: "u2"})
+	p.Cooldown("u2", CoolHard, time.Hour, "余额不足")
+	p.ReenableIfCredits("u2", 500)
+	if st2, _ := p.Status("u2"); st2.Cooling {
+		t.Errorf("hard cooldown should still be revived by checkin: %+v", st2)
+	}
+}
+
+// TestNoteSafetyBannedThreshold 连续计数达到阈值才判为账号级封控：
+// 单次命中（可能是用户某条内容触发审核）不得直接长冷却整个池。
+func TestNoteSafetyBannedThreshold(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	for i := 1; i < SafetyBannedThreshold(); i++ {
+		if p.NoteSafetyBanned("u1") {
+			t.Fatalf("call %d: 未达阈值不应判定成立（阈值 %d）", i, SafetyBannedThreshold())
+		}
+	}
+	if !p.NoteSafetyBanned("u1") {
+		t.Fatalf("连续 %d 次后应判定成立", SafetyBannedThreshold())
+	}
+	// 判定成立后计数清零：下一轮从零重新累计。
+	if p.NoteSafetyBanned("u1") {
+		t.Error("阈值达成后计数应清零，下一次不应立即再次成立")
+	}
+}
+
+// TestClearSafetyBanned 成功/测试通过/重置/人工复活都清连续 11140 计数。
+func TestClearSafetyBanned(t *testing.T) {
+	for _, clear := range []struct {
+		name string
+		fn   func(*Pool, string)
+	}{
+		{"NoteSuccess", func(p *Pool, uid string) { p.NoteSuccess(uid) }},
+		{"NoteTestOK", func(p *Pool, uid string) { p.NoteTestOK(uid) }},
+		{"Reset", func(p *Pool, uid string) { p.Reset(uid, true) }},
+		{"ClearSafetyBanned", func(p *Pool, uid string) { p.ClearSafetyBanned(uid) }},
+	} {
+		p := New("")
+		p.Add(&auth.Auth{UID: "u1"})
+		for i := 0; i < SafetyBannedThreshold()-1; i++ {
+			p.NoteSafetyBanned("u1")
+		}
+		clear.fn(p, "u1")
+		if p.NoteSafetyBanned("u1") {
+			t.Errorf("%s: 计数未清零（应需再累计 %d 次才成立）", clear.name, SafetyBannedThreshold())
+		}
 	}
 }
 

@@ -418,6 +418,102 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	}
 }
 
+// TestChatSafetyBannedEventuallyLongCools 端到端回归 2026-09-27 生产事故：
+// 上游对某账号的 chat 通道持续返回 403 + 11140 + request illegal
+// （displayMsg「内容未通过安全审核」）。修复前 Classify 归 ErrClient →
+// applyErrorPolicy 走 default「只换号不罚」，该死号在 15 小时内被反复选中 50 次，
+// 每个请求白吃一个 MaxRotate 名额，把正常请求拖成 503。
+//
+// 修复后：未达阈值先短冷却（挡在轮换之外），连续达到阈值转长冷却，
+// 且该号不再被任何后续请求选中。
+func TestChatSafetyBannedEventuallyLongCools(t *testing.T) {
+	const bannedBody = `{"code":11140,"msg":"request illegal","requestId":"x",` +
+		`"displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试"}}`
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 403, bannedBody, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000) // 让 bad 被先选中（确定性手法，同 TestChatSoftCoolsOnRateLimitBody）
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2})
+
+	req := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		return rec
+	}
+	// 第一轮：bad 被尝试 1 次（吃到 403），随后被短冷却挡在轮换之外，good 兜住 200。
+	// 短冷却下 bad 只被尝试一次，正是「不放大请求量」的那条性质。
+	rec := req()
+	if rec.Code != 200 {
+		t.Fatalf("round 1: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 {
+		t.Fatalf("round 1: bad 应被尝试 1 次，实际 %d", calls["Bearer at-bad"])
+	}
+	st, _ := p.Status("bad")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("未达阈值应先短冷却（soft_rate）: %+v", st)
+	}
+
+	// 阈值达成前的其余命中直接驱动 applyErrorPolicy —— 走完整 HTTP 需要等短冷却
+	// 自然到期（真实 sleep），而这里要验的是「连续命中累积到阈值」本身。
+	// Classify→applyErrorPolicy 的接线已由本轮真实请求覆盖。
+	for i := 2; i <= pool.SafetyBannedThreshold(); i++ {
+		h.applyErrorPolicy("bad", upstream.ErrSafetyBanned, bannedBody, "glm-5.2")
+	}
+
+	// 阈值达成 → 长冷却，cool_kind 必须是 safety_banned。
+	st, _ = p.Status("bad")
+	if !st.Cooling || st.CoolKind != "safety_banned" {
+		t.Fatalf("bad 应进入 safety_banned 长冷却: %+v", st)
+	}
+	// 长冷却带 ±25% 抖动（jitterDur）：断言落在 [0.75×, 1.25×] 区间内。
+	lo := int64(float64(safetyBannedCooldown) / float64(time.Second) * 0.75)
+	hi := int64(float64(safetyBannedCooldown) / float64(time.Second) * 1.25)
+	if st.CoolRemaining < lo || st.CoolRemaining > hi {
+		t.Errorf("cool_remaining_sec=%d want in [%d,%d]（6h ±25%% 抖动）", st.CoolRemaining, lo, hi)
+	}
+
+	// 关键回归：长冷却生效后，bad 不再被选中（修复前它会被无限选中）。
+	before := calls["Bearer at-bad"]
+	rec = req()
+	if rec.Code != 200 {
+		t.Fatalf("post-ban code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != before {
+		t.Errorf("长冷却中的账号不应再被选中: calls=%v", calls)
+	}
+}
+
+// TestChatSafetyBannedLongCooldownSurvivesCheckin 长冷却不被签到解冻：
+// 内容安全封控与余额无关，若被 ReenableIfCredits 清掉，签到任务会把封控号放回池中。
+func TestChatSafetyBannedLongCooldownSurvivesCheckin(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p})
+	for i := 0; i < pool.SafetyBannedThreshold(); i++ {
+		h.applyErrorPolicy("u1", upstream.ErrSafetyBanned, `{"code":11140,"msg":"request illegal"}`, "glm-5.2")
+	}
+	st, _ := p.Status("u1")
+	if st.CoolKind != "safety_banned" {
+		t.Fatalf("want safety_banned, got %+v", st)
+	}
+	p.ReenableIfCredits("u1", 999) // 签到成功 + 余额充足
+	if st, _ = p.Status("u1"); !st.Cooling || st.CoolKind != "safety_banned" {
+		t.Fatalf("签到不得解除内容安全封控: %+v", st)
+	}
+}
+
 // TestApplyErrorPolicyNotFoundUsesFixedBase 404 分流：偶发上游 404 的冷却基数固定 60s
 // （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响。
 //

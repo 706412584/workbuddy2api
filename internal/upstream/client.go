@@ -43,10 +43,25 @@ const (
 	// 但轮换耗尽后必须回 404 而非 503：模型名不对不是「网关没有可用账号」。
 	ErrModelNotFound
 	// ErrWafBlock 403 + 非业务信封体（APISIX WAF 拦截页/空体/纯文本）→ 账号软冷却
-	// + 轮转退避。判据是「无业务信封」：带 code/msg 的 403（11140 request illegal
-	// 等）走各自既有分类，不受影响。此前该形态落 ErrClient 兜底 → 只换号不罚
-	// → 连环 403 放大请求量。
+	// + 轮转退避。判据是「无业务信封」：带 code/msg 的 403 走各自的业务分类
+	// （如 11140 request illegal → ErrSafetyBanned），不受影响。此前该形态落
+	// ErrClient 兜底 → 只换号不罚 → 连环 403 放大请求量。
 	ErrWafBlock
+	// ErrSafetyBanned 403 + code 11140 + msg "request illegal"（displayMsg 为
+	// 「内容未通过安全审核」）→ 账号级内容安全封控，长冷却。
+	//
+	// 与 ErrContentBlocked 的分工（二者都带「审核」语义，方向相反，不可混淆）：
+	//   - ErrContentBlocked 是 HTTP 400 + 逐字指纹误报，**请求侧**问题，换号即可绕过，
+	//     故不罚账号、走降级重试；
+	//   - ErrSafetyBanned 是 HTTP 403 + **账号侧**终态。2026-09-27 实测：同一 body
+	//     换健康账号即 200、最小探针（system+「hi」）同样 403、重新登录（新 session）
+	//     不解除、持续 15h 以上。不罚的话死号会一直留在池中被反复选中（实测 50 次），
+	//     每个请求吃掉一个 MaxRotate 名额，把正常请求拖成 503。
+	//
+	// 判据必须同时要求 code 与 msg：11140 是复用码，限流文案也用它
+	// （"The model provider is rate-limiting requests." → ErrSoftRate），
+	// 只看 code 会把限流误判成封禁。
+	ErrSafetyBanned
 	ErrClient // 其他 4xx / 业务错误
 )
 
@@ -72,6 +87,8 @@ func (k ErrKind) String() string {
 		return "model_not_found"
 	case ErrWafBlock:
 		return "waf_block"
+	case ErrSafetyBanned:
+		return "safety_banned"
 	case ErrClient:
 		return "client"
 	default:
@@ -143,6 +160,29 @@ var contentBlockedMarkers = []string{
 	"illegal api invocation",
 }
 
+// safetyBanned 账号级内容安全封控的识别标记（生产实测形态，2026-09-27）：
+//
+//	{"code":11140,"msg":"request illegal","requestId":"...",
+//	 "displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.",
+//	               "zh":"内容未通过安全审核，请调整后重试"}}
+//
+// **两个标记必须同时命中**：11140 是复用码——模型级限流也用它
+// （{"code":11140,"msg":"The model provider is rate-limiting requests."}，
+// 由 softRateMarkers 先接住判为 ErrSoftRate）。只看 code 会把限流误判成封禁，
+// 把一个十分钟自愈的号罚成长期停用。
+const safetyBannedBizCode = `"code":11140`
+const safetyBannedMsg = "request illegal"
+
+// IsSafetyBanned 报告 403 响应是否为账号级内容安全封控（11140 + request illegal）。
+// 与 IsWafBlocked 互补：后者要求「无业务信封」，本形态带完整业务信封，故不冲突。
+func IsSafetyBanned(status int, body string) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	return strings.Contains(body, safetyBannedBizCode) &&
+		strings.Contains(strings.ToLower(body), safetyBannedMsg)
+}
+
 // badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
@@ -212,7 +252,8 @@ func hasBusinessEnvelope(body string) bool {
 
 // IsWafBlocked 报告 403 响应是否为 WAF 拦截形态：HTTP 403 且 body 无业务信封
 // （无 `"code":`/`"msg":` JSON 字段——HTML 拦截页、空体、纯文本均命中）。
-// 带业务信封的 403（11140 request illegal 等）仍走既有分类链，不受影响。
+// 带业务信封的 403（11140 request illegal → ErrSafetyBanned 等）不在此列，
+// 由 Classify 在下方按各自标记分类。
 func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
 }
@@ -407,6 +448,9 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 //     结果同为 soft_rate，与下一层一致。
 //  4. status==429 —— body 无文案时的兜底识别。
 //  5. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
+//
+// 403 的三个分流（都在下方 4xx 层之前）：无业务信封 → WAF；带 11140+request illegal
+// → 账号级安全封控；其余带信封 403 → 按既有 marker 链分类。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
@@ -442,6 +486,12 @@ func Classify(status int, body string) ErrKind {
 	// 带信封的 403 在上方各层已有权威分类，不受影响。
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
+	}
+	// 账号级内容安全封控（403 + 11140 + request illegal）：判在内容策略之前——
+	// 二者都含「审核」语义但方向相反，且 contentBlockedMarkers 并不匹配本形态，
+	// 不显式分流就会一路落进 ErrClient 兜底（只换号不罚），死号留在池中被反复选中。
+	if IsSafetyBanned(status, body) {
+		return ErrSafetyBanned
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
