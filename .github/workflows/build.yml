@@ -38,12 +38,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 版本注入：容器里的网关要能报出版本，否则面板「检查更新」永远显示开发版。
+      # tag 触发用 tag 名，其余用 commit 短 sha（与 release.yml 同一口径）。
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build & push multi-arch
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
@@ -54,6 +69,9 @@ jobs:
       - name: Export offline tarball (amd64)
         run: |
           docker buildx build --platform linux/amd64 --file Dockerfile \
+            --build-arg VERSION=${{ steps.ver.outputs.version }} \
+            --build-arg COMMIT=${{ github.sha }} \
+            --build-arg BUILD_TIME=${{ github.event.head_commit.timestamp }} \
             --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar .
           gzip -f wb2api-amd64.tar
 

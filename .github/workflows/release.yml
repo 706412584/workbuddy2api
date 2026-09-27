@@ -61,16 +61,25 @@ jobs:
       # 五个二进制一次编齐。命令与 README「源码构建」章节、Dockerfile 第 8-11 行
       # 逐字一致（同一套 -trimpath -ldflags="-s -w" CGO_ENABLED=0）。
       # Windows 的 .exe 后缀由 Go 自动追加，但这里显式拼 ext 以保证产物名确定。
+      #
+      # 版本注入（internal/version）：把 tag 名与构建信息编进二进制，供网关的
+      # 「检查更新」比较版本。**必须在 ldflags 里给**——版本号写死在源码里就意味着
+      # 每发一版都要改代码，而"改了代码忘了改版本号"是发布流程最常见的事故。
+      # 只有 cmd/server 链接了 internal/version，其余四个 -X 是无害的空操作。
       - name: Build binaries
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           EXT: ${{ matrix.ext }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
+          LDFLAGS="-s -w -X workbuddy2api/internal/version.Version=${VERSION}"
+          LDFLAGS="$LDFLAGS -X workbuddy2api/internal/version.Commit=${GITHUB_SHA::7}"
+          LDFLAGS="$LDFLAGS -X workbuddy2api/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           while IFS=: read -r name pkg; do
-            CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "dist/${name}${EXT}" "$pkg"
+            CGO_ENABLED=0 go build -trimpath -ldflags="$LDFLAGS" -o "dist/${name}${EXT}" "$pkg"
           done <<'EOF'
           wb2api:./cmd/server
           login:./cmd/login
@@ -79,6 +88,14 @@ jobs:
           activity:./cmd/activity
           EOF
           ls -l dist
+          # 版本注入防呆：编出来的主程序必须含 tag 名字符串，否则「检查更新」会
+          # 永远把自己当开发版、永不提示更新。这里是 CI 侧最便宜的验证点。
+          #
+          # 用 grep 而非 `go version -m`：后者只列 build info，**不包含 -X 注入的
+          # 变量值**（那些在符号表里），拿它断言必然误报。grep -a 按二进制文本搜，
+          # 实测能稳定区分"注入/未注入"。
+          grep -aq "${VERSION}" "dist/wb2api${EXT}" \
+            || { echo "ERROR: version ${VERSION} not injected into wb2api${EXT}"; exit 1; }
 
       # 打成单层目录的压缩包（wb2api-v1.0.0-linux-amd64/wb2api），
       # 避免解压时把二进制散落到当前目录。

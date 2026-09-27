@@ -4,11 +4,20 @@ WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
+# 版本注入：与 .github/workflows/release.yml 同一套 -X，供网关「检查更新」比较版本。
+# 不给 VERSION 时编出的是开发版（面板会明确显示，不参与版本比较），
+# 而不是"假装已是最新"——静默的错误版本比明确的开发版更难排查。
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
+RUN LDFLAGS="-s -w -X workbuddy2api/internal/version.Version=${VERSION} \
+  -X workbuddy2api/internal/version.Commit=${COMMIT} \
+  -X workbuddy2api/internal/version.BuildTime=${BUILD_TIME}" \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="$LDFLAGS" -o /out/wb2api ./cmd/server \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="$LDFLAGS" -o /out/signin_bin ./cmd/signin \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="$LDFLAGS" -o /out/login ./cmd/login \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="$LDFLAGS" -o /out/credit ./cmd/credit
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。

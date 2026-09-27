@@ -23,6 +23,7 @@ import (
 
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/proxyreg"
+	"workbuddy2api/internal/updater"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -83,6 +84,11 @@ type Config struct {
 	// 会出现在客户端配置里。而本组接口能增删账号、改写密钥表——给它的凭证应当独立，
 	// 泄露 API 密钥不等于失去账号管理权。
 	Token string
+	// Updater 更新检查/安装器。nil = 本进程未接线更新功能，相关接口返回明确错误。
+	Updater *updater.Client
+	// RequestRestart 请求一次零停机交接重启（见 cmd/server/handoff.go）。
+	// 非阻塞：投递后立即返回，交接在后台完成。nil = 不支持自动重启。
+	RequestRestart func(reason string)
 }
 
 // adminTokenHeader 管理员口令的请求头。
@@ -128,6 +134,11 @@ func New(cfg Config) *Handler {
 
 	h.mux.HandleFunc("GET /__admin/apikeys", h.getKeys)
 	h.mux.HandleFunc("POST /__admin/apikeys", h.saveKeys)
+
+	h.mux.HandleFunc("GET /__admin/system/version", h.systemVersion)
+	h.mux.HandleFunc("GET /__admin/system/check-updates", h.systemCheckUpdates)
+	h.mux.HandleFunc("POST /__admin/system/update", h.systemUpdate)
+	h.mux.HandleFunc("POST /__admin/system/restart", h.systemRestart)
 
 	return h
 }

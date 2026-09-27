@@ -23,7 +23,9 @@ import (
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/updater"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/version"
 	"workbuddy2api/internal/web"
 )
 
@@ -45,7 +47,15 @@ func slotsToRegistry(in []ProxySlot) []proxyreg.Slot {
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	// -version：不进主流程，直接报版本退出。发布包/容器里想确认"跑的是哪版"时，
+	// 比翻面板或看日志都快，也让「检查更新」的版本比较有个可直接核对的来源。
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -191,6 +201,10 @@ func main() {
 		return a
 	}
 
+	// restartCh 更新重启请求通道：admin 的更新接口发信号，serveWithHandoff 收到后
+	// 做零停机交接（见 handoff.go）。容量 1 即可 —— 交接期间不会有第二次请求。
+	restartCh := make(chan string, 1)
+
 	// h 先声明后赋值：admin 的新增回调要引用它，而它又需要 admin 才能构造。
 	var h *server.Handler
 	adm := admin.New(admin.Config{
@@ -247,6 +261,19 @@ func main() {
 			}
 			return "未知任务：" + key
 		},
+		// 更新：检查本仓库 GitHub Releases（见 internal/updater），安装后经 restartCh
+		// 触发零停机交接。Updater 为 nil（未接线）时相关接口返回明确错误。
+		Updater: updater.New(),
+		// RequestRestart 非阻塞地投递一次交接请求。交接是异步的：接口先返回，
+		// 让用户看到「已更新，正在交接」，再真正重启。
+		RequestRestart: func(reason string) {
+			select {
+			case restartCh <- reason:
+			default:
+				// 已有一个待处理请求：不排队（重复交接没有意义），如实记录。
+				log.Printf("更新重启请求已在处理中，忽略重复请求：%s", reason)
+			}
+		},
 	})
 
 	h = server.NewHandler(server.Config{
@@ -281,23 +308,46 @@ func main() {
 	defer stop()
 	go sch.Run(ctx)
 
+	// 监听：普通启动 bind 配置地址；交接启动则接管旧进程继承来的套接字
+	// （端口全程无"无监听者"空窗，见 handoff.go）。
+	ln, inherited, err := listenForServe(cfg.Listen)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.Listen, err)
+	}
+
+	// 句柄复制必须在 Accept 之前完成（Windows 限制，见 handoff_windows.go）。
+	// 因此顺序是：先 dup，再起 Serve。dup 失败不致命 —— 服务照常跑，只是本次
+	// 进程无法做零停机交接，更新接口会明确报错而不是假装成功。
+	//
+	// 交接启动的新进程同样是"监听持有者"，也要能再交接给下一次更新，故两条路径一致。
+	hs := handoffState{ok: false, why: "未初始化"}
+	if f, err := dupListener(ln); err != nil {
+		hs.why = err.Error()
+		log.Printf("WARN: 无法复制监听句柄，本进程不支持零停机更新（更新后需手工重启）：%v", err)
+	} else {
+		hs = handoffState{file: f, ok: true}
+	}
+
+	// 连接跟踪器：交接排空靠它数在途请求（不能用 Shutdown，见 handoff.go 约束）。
+	tracker := newConnTracker()
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
+		ConnState:         tracker.state,
 	}
-	go func() {
-		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
+	registerTracker(srv, tracker)
 
-	log.Printf("workbuddy2api listening on %s", cfg.Listen)
+	log.Printf("workbuddy2api %s listening on %s", version.String(), cfg.Listen)
+	if inherited {
+		log.Printf("本次为交接启动：已接管旧进程的监听套接字")
+	}
 	log.Printf("api keys: %s", describeAPIKeys(cfg))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+
+	handedOff := serveWithHandoff(ctx, ln, srv, p, restartCh, hs)
+	if handedOff {
+		log.Printf("bye（已交接给新进程）")
+		return
 	}
 	log.Printf("bye")
 }
