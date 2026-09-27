@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
+# Go ≥ 1.25 是硬要求，不是「越新越好」：Windows 上的零停机交接依赖
+# net.TCPListener.File() 与 net.FileListener，而这两者在 Windows 上直到
+# Go 1.25 才实现（1.22~1.24 的 net/file_windows.go 里是 `return nil, EWINDOWS`
+# 的 TODO 桩）。用 1.22 构建出的 Windows 二进制会在交接时静默降级为
+# 「无法复制监听句柄」，更新只能落到手工重启。
+FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download

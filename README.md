@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker&logoColor=white&style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
@@ -82,7 +82,9 @@ flowchart LR
 
 - **Docker + Docker Compose**（推荐部署方式，镜像内已含 `app` 低权限用户与全部工具脚本）
 - 一个（或多个）已注册的 CodeBuddy 账号，用于 OAuth 登录
-- 宿主机 Go ≥ 1.22（仅本地直接编译时需要）
+- 宿主机 Go ≥ 1.25（仅本地直接编译时需要）。**Windows 上必须 ≥ 1.25**：零停机交接
+  依赖 `net.TCPListener.File()` 与 `net.FileListener`，这两者在 Windows 上直到 Go 1.25
+  才实现，1.22~1.24 构建出的 Windows 二进制只能手工重启更新
 - Node ≥ 20（**仅修改前端时需要**；面板产物已入库，正常构建不必装）
 
 ### 管理面板
