@@ -472,8 +472,19 @@ tbody tr:hover {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+/* 账号页：上方两个表单并排（添加账号 / 导出账号），下方凭证表占满整行。
+   表单不需要 1fr 那么宽——输入框拉满整屏反而难读，故限一个最大宽度，
+   让两个表单紧凑并排；表格另起一行吃满宽度（六列 + 操作列需要空间）。
+   必须写在下方的 760px 媒体查询**之前**：两者选择器权重相同（0,2,0），
+   谁在后面谁生效，写在后面会让窄屏回落单列的规则失效。 */
+.grid-2.forms {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: 880px;
+}
+
 @media (max-width: 760px) {
-  .grid-2.eq {
+  .grid-2.eq,
+  .grid-2.forms {
     grid-template-columns: 1fr;
   }
 }

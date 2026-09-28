@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/pool"
 )
 
 // authFileRE 凭证文件名必须严格匹配，杜绝 '../' 之类的路径穿越。
@@ -31,6 +32,14 @@ type authFileView struct {
 	ExpiresAt    int64  `json:"expiresAt"`
 	Expired      bool   `json:"expired"`
 	TokenHint    string `json:"tokenHint"`
+	// Disabled 池中该账号是否被禁用（含自动禁用与人工禁用）。**来源是池状态而非文件**：
+	// disabled 是运行期调度状态，凭证文件里没有这个字段。
+	// UID 不在池中时（尚未加载/文件坏）为 false，且 InPool=false 让面板不误显示「启用中」。
+	Disabled bool `json:"disabled"`
+	// DisabledReason 禁用原因（"12153 session dead" / 人工禁用等），仅 disabled 时非空。
+	DisabledReason string `json:"disabledReason,omitempty"`
+	// InPool 该账号是否已在网关池中。false 时 Disabled/DisabledReason 无意义。
+	InPool bool `json:"inPool"`
 }
 
 // viewOf 解析单个凭证文件为视图。解析失败（含缺 accessToken）返回 false，
@@ -84,12 +93,94 @@ func listAccounts(dir string) []authFileView {
 	return out
 }
 
+// mergePoolState 把池中的禁用状态合进磁盘视图。
+//
+// 磁盘（auths/*.json）与池是两份数据：前者是凭证，后者是调度状态。面板要同时显示
+// 「这是哪个账号」与「它现在能不能被调度」，就得在出接口前合并一次。
+// 查不到的 uid（文件有、池里没有）保留 InPool=false，面板据此区分「未加载」与「已启用」。
+func mergePoolState(p *pool.Pool, views []authFileView) {
+	if p == nil {
+		return
+	}
+	byUID := make(map[string]pool.Status, len(views))
+	for _, s := range p.List() {
+		byUID[s.UID] = s
+	}
+	for i := range views {
+		s, ok := byUID[views[i].UID]
+		if !ok {
+			continue
+		}
+		views[i].InPool = true
+		views[i].Disabled = s.Disabled
+		views[i].DisabledReason = s.DisabledReason
+	}
+}
+
 func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
+	views := listAccounts(h.cfg.AuthDir)
+	mergePoolState(h.cfg.Pool, views)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authDir":  h.cfg.AuthDir,
-		"accounts": listAccounts(h.cfg.AuthDir),
+		"accounts": views,
 	})
 }
+
+// toggleAccount POST /__admin/accounts/toggle —— 人工启用/禁用单个账号。
+//
+// 只改池中调度状态，**不碰凭证文件**：禁用是「暂时别用它」，删除才是「不要它了」。
+// 这一点很重要 —— 误禁用可一键恢复，误删除要重新登录。
+//
+// 人工禁用与自动禁用（12153 session dead）共用同一个 disabled 字段，只靠 reason 文案区分。
+// 因此「解除禁用」不止本端点一条路径，界面上必须说清楚：
+//   - 签到（ReenableIfCredits）**不会**解除：它只管余额与冷却；
+//   - keepalive（refresh 成功）**不会**解除：只清连续 12153 计数；
+//   - 面板「测试连接」成功**会**解除（NoteTestOK：测试通过即证明 session 活着）；
+//   - 面板「重置」勾选解除禁用**会**解除（Reset includeDisabled）。
+// 后两条都是用户在面板上的显式动作，不算"偷偷放回"，但文案不能宣称禁用是绝对粘性的。
+func (h *Handler) toggleAccount(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		UID      string `json:"uid"`
+		Disabled bool   `json:"disabled"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	uid := strings.TrimSpace(body.UID)
+	if uid == "" {
+		fail(w, http.StatusBadRequest, "缺少 uid")
+		return
+	}
+	// 与 mergePoolState / testAccount 同样的防御：Pool 未接线时给明确错误，
+	// 而不是空指针 panic 变成 500。
+	if h.cfg.Pool == nil {
+		fail(w, http.StatusNotImplemented, "本进程未接线账号池，无法切换账号状态")
+		return
+	}
+	if _, ok := h.cfg.Pool.Status(uid); !ok {
+		fail(w, http.StatusNotFound, "账号 %s 不在池中（可能尚未加载，或凭证文件已被删除）", uid)
+		return
+	}
+	if body.Disabled {
+		h.cfg.Pool.Disable(uid, manualDisableReason)
+	} else {
+		// 启用走 ReviveDisabled：清 disabled + reason + 两个连续计数，**不动冷却/熔断**
+		// （那是「重置」的职责，启用只负责把号放回轮换）。
+		// 副作用：若该号本就在冷却/熔断中，启用后仍不会被选中 —— 面板状态列会显示
+		// 「已加载」而非「已禁用」，别让用户以为点了没生效。
+		h.cfg.Pool.ReviveDisabled(uid)
+	}
+	h.cfg.Pool.Flush()
+	action := "启用"
+	if body.Disabled {
+		action = "禁用"
+	}
+	logf("账号 %s 已%s（人工）", uid, action)
+	ok(w, map[string]any{"uid": uid, "disabled": body.Disabled, "action": action})
+}
+
+// manualDisableReason 人工禁用的 reason 文案，供面板区分于自动禁用。
+const manualDisableReason = "面板人工禁用"
 
 // loaded 网关此刻到底加载了哪些账号。
 //

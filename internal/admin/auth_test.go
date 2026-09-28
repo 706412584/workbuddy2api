@@ -130,6 +130,7 @@ func TestAdminAuthCoversAllPaths(t *testing.T) {
 		{http.MethodPost, "/__admin/accounts/import"},
 		{http.MethodPost, "/__admin/accounts/delete"},
 		{http.MethodPost, "/__admin/accounts/test"},
+		{http.MethodPost, "/__admin/accounts/toggle"},
 		{http.MethodGet, "/__admin/loaded"},
 		{http.MethodPost, "/__admin/login/start"},
 		{http.MethodPost, "/__admin/login/poll"},

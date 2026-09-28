@@ -12,6 +12,7 @@ import {
   pollLogin,
   reloadPool,
   startLogin,
+  toggleAccount,
 } from '../api/client'
 interface Props {
   onChanged: () => void
@@ -211,6 +212,49 @@ export function Accounts({ onChanged }: Props) {
     }
   }
 
+  /** 正在切换启用/禁用的 uid（毫秒级，仅用于立刻禁用按钮） */
+  const [toggling, setToggling] = useState<Set<string>>(new Set())
+  /**
+   * 表格内动作（启用/禁用）的结果提示。
+   * 与 loginMsg 分开：loginMsg 渲染在「添加账号」面板里，而这里是表格上的操作，
+   * 提示必须紧挨着被操作的行 —— 否则用户在表格上点了按钮，反馈出现在上方另一个面板里。
+   */
+  const [rowMsg, setRowMsg] = useState('')
+
+  /**
+   * 人工启用/禁用。只改池中调度状态，不碰凭证文件 —— 误禁用可一键恢复，
+   * 误删除要重新登录，所以这是两个分开的动作。
+   */
+  const doToggle = async (f: AuthFileView) => {
+    const next = !f.disabled
+    if (next) {
+      const ok = confirm(
+        `确认禁用账号 ${f.nickname || f.uid.slice(0, 8)}？\n\n` +
+          '该账号会立即退出轮换，不再被任何请求选中（凭证文件保留）。\n' +
+          '签到与 token 保活不会解除禁用；只有在此页点「启用」，\n' +
+          '或对它执行「测试连接 / 重置（勾选解除禁用）」才会恢复。',
+      )
+      if (!ok) return
+    }
+    setErr('')
+    setRowMsg('')
+    setToggling((s) => new Set(s).add(f.uid))
+    try {
+      const r = await toggleAccount(f.uid, next)
+      setRowMsg(`账号 ${f.nickname || f.uid.slice(0, 8)} 已${r.action}`)
+      await load()
+      onChanged()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setToggling((s) => {
+        const n = new Set(s)
+        n.delete(f.uid)
+        return n
+      })
+    }
+  }
+
   const doDelete = async (f: AuthFileView) => {
     if (!confirm(`确认删除账号文件 ${f.file}？\n\n该操作只删除本地凭证文件，网关会立即把它从池中移除。`)) {
       return
@@ -273,7 +317,7 @@ export function Accounts({ onChanged }: Props) {
         </div>
       )}
 
-      <div className="grid-2">
+      <div className="grid-2 forms">
         <div className="panel">
           <header>
             <h2>添加账号</h2>
@@ -446,96 +490,142 @@ export function Accounts({ onChanged }: Props) {
             </div>
           </div>
         </div>
+      </div>
 
-        <div className="panel">
-          <header>
-            <h2>凭证文件</h2>
-            <span className="sub">
-              {files.length} 个
-            </span>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <header>
+          <h2>凭证文件</h2>
+          <span className="sub">
+            {files.length} 个
+          </span>
+          <div className="spacer" />
+          <button className="btn" onClick={() => void load()} disabled={busy}>
+            {busy ? <span className="spin" /> : null}
+            {busy ? ' 读取中' : '重新读取'}
+          </button>
+        </header>
+
+        {/* 启用/禁用的结果紧贴在表格上方 —— 它是表格内的动作，反馈不该跑到上面的面板里 */}
+        {rowMsg && (
+          <div className="dirty-bar" style={{ color: 'var(--ok)', background: 'rgba(63, 185, 80, 0.08)', borderBottomColor: 'rgba(63, 185, 80, 0.3)' }}>
+            <span>{rowMsg}</span>
             <div className="spacer" />
-            <button className="btn" onClick={() => void load()} disabled={busy}>
-              {busy ? <span className="spin" /> : null}
-              {busy ? ' 读取中' : '重新读取'}
+            <button className="btn" onClick={() => setRowMsg('')}>
+              知道了
             </button>
-          </header>
+          </div>
+        )}
 
-          {files.length === 0 ? (
-            <div className="empty">
-              还没有账号文件。用左侧「设备码登录」添加第一个账号。
-            </div>
-          ) : (
-            <div className="scroll-x">
-              <table>
-                <thead>
-                  <tr>
-                    <th>账号</th>
-                    <th>区域</th>
-                    <th>已加载</th>
-                    <th>凭证有效期</th>
-                    <th>文件</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {files.map((f) => {
-                    const isLoaded = loadedUids?.has(f.uid) ?? null
-                    return (
-                      <tr key={f.file}>
-                        <td>
-                          <div style={{ color: 'var(--text-strong)' }}>
-                            {f.nickname || '（无昵称）'}
-                          </div>
-                          <div className="mono dim" style={{ fontSize: 11 }}>
-                            {f.uid || '(缺 uid)'} · {f.tokenHint}
-                          </div>
-                        </td>
-                        <td>
-                          <span className={'badge' + (f.region === 'global' ? ' accent' : '')}>
-                            {f.region}
+        {files.length === 0 ? (
+          <div className="empty">
+            还没有账号文件。用上方「设备码登录」添加第一个账号。
+          </div>
+        ) : (
+          <div className="scroll-x">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>区域</th>
+                  <th>状态</th>
+                  <th>凭证有效期</th>
+                  <th>文件</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {files.map((f) => {
+                  const isToggling = toggling.has(f.uid)
+                  // 加载态以 inPool 为准：它与后端 404 判定同源，不会出现
+                  // 「状态列说已加载、禁用按钮却灰着」这种自相矛盾的行。
+                  // loadedUids 只在老后端不回 inPool 时兜底；都没有才显示「未知」。
+                  const isLoaded =
+                    typeof f.inPool === 'boolean' ? f.inPool : (loadedUids?.has(f.uid) ?? null)
+                  return (
+                    <tr key={f.file}>
+                      <td>
+                        <div style={{ color: 'var(--text-strong)' }}>
+                          {f.nickname || '（无昵称）'}
+                        </div>
+                        <div className="mono dim" style={{ fontSize: 11 }}>
+                          {f.uid || '(缺 uid)'} · {f.tokenHint}
+                        </div>
+                      </td>
+                      <td>
+                        <span className={'badge' + (f.region === 'global' ? ' accent' : '')}>
+                          {f.region}
+                        </span>
+                      </td>
+                      <td>
+                        {isLoaded === null ? (
+                          <span className="badge" title="查不到网关账号池，无法判断">
+                            未知
                           </span>
-                        </td>
-                        <td>
-                          {isLoaded === null ? (
-                            <span className="badge" title="查不到网关账号池，无法判断">
-                              未知
-                            </span>
-                          ) : isLoaded ? (
-                            <span className="badge ok">已加载</span>
-                          ) : (
-                            <span className="badge warn" title="磁盘上有这个文件，但不在网关的账号池里">
-                              未加载
-                            </span>
-                          )}
-                        </td>
-                        <td className="nowrap" style={{ fontSize: 11.5 }}>
-                          {f.expired ? (
-                            <span className="badge err">已过期</span>
-                          ) : (
-                            <span className="mono dim">{fmtTime(new Date(f.expiresAt * 1000).toISOString())}</span>
-                          )}
-                        </td>
-                        <td className="mono dim" style={{ fontSize: 11 }}>
-                          {f.file}
-                        </td>
-                        <td>
+                        ) : !isLoaded ? (
+                          <span className="badge warn" title="磁盘上有这个文件，但不在网关的账号池里">
+                            未加载
+                          </span>
+                        ) : f.disabled ? (
+                          <span
+                            className="badge err"
+                            title={f.disabledReason || '已禁用：不参与轮换'}
+                          >
+                            已禁用
+                          </span>
+                        ) : (
+                          <span className="badge ok">已加载</span>
+                        )}
+                      </td>
+                      <td className="nowrap" style={{ fontSize: 11.5 }}>
+                        {f.expired ? (
+                          <span className="badge err">已过期</span>
+                        ) : (
+                          <span className="mono dim">
+                            {fmtTime(new Date(f.expiresAt * 1000).toISOString())}
+                          </span>
+                        )}
+                      </td>
+                      {/* 文件名不折行：窄屏下它会把每行撑成好几行，反而不如让表格横向滚动
+                          （与 .grid-2.eq 的既有约定一致：铺得下就铺满，铺不下才滚）。 */}
+                      <td className="mono dim nowrap" style={{ fontSize: 11 }}>
+                        {f.file}
+                      </td>
+                      <td>
+                        <div className="row" style={{ gap: 6 }}>
+                          {/* 只有已在池中的账号才能切换调度状态：文件在盘上但没加载时，
+                              disabled 没有承载对象（后端会回 404）。 */}
+                          <button
+                            className="btn"
+                            onClick={() => void doToggle(f)}
+                            disabled={isToggling || !f.inPool}
+                            title={
+                              f.inPool
+                                ? f.disabled
+                                  ? '恢复参与轮换（保留凭证文件）'
+                                  : '退出轮换但保留凭证文件'
+                                : '账号未加载到网关池，无法切换'
+                            }
+                          >
+                            {isToggling ? <span className="spin" /> : null}
+                            {f.disabled ? '启用' : '禁用'}
+                          </button>
                           <button className="btn danger" onClick={() => void doDelete(f)}>
                             删除
                           </button>
-                        </td>
-                      </tr>
-                    )
-                  })}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
                 </tbody>
               </table>
             </div>
           )}
-          {authDir && (
-            <div className="dim mono" style={{ fontSize: 11, padding: '10px 14px' }}>
-              {authDir}
-            </div>
-          )}
-        </div>
+        {authDir && (
+          <div className="dim mono" style={{ fontSize: 11, padding: '10px 14px' }}>
+            {authDir}
+          </div>
+        )}
       </div>
     </>
   )

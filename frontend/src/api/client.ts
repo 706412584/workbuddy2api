@@ -396,6 +396,13 @@ export const deleteAuth = (file: string) =>
     body: JSON.stringify({ file }),
   })
 
+/** 人工启用/禁用单个账号。只改池中调度状态，不动凭证文件。 */
+export const toggleAccount = (uid: string, disabled: boolean) =>
+  adminJSON<{ uid: string; disabled: boolean; action: string }>('/__admin/accounts/toggle', {
+    method: 'POST',
+    body: JSON.stringify({ uid, disabled }),
+  })
+
 /** 按区域列出可测模型，供测试连接的下拉框用。 */
 export const getRegionModels = () => adminJSON<RegionModels>('/__admin/models')
 

@@ -115,6 +115,7 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /__admin/accounts/import", h.importAccount)
 	h.mux.HandleFunc("POST /__admin/accounts/delete", h.deleteAccount)
 	h.mux.HandleFunc("POST /__admin/accounts/test", h.testAccount)
+	h.mux.HandleFunc("POST /__admin/accounts/toggle", h.toggleAccount)
 	h.mux.HandleFunc("GET /__admin/loaded", h.loaded)
 
 	h.mux.HandleFunc("POST /__admin/login/start", h.loginStart)

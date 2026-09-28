@@ -130,6 +130,12 @@ export interface AuthFileView {
   expiresAt: number
   expired: boolean
   tokenHint: string
+  /** 池中是否已禁用（自动禁用或人工禁用）。来源是池状态，非凭证文件。 */
+  disabled: boolean
+  /** 禁用原因，仅 disabled 时存在 */
+  disabledReason?: string
+  /** 该账号是否已在网关池中；false 时 disabled 无意义 */
+  inPool: boolean
 }
 
 export interface AccountsResponse {
