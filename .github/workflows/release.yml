@@ -38,8 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # go-version-file 让 CI 与仓库声明的 Go 版本（go.mod 的 go 1.22.5）强一致，
+      # go-version-file 让 CI 与仓库声明的 Go 版本（go.mod 的 go 1.25.0）强一致，
       # 避免 runner 默认版本漂移导致「本地能编、CI 编不过」。
+      # 下限是 1.25 而非更低：Windows 的零停机交接依赖 net.TCPListener.File() /
+      # net.FileListener，这两者在 Windows 上直到 Go 1.25 才实现（1.22~1.24 是
+      # 返回 EWINDOWS 的 TODO 桩）。低于 1.25 会触发 cmd/server 的构建期闸门。
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
