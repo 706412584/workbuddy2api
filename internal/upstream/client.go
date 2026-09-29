@@ -42,6 +42,20 @@ const (
 	// 可能滞后于上游；对未收录的模型（不做区域限制）轮换能撞出真正提供它的区域。
 	// 但轮换耗尽后必须回 404 而非 503：模型名不对不是「网关没有可用账号」。
 	ErrModelNotFound
+	// ErrBadRequest 请求参数被上游拒绝（400 + 11133/11129/11152 一类）：
+	// 与 ErrContextExceeded 同属**请求侧**问题，同样**不轮换、原样透传 4xx**。
+	//
+	// 为什么必须单列（2026-09-29 实测复现）：一个畸形图片 URL
+	// （`...png "扫描此二维码测试游戏"`，来自 MCP 工具返回）在 /v1/chat/completions
+	// 路径上原样透传给上游 → 上游回 400 code=11133 model_param_invalid。该分类原先
+	// 没有 marker，一路落 ErrClient 兜底 → 只换号不罚 → 轮换 3 个账号都拿到同一个
+	// 确定性 400 → 回 503 → Anthropic 侧映射 overloaded_error → 客户端读作「服务过载」
+	// 原样重发 10 次 × 37s ≈ 15 分钟假死。与 ErrContextExceeded 的注释所述事故同构。
+	//
+	// 与 ErrBadParams(11101) 的区别在「该不该轮换」：11101 是 JSON 畸形（换号一样 400，
+	// 但历史上按「不同账号模型权限不同」保留轮换）；11133/11129/11152 是参数/工具 schema
+	// 校验失败，**每个账号都会返回一模一样的结果**，轮换纯属浪费往返并放大请求量。
+	ErrBadRequest
 	// ErrWafBlock 403 + 非业务信封体（APISIX WAF 拦截页/空体/纯文本）→ 账号软冷却
 	// + 轮转退避。判据是「无业务信封」：带 code/msg 的 403 走各自的业务分类
 	// （如 11140 request illegal → ErrSafetyBanned），不受影响。此前该形态落
@@ -85,6 +99,8 @@ func (k ErrKind) String() string {
 		return "context_exceeded"
 	case ErrModelNotFound:
 		return "model_not_found"
+	case ErrBadRequest:
+		return "bad_request"
 	case ErrWafBlock:
 		return "waf_block"
 	case ErrSafetyBanned:
@@ -238,6 +254,76 @@ const modelNotFoundMarker = "service info not found"
 func IsModelNotFound(body string) bool {
 	return strings.Contains(body, modelNotFoundBizCode) ||
 		strings.Contains(strings.ToLower(body), modelNotFoundMarker)
+}
+
+// badRequestBizCodes 请求参数被上游拒绝的业务码（生产实测形态，2026-09-29）：
+//
+//	11133 Invalid request parameters        / extError.code=model_param_invalid
+//	11129 invalid function call parameters  / extError.code=invalid_function_parameters
+//	11152 the tool name is invalid or duplicated
+//	11135 "Please start a new conversation, replace the image"（图片无法使用，需换图/开新会话）
+//
+// 都是「请求体本身不合上游要求」：同一 body 换任何账号都会得到一字不差的 400。
+// 已实测复现的触发条件（对着 :7863 逐个验证）：
+//   - image_url.url 含空格/尾随文案（如 MCP 工具返回的畸形二维码 URL）→ 11133
+//   - tools[].input_schema 缺 "type" / 工具名为空 / 工具名重复 → 11133
+//   - tools[].input_schema 为 {} → 11129
+//   - 工具名含非法字符（"mcp__a b/c"）→ 11152
+//   - 某张图上游已无法再处理（如上下文里的图被回收）→ 11135
+//
+// 11135 纳入本类的理由与其余码一致：它是**请求侧**状态（换号/换图/开新会话才能解决），
+// 落 ErrClient 兜底同样会被轮换成 503，客户端读作 overloaded 原样重发。它的 msg 明确
+// 指向「图」与「新会话」，透传给用户比「no_healthy_account」有用得多。
+//
+// 只认业务码而非文案：上游文案会变、会本地化，业务码是稳定契约。
+//
+// 除业务码外还带上两个 **extError.code**（结构化、与文案无关）作冗余保险：
+// 上游若在业务码字段里加了空白（`"code": 11133`），子串匹配会落空而退回 ErrClient
+// 兜底 → 又变回「轮换成 503」的老毛病。extError.code 是并列的第二判据，
+// 与 contextExceeded 用多个标记冗余的思路一致（上游改一处仍有另一处兜住）。
+// 11135 未观测到独立的 extError.code（其 extError.code 复用 invalid_request_error，
+// 该串过于宽泛不能作判据），故只用业务码。
+var badRequestBizCodes = []string{
+	`"code":11133`, `"model_param_invalid"`,
+	`"code":11129`, `"invalid_function_parameters"`,
+	`"code":11152`,
+	`"code":11135`,
+}
+
+// IsBadRequest 报告上游 body 是否为「请求参数被拒」形态。
+func IsBadRequest(body string) bool {
+	for _, c := range badRequestBizCodes {
+		if strings.Contains(body, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// BadRequestMessage 从上游 body 提取可直接回给客户端的消息。
+//
+// 目标是给调用方一句能定位问题的话：畸形 URL / 工具 schema 这类问题，用户看
+// 「no_healthy_account」只会去查账号池，看上游原话才知道要改请求体。上游 body 带
+// displayMsg.zh（如「请求参数不符合当前模型要求，请调整后重试。」）时优先用中文，
+// 否则回退到固定文案 + 业务码，绝不臆造原因。
+func BadRequestMessage(body string) string {
+	// displayMsg.zh 优先：上游面向用户的中文文案，最贴合「用户该怎么做」。
+	var env struct {
+		Code       int    `json:"code"`
+		Msg        string `json:"msg"`
+		DisplayMsg struct {
+			Zh string `json:"zh"`
+		} `json:"displayMsg"`
+	}
+	if json.Unmarshal([]byte(body), &env) == nil {
+		if zh := strings.TrimSpace(env.DisplayMsg.Zh); zh != "" {
+			return zh
+		}
+		if msg := strings.TrimSpace(env.Msg); msg != "" {
+			return fmt.Sprintf("upstream rejected the request parameters (code=%d): %s", env.Code, msg)
+		}
+	}
+	return "upstream rejected the request parameters (check the request body: malformed image URL, invalid tool schema, or unsupported parameter)"
 }
 
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
@@ -524,6 +610,12 @@ func Classify(status int, body string) ErrKind {
 		// 判在 ErrClient 之前，好让轮换耗尽时能回 404 而不是 503。
 		if IsModelNotFound(body) {
 			return ErrModelNotFound
+		}
+		// 请求参数被上游拒绝（11133/11129/11152）：请求侧问题，**不轮换、原样透传 400**。
+		// 判在 ErrClient 之前，否则会落兜底 → 只换号不罚 → 轮换成 503 → 客户端
+		// 读作 overloaded_error 反复重发同一份 body（2026-09-29 实测 15 分钟假死）。
+		if IsBadRequest(body) {
+			return ErrBadRequest
 		}
 		return ErrClient
 	}

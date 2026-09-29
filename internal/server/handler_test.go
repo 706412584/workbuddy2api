@@ -256,6 +256,86 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	}
 }
 
+// TestChatBadRequestNoRotatePassthrough400 上游 400 + 11133（畸形图片 URL / 非法工具
+// schema 类）→ 归 ErrBadRequest：**不轮换、不罚账号、原样回 400**。
+//
+// 这是 2026-09-29 那个「15 分钟假死」的回归锁定：旧行为是只换号不罚 → 轮换 3 个账号
+// 都拿到同一个确定性 400 → 回 503 no_healthy_account → Anthropic 映射 overloaded_error
+// → 客户端读作「服务过载」原样重发。断言三件事：只打上游 1 次（不轮换）、状态码 400
+// （不是 503）、账号无冷却（不罚号）。
+func TestChatBadRequestNoRotatePassthrough400(t *testing.T) {
+	const body11133 = `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"},"displayMsg":{"zh":"请求参数不符合当前模型要求，请调整后重试。"}}`
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, body11133, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400，不能是 503)", rec.Code, rec.Body)
+	}
+	total := 0
+	for _, n := range calls {
+		total += n
+	}
+	if total != 1 {
+		t.Errorf("upstream 被调用 %d 次 want 1（ErrBadRequest 不得轮换）calls=%v", total, calls)
+	}
+	// 文案要能定位问题，且不得是 no_healthy_account。
+	got := rec.Body.String()
+	if strings.Contains(got, "no_healthy_account") {
+		t.Errorf("不得回 no_healthy_account（会把排查引向账号池）: %s", got)
+	}
+	if !strings.Contains(got, "请求参数不符合当前模型要求") {
+		t.Errorf("应透传上游 displayMsg.zh: %s", got)
+	}
+	// 账号无冷却：请求侧问题不该罚号。
+	for _, uid := range []string{"u1", "u2"} {
+		if st, _ := p.Status(uid); st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+			t.Errorf("ErrBadRequest 不得罚账号 uid=%s: %+v", uid, st)
+		}
+	}
+}
+
+// TestChatBadRequestAnthropicMapsToInvalidRequest Anthropic 客户端拿到的必须是 400
+// invalid_request_error，而不是 503 overloaded_error —— 后者会被客户端读作「服务过载，
+// 稍后重试」并原样重发同一份 body（正是 15 分钟假死的成因）。
+func TestChatBadRequestAnthropicMapsToInvalidRequest(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11133,"msg":"Invalid request parameters"}`, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	body := `{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
+	}
+	var res struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("响应非 JSON: %v body=%s", err, rec.Body)
+	}
+	if res.Error.Type != "invalid_request_error" {
+		t.Errorf("error.type=%q want invalid_request_error（不能是 overloaded_error）", res.Error.Type)
+	}
+}
+
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {

@@ -62,6 +62,27 @@ func TestModelNotFoundMessage(t *testing.T) {
 	}
 }
 
+// TestBadRequestMessage 透传给客户端的文案要能定位问题：优先上游 displayMsg.zh，
+// 其次 msg（带 code），都取不到才回固定兜底 —— 绝不能回「no_healthy_account」那种
+// 把人引去查账号池的文案。
+func TestBadRequestMessage(t *testing.T) {
+	// displayMsg.zh 优先（上游面向用户的中文文案）。
+	withZh := `{"code":11133,"msg":"Invalid request parameters","displayMsg":{"en":"x","zh":"请求参数不符合当前模型要求，请调整后重试。"}}`
+	if got := BadRequestMessage(withZh); got != "请求参数不符合当前模型要求，请调整后重试。" {
+		t.Errorf("displayMsg.zh 未优先: %q", got)
+	}
+	// 无 displayMsg → 回退 msg 且带上 code（便于对照上游文档）。
+	noZh := `{"code":11152,"msg":"the tool name is invalid or duplicated"}`
+	got := BadRequestMessage(noZh)
+	if !strings.Contains(got, "11152") || !strings.Contains(got, "tool name is invalid") {
+		t.Errorf("无 displayMsg 时应回退 msg+code: %q", got)
+	}
+	// 完全解析不出 → 固定兜底非空（且提示排查方向是请求体而非账号）。
+	if got := BadRequestMessage(`not json`); got == "" {
+		t.Error("兜底文案为空")
+	}
+}
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		status int
@@ -119,6 +140,23 @@ func TestClassify(t *testing.T) {
 		// 模型不存在（生产原文）：必须单独归类，好让轮换耗尽时回 404 而非 503。
 		{400, `{"code":11102,"msg":"model [deepseek-v4] service info not found","displayMsg":{"en":"The requested model is not available. Please switch to another model."}}`, ErrModelNotFound},
 		{400, `model [x] service info not found`, ErrModelNotFound},
+		// 请求参数被上游拒绝（11133/11129/11152，2026-09-29 生产原文）：请求侧问题，
+		// 必须单独归类 → 不轮换、原样透传 400。落 ErrClient 兜底会被轮换成 503，
+		// Anthropic 侧映射 overloaded_error，客户端原样重发 10 次 ≈ 15 分钟假死。
+		{400, `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"}}`, ErrBadRequest},
+		{400, `{"code":11129,"msg":"invalid function call parameters","extError":{"code":"invalid_function_parameters"}}`, ErrBadRequest},
+		{400, `{"code":11152,"msg":"the tool name is invalid or duplicated","extError":{"code":"invalid_request_error"}}`, ErrBadRequest},
+		// 冗余判据：业务码字段若被上游加了空白（`"code": 11133`），靠 extError.code 兜住，
+		// 不得退回 ErrClient 兜底（那会重新变成「轮换成 503」的老毛病）。
+		{400, `{"code": 11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid","message":"x"}}`, ErrBadRequest},
+		{400, `{"code": 11129,"msg":"x","extError":{"code":"invalid_function_parameters"}}`, ErrBadRequest},
+		// 11135（图片不可用，生产原文）：同为请求侧，纳入本类避免被轮换成 503。
+		{400, `{"code":11135,"msg":"Please start a new conversation, replace the image, and try again.","extError":{"code":"invalid_request_error"}}`, ErrBadRequest},
+		// 边界：11101 是「JSON 畸形」不是「参数非法」，仍走 ErrBadParams（保留轮换）。
+		{400, `{"code":11101,"msg":"Unmarshal chat params failed"}`, ErrBadParams},
+		// 边界：其他 111xx 业务码不得被误判成 ErrBadRequest。
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrClient},
+		{400, `{"code":11111,"msg":"whatever"}`, ErrClient},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},

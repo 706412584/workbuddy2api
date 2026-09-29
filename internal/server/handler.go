@@ -914,6 +914,29 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 				releaseHeld()
 				return nil
 			}
+			// 请求参数被上游拒绝（400 + 11133/11129/11152）：同 ErrContextExceeded，
+			// **立即回 400，不轮换**。
+			//
+			// 两个理由与上下文超限完全一致：换号毫无意义（参数校验是请求体属性，每个
+			// 账号返回一字不差的 400），状态码必须是 4xx（503 会被 Anthropic 映射成
+			// overloaded_error，客户端读作「服务过载」原样重发，2026-09-29 实测把一个
+			// 畸形二维码 URL 放大成 15 分钟假死）。
+			//
+			// 消息透传上游 displayMsg.zh（如「请求参数不符合当前模型要求，请调整后重试。」）：
+			// 这是能真正定位问题的信息 —— 报「no_healthy_account」会把人引去查账号池。
+			if kind == upstream.ErrBadRequest {
+				writeErrFn := o.writeErr
+				if writeErrFn == nil {
+					writeErrFn = writeOpenAIError
+				}
+				msg := upstream.BadRequestMessage(string(respBody))
+				log.Printf("WARN: [server] bad request uid=%s model=%s: %s",
+					logfmt.UID8(acct.UID), o.model, msg)
+				writeErrFn(w, http.StatusBadRequest, "invalid_request_error", msg)
+				st.status = http.StatusBadRequest
+				releaseHeld()
+				return nil
+			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
 			// 第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端。
@@ -1232,8 +1255,9 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // ErrSafetyBanned 与 ErrContentBlocked 都带「内容审核」语义但方向相反，不可合并：
 // 前者 403 账号侧终态（本函数罚），后者 400 请求侧误报（本函数不罚，走降级重试）。
 //
-// ErrContextExceeded 不在此表：调用方在进入轮换前就把它拦下并直接回 400
-// （换号改变不了请求体，窗口是模型属性），故本函数不会收到该分类。
+// ErrContextExceeded 与 ErrBadRequest 都不在此表：调用方在进入轮换前就把它们拦下并
+// 直接回 400（换号改变不了请求体——前者窗口是模型属性，后者参数校验是请求体属性），
+// 故本函数不会收到这两个分类。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
 // 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
