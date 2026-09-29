@@ -222,6 +222,12 @@ func anthropicUserToChatMessages(raw json.RawMessage) ([]ChatMessage, error) {
 					Type:     "image_url",
 					ImageURL: &ChatImageURL{URL: uri},
 				})
+			} else if note := anthropicImageDropNote(b.Source); note != "" {
+				// 畸形 URL 无法安全转发（实测 `...png "扫描此二维码测试游戏"` 会让上游
+				// 回 400 code=11133）。降级成一条文字说明：既不把非法参数透传给上游，
+				// 也不让图片无声消失 —— 模型能知道「这里原本有张图但没取到」。
+				textParts = append(textParts, note)
+				parts = append(parts, ChatContentPart{Type: "text", Text: note})
 			}
 		}
 	}

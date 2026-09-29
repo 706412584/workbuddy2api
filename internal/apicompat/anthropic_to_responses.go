@@ -3,6 +3,7 @@ package apicompat
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -238,6 +239,9 @@ func anthropicUserToResponses(raw json.RawMessage) ([]ResponsesInputItem, error)
 		case "image":
 			if uri := anthropicImageToDataURI(b.Source); uri != "" {
 				parts = append(parts, ResponsesContentPart{Type: "input_image", ImageURL: uri})
+			} else if note := anthropicImageDropNote(b.Source); note != "" {
+				// 畸形 URL 无法转发：补一条文字说明，别让图片无声消失。
+				parts = append(parts, ResponsesContentPart{Type: "input_text", Text: note})
 			}
 		}
 	}
@@ -349,17 +353,63 @@ func fromResponsesCallID(id string) string {
 	return id
 }
 
-// anthropicImageToDataURI converts an AnthropicImageSource to a data URI string.
-// Returns "" if the source is nil or has no data.
+// anthropicImageToDataURI converts an AnthropicImageSource into a URI the
+// upstream can consume: a data URI for base64 sources, or the raw http(s) URL
+// for URL sources. Returns "" when the source is nil, empty, or carries a URL
+// that cannot be safely forwarded (see isForwardableImageURL).
 func anthropicImageToDataURI(src *AnthropicImageSource) string {
-	if src == nil || src.Data == "" {
+	if src == nil {
 		return ""
 	}
-	mediaType := src.MediaType
-	if mediaType == "" {
-		mediaType = "image/png"
+	if src.Data != "" {
+		mediaType := src.MediaType
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		return "data:" + mediaType + ";base64," + src.Data
 	}
-	return "data:" + mediaType + ";base64," + src.Data
+	// URL 源：合法 http(s) URL 原样转发（上游能直接取图，实测 200）；畸形 URL 返回空，
+	// 由调用方降级成一条文字说明，而不是把非法参数透传给上游换回一个 400 code=11133。
+	if isForwardableImageURL(src.URL) {
+		return src.URL
+	}
+	return ""
+}
+
+// isForwardableImageURL reports whether a raw URL from an image source can be
+// forwarded to the upstream as an image_url: an absolute http/https URL with no
+// whitespace or control characters.
+//
+// 空白字符检查是这里的**关键**且不能省：MCP 工具会把中文说明拼进 URL 尾部
+// （实测 `...png "扫描此二维码测试游戏"`），该串在 JSON 里完全合法，但 net/url
+// 对含空格的 URL 并不报错（空格落进 Path 字段），网关若原样透传，上游会回
+// 400 code=11133 model_param_invalid → 轮换耗尽 → 503 → 客户端 15 分钟假死。
+func isForwardableImageURL(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if strings.ContainsAny(raw, " \t\r\n") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return u.Host != ""
+}
+
+// anthropicImageDropNote returns a short note to append as text when an image
+// source cannot be forwarded, so the model (and anyone reading the transcript)
+// learns an image was dropped instead of silently losing it. Empty when the
+// source is absent, is base64, or has no URL at all.
+func anthropicImageDropNote(src *AnthropicImageSource) string {
+	if src == nil || src.Data != "" || src.URL == "" {
+		return ""
+	}
+	return "[image omitted: its URL could not be forwarded to the model]"
 }
 
 // convertToolResultOutput extracts text and image content from a tool_result
@@ -398,6 +448,10 @@ func convertToolResultOutput(b AnthropicContentBlock) (string, []ResponsesConten
 		case "image":
 			if uri := anthropicImageToDataURI(ib.Source); uri != "" {
 				imageParts = append(imageParts, ResponsesContentPart{Type: "input_image", ImageURL: uri})
+			} else if note := anthropicImageDropNote(ib.Source); note != "" {
+				// 畸形 URL（如 MCP 工具把说明文字拼进 URL）无法转发：写进 tool 输出文字里，
+				// 免得模型以为工具真的返回了图片。
+				textParts = append(textParts, note)
 			}
 		}
 	}

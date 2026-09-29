@@ -104,10 +104,21 @@ func (b AnthropicContentBlock) MarshalJSON() ([]byte, error) {
 }
 
 // AnthropicImageSource describes the source data for an image content block.
+//
+// Type 有两态（与 Anthropic 官方 API 一致）：
+//   - "base64"：图片数据在 Data（+ MediaType）；
+//   - "url"：图片在 URL。官方 API 本身不接受 url，但 MCP 工具（如
+//     mcp__taptap-maker__generate_test_qrcode）会产出这种块，且 URL 可能被工具
+//     拼进一段带引号的说明文字（实测：`...png "扫描此二维码测试游戏"`）。
+//
+// 之前缺 URL 字段导致这类块被静默丢弃（anthropicImageToDataURI 见 Data=="" 返回
+// 空），既没让模型看到图，也没告诉调用方；而 chat 路径又会把 URL 原样透传给上游
+// 触发 400。现在 URL 保留在结构里，由 anthropicImageToDataURI 统一做合法性判断。
 type AnthropicImageSource struct {
-	Type      string `json:"type"` // "base64"
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
+	Type      string `json:"type"` // "base64" | "url"
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 // AnthropicTool describes a tool available to the model.
