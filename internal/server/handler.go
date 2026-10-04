@@ -924,10 +924,24 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			//
 			// 消息透传上游 displayMsg.zh（如「请求参数不符合当前模型要求，请调整后重试。」）：
 			// 这是能真正定位问题的信息 —— 报「no_healthy_account」会把人引去查账号池。
+			//
+			// 但要先区分「上下文超限」与「真参数错误」：上游对二者都回 400 11133
+			// （model_param_invalid），逐字节同形（见 contextcheck.go）。用本地估算判：
+			// 估算已越窗口 → 按超限回 "prompt is too long: N tokens > M maximum"，
+			// 让客户端触发自动压缩；否则才是真参数错误，回泛化文案。
 			if kind == upstream.ErrBadRequest {
 				writeErrFn := o.writeErr
 				if writeErrFn == nil {
 					writeErrFn = writeOpenAIError
+				}
+				if overflow, est, window := h.contextOverflowLikely(body, o.allowedRegions); overflow {
+					msg := contextLengthExceededMessage(est, window)
+					log.Printf("WARN: [server] context exceeded (via 11133) uid=%s model=%s est_tokens=%d window=%d: %s",
+						logfmt.UID8(acct.UID), o.model, est, window, msg)
+					writeErrFn(w, http.StatusBadRequest, "context_length_exceeded", msg)
+					st.status = http.StatusBadRequest
+					releaseHeld()
+					return nil
 				}
 				msg := upstream.BadRequestMessage(string(respBody))
 				log.Printf("WARN: [server] bad request uid=%s model=%s: %s",

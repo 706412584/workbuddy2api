@@ -336,6 +336,137 @@ func TestChatBadRequestAnthropicMapsToInvalidRequest(t *testing.T) {
 	}
 }
 
+// bigMessagesBody 构造一个 messages 内容估算后超过 window 的请求体（ASCII 1 字符 ≈ 0.25
+// token → 需要约 4*chars 个字符才能逼近 window token）。返回可直接发往
+// /v1/chat/completions 的 JSON。
+func bigMessagesBody(model string, chars int) string {
+	content := strings.Repeat("a", chars)
+	return `{"model":"` + model + `","messages":[{"role":"user","content":"` + content + `"}]}`
+}
+
+// TestChatOversizedContextReportsPromptTooLong 上游对「超限」与「参数错误」都回 400
+// 11133（同形）。本地估算判定已越窗口时，网关必须改判为 context_length_exceeded 并回
+// "prompt is too long: ... maximum"，让客户端触发自动压缩 —— 而不是泛化的 invalid_request_error。
+//
+// 回归：2026-10-03 实测上游对 1M 窗口模型在 ~1.47M token 输入时回 11133（非 11115）。
+func TestChatOversizedContextReportsPromptTooLong(t *testing.T) {
+	resetModelsCache()
+	// glm-5.2 静态窗口 1,000,000；构造约 5M 字符 → 估算 ~1.25M token > 窗口，明确超限。
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"}}`, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(bigMessagesBody("glm-5.2", 5_000_000))))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
+	}
+	got := rec.Body.String()
+	if !strings.Contains(got, "prompt is too long") || !strings.Contains(got, "maximum") {
+		t.Errorf("超限应回 Anthropic 同款 'prompt is too long: N tokens > M maximum'，实际: %s", got)
+	}
+	if strings.Contains(got, "请求参数不符合当前模型要求") {
+		t.Errorf("超限不得回泛化参数文案（客户端读不出压缩信号）: %s", got)
+	}
+}
+
+// TestChatOversizedContextAnthropicKeeps400 超限经 Anthropic 入口也必须是 400
+// （invalid_request_error），而不是 503 overloaded_error。
+func TestChatOversizedContextAnthropicKeeps400(t *testing.T) {
+	resetModelsCache()
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"}}`, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Protocol: ProtocolConfig{ModelMapping: map[string]string{"claude-sonnet-4-5": "glm-5.2"}},
+	})
+	// 客户端模型名是 claude-*，映射到 glm-5.2（窗口 1M）。构造超限 body。
+	body := `{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"` +
+		strings.Repeat("a", 5_000_000) + `"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400，不能是 503)", rec.Code, rec.Body)
+	}
+	var res struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("响应非 JSON: %v body=%s", err, rec.Body)
+	}
+	if res.Error.Type != "invalid_request_error" {
+		t.Errorf("error.type=%q want invalid_request_error（不能是 overloaded_error）", res.Error.Type)
+	}
+	if !strings.Contains(res.Error.Message, "prompt is too long") {
+		t.Errorf("超限文案应为 prompt is too long，实际: %s", res.Error.Message)
+	}
+}
+
+// TestChatSmallBadRequestStaysGeneric 未超限的 11133（真参数错误）必须保持泛化文案，
+// 不得被误判为超限 —— 本地估算只用于「上游已拒绝后」的区分，不能改变拒绝与否。
+func TestChatSmallBadRequestStaysGeneric(t *testing.T) {
+	resetModelsCache()
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"},"displayMsg":{"zh":"请求参数不符合当前模型要求，请调整后重试。"}}`, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	got := rec.Body.String()
+	if strings.Contains(got, "prompt is too long") {
+		t.Errorf("小请求不得被误判为超限: %s", got)
+	}
+	if !strings.Contains(got, "请求参数不符合当前模型要求") {
+		t.Errorf("应透传上游 displayMsg.zh: %s", got)
+	}
+}
+
+// TestEstimateUpstreamInputTokensReadsBodyModel 估算必须从 body.model 取模型名
+// （而非客户端模型名）—— Anthropic 入口 o.model 是 claude-*，窗口要按 body 里的上游名查。
+func TestEstimateUpstreamInputTokensReadsBodyModel(t *testing.T) {
+	n, model := estimateUpstreamInputTokens([]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}]}`))
+	if model != "glm-5.2" {
+		t.Errorf("model=%q want glm-5.2", model)
+	}
+	if n <= 0 {
+		t.Errorf("est=%d want >0", n)
+	}
+}
+
+// TestContextWindowForModelPrefersMinRegion 未限区域时应取两区窗口的最小值（保守）。
+func TestContextWindowForModelPrefersMinRegion(t *testing.T) {
+	resetModelsCache()
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})})
+	// glm-5.2 两区都收录且都是 1,000,000。
+	if w := h.contextWindowForModel("glm-5.2", nil); w != 1000000 {
+		t.Errorf("glm-5.2 window=%d want 1000000", w)
+	}
+	// 未知模型 → 0（跳过预检）。
+	if w := h.contextWindowForModel("no-such-model", nil); w != 0 {
+		t.Errorf("未知模型 window=%d want 0", w)
+	}
+}
+
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {
