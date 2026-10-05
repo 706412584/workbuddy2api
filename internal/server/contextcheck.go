@@ -1,12 +1,20 @@
 // contextcheck.go 上下文预算的**本地估算**：用于把上游那个含糊的 400 11133
 // 区分为「上下文超限」还是「参数错误」。
 //
-// 背景（2026-10-03 实测）：
+// 背景（2026-10-06 直连两区上游实测，逐字节对比）：
 //
-//	上游在「输入超出模型上下文窗口」时**不返回 11115（context_length_exceeded）**，
-//	而是返回 400 + code=11133 + extError.code="model_param_invalid" —— 与「tool
-//	schema 畸形」「图片 URL 非法」等真正的参数错误**逐字节同形**。实测同一个 1M
-//	上下文模型：输入 ~975K token → 200，~1.47M token → 400 11133。
+//	**两区行为不同**，这是问题的根源：
+//
+//	- CN（copilot.tencent.com）：输入超窗口时回 400 + code=**11115**，body 里直接
+//	  带精确计数与官方话术 —— "prompt is too long: 1252240 tokens > 1048576
+//	  maximum"，extError.code=invalid_request_error。**无需本地估算**，网关的
+//	  ErrContextExceeded 分支已原样透传该文案（见 upstream.ContextExceededMessage）。
+//
+//	- global（www.workbuddy.ai）：输入超窗口时**不返回 11115**，而是回 400 +
+//	  code=**11133** + extError.code="model_param_invalid" —— 与「tool schema 畸形」
+//	  「tool 名非法」等真正的参数错误**逐字节同形**（实测：超限与坏 tool 名两个请求
+//	  的 body 完全一致，均无任何 token 计数或提示）。于是 global 侧唯一可用的判据
+//	  就是**本地估算**。
 //
 //	若一律按参数错误回泛化文案（「请求参数不符合当前模型要求，请调整后重试。」），
 //	客户端读不出「该压缩上下文了」这个信号，自动压缩永不触发 —— 与 issue「503 被
@@ -15,9 +23,8 @@
 // 做法：**不预先拒绝**（本地估算有误差，提前拒绝可能误伤上游本可接受的请求），
 // 而是在上游已返回 11133 之后，用本地估算判断「这个请求是不是本就超了窗口」：
 //
-//   - 估算已越界 → 这是上下文超限，回 Anthropic 官方同款 "prompt is too long:
-//     N tokens > M maximum"（客户端按此触发压缩）；
-//   - 估算远未越界 → 是真正的参数错误，回泛化参数文案。
+//   - 估算越界 → 按上下文超限回 Anthropic 同款 "prompt is too long …"（触发压缩）；
+//   - 估算远未越界 → 真正的参数错误，回泛化参数文案。
 //
 // 只在「上游已拒绝」这个前提下做判断，故估算误差只会影响**文案**，不会改变
 // 「请求是否被拒绝」—— 代价被压到最小。
@@ -122,10 +129,38 @@ func (h *Handler) contextWindowForModel(model string, regions []auth.Region) int
 
 // contextOverflowLikely 判断「上游以 11133 拒绝的这个请求，是否本就超出了上下文窗口」。
 //
-// 判据：本地估算输入 > 窗口 * (1 - margin)。留 margin 是因为 estimateTokens 对代码/
-// JSON 这类符号密集文本会**低估**（真实 BPE 在符号串上切得更碎）：低估时 est 偏小，
-// 少判成超限 → 退回泛化参数文案（不误伤，只是信号弱一点）；估准或略高估时按超限处理。
-// 取 5% 余量覆盖实测误差量级。
+// 判据：本地估算输入 > 窗口 * underEstimateSlack。
+//
+// 为什么 slack 远小于 1（而不是「估到接近窗口才算」）：
+//
+//	estimateTokens 用固定的 0.25 token/字符估 ASCII，而真实 BPE 对**代码/JSON 这类
+//	符号密集文本**切得更碎。2026-10-06 用真实上游 usage.prompt_tokens 标定（经网关
+//	发同样内容，读回上游计数）：
+//
+//	    Go 源码   真实/估算 = 1.30
+//	    Markdown  真实/估算 = 1.42
+//	    英文散文  真实/估算 = 0.83
+//	    中文      真实/估算 = 1.05
+//
+//	即结构化内容**低估最多 ~1.4 倍**。若阈值取 0.95×窗口，则真实 token 要到
+//	~1.35×窗口 才判超限 —— 而真实超限发生在 1.0×窗口，于是 est 落在
+//	[0.65×窗口, 0.95×窗口) 的真实超限请求全被漏判成「参数错误」（正是线上现象）。
+//
+//	取 underEstimateSlack = 0.65 ≈ 1/1.54：给实测最坏低估（1.42）留了余量，
+//	真实超限（real = 窗口）在**最坏低估**下 est 仍有 ~0.70×窗口，稳在阈值之上。
+//	覆盖代码 / Markdown / minified JSON（实测比率 1.23~1.42），**盖不住**极端高密度
+//	内容 —— base64 实测 2.87、hex 2.34（随机字母数字几乎不可压缩，1 字符≈1 token）。
+//	这类内容真实超限时 est 仅 ~0.35×窗口，仍会被漏判成参数错误。**不做更低阈值**
+//	是刻意的：阈值越低，越容易把「中等体积的真实参数错误」误判成超限，而若该参数
+//	错误持续存在，客户端会反复压缩却始终看不到真正的报错原因（比漏判更难排查）。
+//	两害相权取保守值。
+//
+// 宁可略过报，不可漏报：走到本函数时上游**已经**以 11133 拒绝了本次请求，
+// 不存在「把成功请求误判成失败」的风险 —— 唯一的差别是**文案**。而两种错的代价不对称：
+//
+//   - 漏报（超限却说参数错误）→ 客户端读不出压缩信号，原样重发 → 永远失败（本次 bug）；
+//   - 过报（参数错误却说超限）→ 客户端压缩后重发；若真是参数问题，压缩后 est 变小、
+//     再次 11133 时即落回泛化文案，客户端最终仍能看到真实原因（自纠正，代价有界）。
 //
 // 返回 (isOverflow, estTokens, window)。窗口未知或无法估算时 isOverflow=false。
 func (h *Handler) contextOverflowLikely(body []byte, regions []auth.Region) (bool, int, int64) {
@@ -137,8 +172,9 @@ func (h *Handler) contextOverflowLikely(body []byte, regions []auth.Region) (boo
 	if window <= 0 {
 		return false, est, 0
 	}
-	const margin = 0.05
-	limit := int64(float64(window) * (1 - margin))
+	// 见上：0.65 ≈ 1 / 1.54，给实测最坏低估（1.42）留余量，保证真实超限不漏判。
+	const underEstimateSlack = 0.65
+	limit := int64(float64(window) * underEstimateSlack)
 	return int64(est) > limit, est, window
 }
 

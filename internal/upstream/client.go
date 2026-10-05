@@ -284,11 +284,18 @@ func IsModelNotFound(body string) bool {
 // 11135 未观测到独立的 extError.code（其 extError.code 复用 invalid_request_error，
 // 该串过于宽泛不能作判据），故只用业务码。
 //
-// 重要：11133 是**复用码**。2026-10-03 实测，输入超出模型上下文窗口时上游也回
-// 11133 + model_param_invalid（与上面几个真参数错误逐字节同形）—— 即 11133 混了
-// 「参数错误」与「上下文超限」两种语义，仅凭本响应体无法区分。区分靠**本地估算**
-// （输入 token 数 vs 模型窗口），见 internal/server/contextcheck.go；分类层保持不动
-// （两者都是「请求侧、不轮换、回 400」，分类一致即可），文案在 handler 层分流。
+// 重要：**global 侧** 11133 是复用码。2026-10-06 直连两区实测：
+//
+//   - CN（copilot.tencent.com）：超限回 **11115**（"prompt is too long: N tokens >
+//     M maximum"，带精确计数），与真参数错误分得清 —— 走 ErrContextExceeded 分支。
+//   - global（www.workbuddy.ai）：超限**不返回 11115**，而是回 11133 +
+//     model_param_invalid，与「tool 名非法」等真参数错误**逐字节同形**（两个请求的
+//     body 实测完全一致，均无 token 计数）。
+//
+// 故只有 global 侧混了「参数错误」与「上下文超限」两种语义，仅凭响应体无法区分。
+// 区分靠**本地估算**（输入 token 数 vs 模型窗口），见 internal/server/contextcheck.go；
+// 分类层保持不动（两者都是「请求侧、不轮换、回 400」，分类一致即可），文案在
+// handler 层分流。
 var badRequestBizCodes = []string{
 	`"code":11133`, `"model_param_invalid"`,
 	`"code":11129`, `"invalid_function_parameters"`,

@@ -441,6 +441,36 @@ func TestChatSmallBadRequestStaysGeneric(t *testing.T) {
 	}
 }
 
+// TestChatMarginalOverflowStillReportsPromptTooLong 回归线上现象（2026-10-06）：
+// global 上游对超限只回含糊的 11133，判超限完全依赖本地估算，而估算对代码/JSON
+// 密集内容会**低估最多 ~1.4 倍**。若阈值取 0.95×窗口，则真实 token 刚过窗口
+// （est ≈ 0.70~0.95×窗口）的超限请求会被漏判成「参数错误」，用户看到的就是泛化文案。
+//
+// 本用例构造 est ≈ 0.8×窗口（1M 窗口 → 3.2M 字符 ≈ 0.8M est），落在旧阈值
+// （0.95M）之下、新阈值（0.65M）之上，必须判为超限。
+func TestChatMarginalOverflowStillReportsPromptTooLong(t *testing.T) {
+	resetModelsCache()
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"}}`, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	// glm-5.2 窗口 1,000,000；3.2M ASCII 字符 × 0.25 ≈ 800K est，介于 700K 与 950K 之间。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(bigMessagesBody("glm-5.2", 3_200_000))))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
+	}
+	got := rec.Body.String()
+	if !strings.Contains(got, "prompt is too long") {
+		t.Errorf("est≈0.8×窗口 的真实超限必须判为超限（旧阈值会漏判）: %s", got)
+	}
+}
+
 // TestEstimateUpstreamInputTokensReadsBodyModel 估算必须从 body.model 取模型名
 // （而非客户端模型名）—— Anthropic 入口 o.model 是 claude-*，窗口要按 body 里的上游名查。
 func TestEstimateUpstreamInputTokensReadsBodyModel(t *testing.T) {
