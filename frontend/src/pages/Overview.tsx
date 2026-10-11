@@ -836,6 +836,16 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
                         {a.soft_streak ? (
                           <div style={{ fontSize: 11 }}>连续退避 ×{a.soft_streak}</div>
                         ) : null}
+                        {a.model_cools?.map((mc) => (
+                          <div
+                            key={mc.model}
+                            className="mono"
+                            style={{ fontSize: 11, marginTop: 3, color: 'var(--warn)' }}
+                          >
+                            仅 {mc.model} 冷却 · 剩 {fmtDuration(Math.max(0, mc.remaining_sec))}
+                            {mc.reason ? ` · ${mc.reason}` : ''}
+                          </div>
+                        ))}
                       </td>
                       <td>
                         <div className="row" style={{ flexWrap: 'nowrap' }}>

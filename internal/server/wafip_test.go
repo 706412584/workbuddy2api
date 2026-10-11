@@ -106,16 +106,18 @@ func TestChatWafIPFailFastStopsRotation(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "waf ip-level block") {
 		t.Errorf("empty-body 503 must carry readable local waf_ip text: %s", rec.Body)
 	}
-	// IP 级激活期间账号软冷却照常记账（协同不叠加）：两号均 soft_rate 冷却中。
+	// IP 级激活期间账号软冷却照常记账（协同不叠加）：两号均在该模型上 soft_rate 冷却中。
 	for _, uid := range []string{"u1", "u2"} {
-		st, _ := p.Status(uid)
-		if !st.Cooling || st.Disabled {
-			t.Errorf("uid=%s must soft-cool without disable (IP state coexists, not stacks): %+v", uid, st)
+		mc := modelCoolOf(t, p, uid, "glm-5.2")
+		if mc.Kind != "soft_rate" {
+			t.Errorf("uid=%s must soft-cool on the requested model: %+v", uid, mc)
+		}
+		if st, _ := p.Status(uid); st.Disabled {
+			t.Errorf("uid=%s must not be disabled (IP state coexists, not stacks): %+v", uid, st)
 		}
 	}
 	// u3 从未被调用：不冷却、可选。
-	st3, _ := p.Status("u3")
-	if st3.Cooling {
+	if st3, _ := p.Status("u3"); st3.Cooling || len(st3.ModelCools) != 0 {
 		t.Errorf("u3 must not be cooled (never called): %+v", st3)
 	}
 }
@@ -166,9 +168,8 @@ func TestChatWafSingleAccountStillRotates(t *testing.T) {
 		t.Errorf("calls=%d want 2 (bad once + good once)", n)
 	}
 	// bad 号软冷却不受 IP 级状态影响（未触发）。
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Errorf("single-account WAF must soft-cool: %+v", st)
+	if mc := modelCoolOf(t, p, "bad", "glm-5.2"); mc.Kind != "soft_rate" {
+		t.Errorf("single-account WAF must soft-cool: %+v", mc)
 	}
 }
 
@@ -194,8 +195,8 @@ func TestChatWafIPGateClearsAfterExpiryThenRotates(t *testing.T) {
 	// 等两个维度过期：IP 窗（150ms）+ 账号软冷却（wafCooldownBase 抖动下界 45s
 	// 太长——直接 Cooldown 0 强制解除，聚焦 IP 窗语义）。
 	time.Sleep(200 * time.Millisecond)
-	p.Cooldown("u1", pool.CoolSoft, 0, "force expiry")
-	p.Cooldown("u2", pool.CoolSoft, 0, "force expiry")
+	p.Cooldown("u1", pool.CoolSoft, 0, "force expiry", "")
+	p.Cooldown("u2", pool.CoolSoft, 0, "force expiry", "")
 	// 阶段二：窗口过期后单号 403（u1 bad / u2 good）→ 不 fail-fast，换到 u2 成功。
 	up2 := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at1" {
@@ -231,18 +232,18 @@ func TestChatWafIPSoftCooldownUnaffected(t *testing.T) {
 		t.Fatalf("code=%d want 503", rec.Code)
 	}
 	for _, uid := range []string{"u1", "u2"} {
-		st, _ := p.Status(uid)
-		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Fatalf("uid=%s must be in soft_rate cooldown: %+v", uid, st)
+		mc := modelCoolOf(t, p, uid, "glm-5.2")
+		if mc.Kind != "soft_rate" {
+			t.Fatalf("uid=%s must be in soft_rate cooldown: %+v", uid, mc)
 		}
-		if st.SoftStreak != 1 {
-			t.Errorf("uid=%s soft_streak=%d want 1 (one WAF hit each, no stacking)", uid, st.SoftStreak)
+		if mc.SoftStreak != 1 {
+			t.Errorf("uid=%s soft_streak=%d want 1 (one WAF hit each, no stacking)", uid, mc.SoftStreak)
 		}
-		if d := time.Duration(st.CoolRemaining) * time.Second; d < 45*time.Second || d > 75*time.Second {
+		if d := time.Duration(mc.RemainingSec) * time.Second; d < 45*time.Second || d > 75*time.Second {
 			t.Errorf("uid=%s cool=%v want in [45s,75s] (IP state must not extend account cooldown)", uid, d)
 		}
-		if !strings.Contains(st.Reason, "waf") {
-			t.Errorf("uid=%s reason=%q want waf marker", uid, st.Reason)
+		if !strings.Contains(mc.Reason, "waf") {
+			t.Errorf("uid=%s reason=%q want waf marker", uid, mc.Reason)
 		}
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// TestWafSoftCooldownBounds WAF 403 的账号级软冷却时长落 [45s,75s]
+// TestWafSoftCooldownBounds WAF 403 的**模型级**软冷却时长落 [45s,75s]
 // （60s 基数经 ±25% 抖动），且不 Disable、不喂熔断。
 func TestWafSoftCooldownBounds(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -25,11 +25,10 @@ func TestWafSoftCooldownBounds(t *testing.T) {
 	if st.Disabled {
 		t.Fatalf("WAF 403 must not disable the account (频控非账号故障): %+v", st)
 	}
-	if !st.Cooling {
-		t.Fatalf("WAF 403 must soft-cool the account: %+v", st)
-	}
-	// CoolRemaining 单位秒；抖动区间 [45,75] 留 1s 余量。
-	rem := time.Duration(st.CoolRemaining) * time.Second
+	// WAF 403 按 (账号, 模型) 记账：封的是本次请求的模型，不连带封掉整个账号。
+	mc := modelCoolOf(t, p, "u1", "glm-5.2")
+	// RemainingSec 单位秒；抖动区间 [45,75] 留 1s 余量。
+	rem := time.Duration(mc.RemainingSec) * time.Second
 	if rem < 44*time.Second || rem > 76*time.Second {
 		t.Fatalf("WAF cooldown=%v want [45s,75s] (60s base ±25%% jitter)", rem)
 	}

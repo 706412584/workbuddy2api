@@ -980,7 +980,7 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			}
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
+		h.cfg.Pool.NoteSuccess(acct.UID, o.model)
 
 		// 流式：转发必须在轮换循环内完成 —— 思考死循环只能靠「读了若干帧之后」
 		// 才判得出来，若交给调用方转发，这里就没有重试的机会了。
@@ -1250,12 +1250,18 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 八条路径，各司其职：
-//   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
-//     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
-//     封顶 soft_rate_max，记录触发模型供切模型豁免）。
-//   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
+// **记账粒度**：多数上游失败只对一个模型成立（14018 付不起 / 6004 限流 / WAF 403 频控 /
+// 404 路由缺失），一律记 (账号, 模型) 二元组；只有「账号真的坏了」的两类才是账号级：
+// 12153 session dead（Disable）、11140 内容封控（CoolSafety）。理由与实证见 pool.modelCool。
+//
+// 九条路径，各司其职：
+//   - ErrHardCredit → CooldownUntilTomorrow4AM(uid, reason, model)：模型级硬冷却到次日 04:00
+//     （等签到恢复）。**不冻结账号**——同账号在免费模型上仍可用（2026-10-11 实测）。
+//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate, model) 连续触发按**该模型**的
+//     streak 指数退避（封顶 soft_rate_max）；若上游 body 为模型级 6004 且带重置时间 →
+//     CooldownSoftForModel（until=重置墙钟，封顶 soft_rate_max）。
+//   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s, model)：短冷却防雪崩，
+//     不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrSafetyBanned → CooldownSafetyBanned(safetyBannedCooldown 固定 6h)：账号级内容安全
 //     封控，长冷却。**不 Disable**——该形态有自愈可能（风控窗口滑动），且未必是账号坏了
@@ -1274,16 +1280,21 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // 故本函数不会收到这两个分类。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
-// 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
+// 携带的模型名，是所有模型级冷却的记账键（空串 = 调用方无模型信息，退化为账号级）。
 //
-// 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
-// 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
+// 恢复出口：模型级冷却由「到期」或「该模型上的一次成功（NoteSuccess）」解除；
+// 账号级冷却（CoolSafety）各自到期恢复；熔断按其指数退避截止到期；
+// 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）清全部冷却。
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
-		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
+		//
+		// **模型级**：14018 表达的是「这个模型付不起」而非「账号没额度」——2026-10-11 实测
+		// 返 14018 的账号在 deepseek-v4.1-flash / hy3 上均 200。记成账号级会把免费模型的
+		// 可用账号一起封到 04:00，正是当天 503 的成因（见 pool.modelCool）。
+		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足", model)
 	case upstream.ErrSoftRate:
 		// 模型级 6004 且带「将在 … 重置」时间（issue #31）：冷却到上游明说的重置墙钟
 		// （封顶 soft_rate_max），记录触发模型 → 该账号对**其他模型**请求可豁免冷却。
@@ -1294,17 +1305,18 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				return
 			}
 		}
-		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时
-		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一 (账号, 模型)
+		// 连续触发时 pool 内部按该模型的 streak 指数退避并封顶 soft_rate_max。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit", model)
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrWafBlock:
-		// WAF 403（无业务信封的拦截形态）：账号级软冷却，**不 Disable**——WAF 403
+		// WAF 403（无业务信封的拦截形态）：**模型级**软冷却，**不 Disable**——WAF 403
 		// 是 IP/指纹维频控信号（被拦后账号本身仍健康），罚过即走、到期自愈。
+		// 记模型级：频控按请求路径生效，把账号整体封住会连带封掉没被拦的模型。
 		// 基数经 jitterDur 抖动（复用 backoff.go 单一抖动来源，防多账号同相位
 		// 冷却到期再聚团）；指数升级/封顶由 Cooldown(CoolSoft) 既有机制接管。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "waf 403")
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "waf 403", model)
 	case upstream.ErrSafetyBanned:
 		// 账号级内容安全封控（403 + 11140 + request illegal）。
 		//
@@ -1320,11 +1332,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.CooldownSafetyBanned(uid, d, "11140 request illegal")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "11140 request illegal (pending)")
+		// 11140 是账号级内容安全形态：未达阈值的过渡态与达阈值的长冷却同为**账号级**
+		// （与 6004/14018 的模型级不同）——它不是"某个模型不行"，而是风控盯上了这个号。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "11140 request illegal (pending)", "")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
-		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。记模型级：404 多为该模型/
+		// 路由维的缺失，不该连带封掉账号在别的模型上的可用性。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404", model)
 	case upstream.ErrServer:
 		// 5xx 上游故障：只换号不罚账号。
 		// 上游整体故障（APISIX 502/504、网关超时）时每个账号都会失败——喂熔断计数

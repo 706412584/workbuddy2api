@@ -4,6 +4,18 @@
 
 export type Region = 'cn' | 'global'
 
+/** 单个 (账号, 模型) 的冷却明细。对应 pool.ModelCoolStatus。
+ *  上游多数失败只对一个模型成立（14018 付不起 / 6004 限流 / WAF 频控），
+ *  这类冷却不写账号级 until，只体现在这里。 */
+export interface ModelCoolStatus {
+  model: string
+  kind: string
+  reason?: string
+  until: string
+  remaining_sec: number
+  soft_streak?: number
+}
+
 /** 单个账号的观测状态（脱敏）。对应 pool.Status。 */
 export interface AccountStatus {
   uid: string
@@ -11,7 +23,7 @@ export interface AccountStatus {
   nickname?: string
   credits: number
   cooling: boolean
-  /** "hard_credit"（余额耗尽，等签到）| "soft_rate"（429，短冷却） */
+  /** "hard_credit"（余额耗尽，等签到）| "soft_rate"（429，短冷却）| "safety_banned"（内容封控） */
   cool_kind?: string
   /** 冷却剩余秒数，仅在 cooling 为 true 时存在 */
   cool_remaining_sec?: number
@@ -19,6 +31,8 @@ export interface AccountStatus {
   reason?: string
   /** 连续软冷却次数，指数退避的指数 */
   soft_streak?: number
+  /** 仅在该模型上冷却的记录（账号对其他模型仍可用） */
+  model_cools?: ModelCoolStatus[]
   disabled: boolean
   success_count?: number
   err_total?: number

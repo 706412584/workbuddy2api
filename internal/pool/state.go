@@ -191,10 +191,18 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 }
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
-// 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
+// 二进制模型：清 fails + retryCount + breakerUntil；不碰账号级 until/coolKind
+// （那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
-func (p *Pool) NoteSuccess(uid string) {
+//
+// model 非空时**额外清除该 (账号, 模型) 的模型级冷却**：一次真实成功是该模型可用的
+// 最强证据（sub2api 的 recordSuccess 直接删掉 account+model 记录，同口径）。
+// 这是打破「冷却 → 永不被选中 → 永远没机会证明自己」死锁的关键一环：
+// 除了签到与人工重置，真实流量本身也能解冻。
+//
+// 账号级 until/coolKind 不动：账号级冷却（11140）表达的故障与单次成功无关。
+func (p *Pool) NoteSuccess(uid, model string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -206,6 +214,9 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.softStreak = 0
 		e.sessionDeadFails = 0
 		e.safetyBannedFails = 0
+		if model != "" {
+			delete(e.modelCools, model)
+		}
 		p.dirty.Store(true)
 	}
 }
@@ -253,7 +264,7 @@ func (p *Pool) Reset(uid string, includeDisabled bool) (before, after string) {
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.softRateModel = ""
+	p.clearModelCoolsLocked(e)
 	e.breakerUntil = time.Time{}
 	e.fails = 0
 	e.retryCount = 0
@@ -288,6 +299,7 @@ func (p *Pool) NoteTestOK(uid string) {
 	e.reason = ""
 	e.coolKind = 0
 	e.softStreak = 0
+	p.clearModelCoolsLocked(e)
 	e.breakerUntil = time.Time{}
 	e.fails = 0
 	e.retryCount = 0
@@ -460,10 +472,9 @@ func (p *Pool) CountsDetailedWhere(pred func(*auth.Auth) bool) (total, healthy, 
 // 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
 //
-// 模型级豁免（issue #31 的探活侧补齐）：6004 模型级软冷却中的账号（modelExempt 形态）
-// 对触发模型不可用、对其他模型仍可选——chat 的 healthyForModel 已按此放行切模型请求，
-// 探活必须同口径，否则"全号被 v4.1 限流但 glm 可用"时 chat 实际 200 而 /healthz 误报 503。
-// /healthz 无请求模型上下文，取"存在可服务模型"的存在性语义（与 chat 可达性等价）。
+// 模型级冷却是"部分模型不可用"，不是"账号不可服务"——/healthz 无请求模型上下文，
+// 取"存在可服务模型"的存在性语义（与 chat 可达性等价）：账号级 healthy 即视为可服务，
+// 故此处不再需要 issue #31 时代的 modelExempt 特判。
 func (p *Pool) ServableNow() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -472,7 +483,7 @@ func (p *Pool) ServableNow() bool {
 		if p.inFlightFull(e) {
 			continue
 		}
-		if e.healthy(now) || e.modelExempt() {
+		if e.healthy(now) {
 			return true
 		}
 	}
@@ -552,6 +563,23 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		}
 		st.CoolKind = e.coolKind.String()
 	}
+	// 模型级冷却单列：它们不写 until（账号对其他模型仍可用），只看 Cooling/Until
+	// 会把「4.1-flash 冷却中」的账号显示成正常 —— 运维盲区。
+	for model, mc := range e.modelCools {
+		if mc.until.IsZero() || !now.Before(mc.until) {
+			continue // 已到期：不再展示（条目由下一次写入或重启清理）
+		}
+		st.ModelCools = append(st.ModelCools, ModelCoolStatus{
+			Model:        model,
+			Kind:         mc.kind.String(),
+			Reason:       mc.reason,
+			Until:        mc.until,
+			RemainingSec: int64(time.Until(mc.until).Seconds() + 0.999),
+			SoftStreak:   mc.streak,
+		})
+	}
+	// 输出稳定：map 遍历无序，面板按模型名排序才不会每次刷新都换位置。
+	sort.Slice(st.ModelCools, func(i, j int) bool { return st.ModelCools[i].Model < st.ModelCools[j].Model })
 	return st
 }
 

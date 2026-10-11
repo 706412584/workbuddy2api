@@ -79,9 +79,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel string, pred func(*auth.Auth
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
+		// 全冷却兜底：无 healthy 候选时，从冷却账号里选指定模型上 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, pred, now)
+		return p.pickEarliestExpiryLocked(tried, pred, now, reqModel)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -167,13 +167,18 @@ func (p *Pool) pick(tried map[string]bool, reqModel string, pred func(*auth.Auth
 	return e.a
 }
 
-// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
-// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）与 CoolSafety（内容安全封控号）
-// 同样排除——前者调了必 402，后者调了必 403，都是浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// pickEarliestExpiryLocked 全冷却兜底：在非禁用的冷却/熔断账号中选指定模型上截止最早的一个。
+// 分级：disabled 永不参与；CoolSafety（账号级内容安全封控号）同样排除——调了必 403，
+// 白白浪费轮换并产生噪音日志。**其余冷却一律放行**（含模型级 14018/6004 冷却与熔断号）：
+// 冷却只是"上次失败"的记录，不是"此刻必然失败"的证明，全池无候选时值得用一个请求去证伪。
+//
+// 历史上 CoolHard（余额耗尽）也在此排除，理由是"调了必 402"——2026-10-11 实测证伪：
+// 返 14018 的账号在免费模型上是 200，被排除后直接导致该模型全池 503。既然 14018 现已
+// 按模型记账，这条排除自然消失（见 modelCool）。
+//
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 // pred（可 nil）同样作用于兜底：区域受限请求在全员冷却时不得越区兜底。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, pred func(*auth.Auth) bool, now time.Time) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, pred func(*auth.Auth) bool, now time.Time, reqModel string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -182,8 +187,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, pred func(*auth.A
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
 		}
-		if (e.coolKind == CoolHard || e.coolKind == CoolSafety) && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额耗尽号 / 内容安全封控号不参与兜底：前者必 402，后者必 403
+		if e.coolKind == CoolSafety && !e.until.IsZero() && now.Before(e.until) {
+			continue // 内容安全封控号不参与兜底：调了必 403
 		}
 		if p.inFlightFull(e) {
 			continue
@@ -191,18 +196,19 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, pred func(*auth.A
 		if pred != nil && !pred(e.a) {
 			continue
 		}
-		exp := e.expiry(now)
+		exp := e.expiry(now, reqModel)
 		if exp.IsZero() {
 			continue
 		}
-		if best == nil || exp.Before(best.expiry(now)) {
+		if best == nil || exp.Before(best.expiry(now, reqModel)) {
 			best = e
 		}
 	}
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s",
+		logfmt.UID8(best.a.UID), best.expiry(now, reqModel).Format(time.RFC3339), best.fallbackKind(now, reqModel))
 	best.lastUsed = time.Now()
 	return best.a
 }

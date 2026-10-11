@@ -225,7 +225,7 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
 	p.Add(a)
-	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足", "")
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
@@ -650,7 +650,7 @@ func TestCheckinAllReenablesCoolingAccount(t *testing.T) {
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
 	p.Add(a)
-	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足", "")
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 	out, err := s.CheckinAll()

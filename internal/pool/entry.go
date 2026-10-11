@@ -48,7 +48,11 @@ type Status struct {
 	Until           time.Time `json:"until,omitempty"`
 	Reason          string    `json:"reason,omitempty"`
 	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
-	Disabled        bool      `json:"disabled"`
+	// ModelCools 仍在生效的**模型级**冷却明细（见 entry.modelCools）。
+	// 账号级冷却只反映在 Until/CoolKind 上，模型级冷却不写 Until —— 面板若只看
+	// Cooling/Until 会把「只在该模型被限流」的账号显示成正常，故单列出来供展示。
+	ModelCools      []ModelCoolStatus `json:"model_cools,omitempty"`
+	Disabled        bool              `json:"disabled"`
 	DisabledReason  string    `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
@@ -58,6 +62,31 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+}
+
+// ModelCoolStatus 单个模型级冷却的对外展示形态（脱敏）。
+type ModelCoolStatus struct {
+	Model         string    `json:"model"`
+	Kind          string    `json:"kind"`
+	Reason        string    `json:"reason,omitempty"`
+	Until         time.Time `json:"until"`
+	RemainingSec  int64     `json:"remaining_sec"`
+	SoftStreak    int       `json:"soft_streak,omitempty"`
+}
+
+// modelCool 单个 (账号, 模型) 的冷却记账。
+//
+// 上游的错误大多**只对一个模型成立**：14018（该模型付不起）、6004（该模型限流）、
+// WAF 403（该模型的频控）。把这类失败记成账号级会把「跑不起 hy4-preview 但
+// 跑得动 deepseek-v4.1-flash」的账号整体封停，进而让没出问题的模型也 503。
+// 故按 (账号, 模型) 二元组记账——与 sub2api 的 account+model transient 同构。
+type modelCool struct {
+	until  time.Time
+	kind   CoolKind
+	reason string
+	// streak 该模型上的连续软限流次数（指数退避）。按模型独立计数：
+	// 在 A 模型上被限流不应放大 B 模型的退避时长。
+	streak int
 }
 type entry struct {
 	a            *auth.Auth
@@ -82,10 +111,16 @@ type entry struct {
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
-	// softRateModel 触发 6004 模型级限流时的模型名（issue #31 模型豁免）。
-	// 仅当冷却由「带解析时间的 6004」触发时记录；空 = 普通软冷却（不豁免）。
-	// 运行态语义（不持久化）：重启清零，退化为现状。
-	softRateModel string
+	// modelCools 模型级冷却记账：(模型 → 记账)。键存在即代表该模型在冷却中。
+	//
+	// 覆盖 14018（付不起）、6004（限流）、WAF 403、404 等**模型/路由维**失败。
+	// 账号级 until/coolKind 只留给「账号真的坏了」的形态（11140 内容封控）；
+	// 账号级冷却一旦施加，模型级记账整体作废（见 CooldownSafetyBanned）。
+	//
+	// 运行态语义（不持久化）：重启清零，退化为「全部模型可用」，靠真实请求重新学习。
+	// 这在两难里选了 fail-open 一侧——多打一次注定失败的请求，好过重启后把
+	// 明明能跑的模型也一并封住（旧实现把 6004 的 until 持久化成账号级，正是后者）。
+	modelCools map[string]*modelCool
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 运行态语义（不持久化，与 inFlight 同语义）：重启清零可接受——重启后首个 keepalive
@@ -123,7 +158,8 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 	return mc, true
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未禁用、未处于任一**账号级**冷却/熔断期）。
+// 模型级冷却不在此判定：它对部分模型可用，由 healthyForModel 收口。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
 		return false
@@ -137,51 +173,60 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
-// modelExempt 报告账号是否处于「6004 模型级软冷却」形态：冷却由带解析时间的
-// 6004 触发（coolKind==CoolSoft 且 softRateModel 非空），且尚未禁用、未熔断。
-// 此形态下账号仅对 softRateModel 不可用，对其他模型仍可选（issue #31）。
-// healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
-// 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看 until 是否已过）。
-func (e *entry) modelExempt() bool {
-	return e.coolKind == CoolSoft && e.softRateModel != "" &&
-		!e.disabled && e.breakerUntil.IsZero()
+// coolingOnModel 报告账号在指定模型上是否处于冷却中。
+// model 为空表示调用方没有模型信息，此时不做模型维过滤（返回 false）——
+// 无模型信息的路径（models 拉取、探活）不该因某个模型的限额而失去候选。
+func (e *entry) coolingOnModel(model string, now time.Time) bool {
+	if model == "" {
+		return false
+	}
+	mc := e.modelCools[model]
+	return mc != nil && !mc.until.IsZero() && now.Before(mc.until)
 }
 
-// healthyForModel 报告账号对指定 model 是否可选（含模型级豁免）：
-// 冷却为由 6004 触发的**模型级**软冷却（softRateModel 非空）且请求模型不同
-// （softRateModel != reqModel）时，跳过冷却判定——该模型限流不代表账号在其他
-// 模型下不可用（issue #31）。空 reqModel / 未记录模型 / 同模型 → 与 healthy 一致。
+// healthyForModel 报告账号对指定 model 是否可选：
+// 账号级健康（未禁用/未账号级冷却/未熔断）**且**该模型未在冷却中。
+//
+// 模型级豁免的由来（issue #31，本函数原为 6004 专用，现覆盖全部模型维失败）：
+// 上游明说 "you can switch to the other models to continue using it"——
+// 在 A 模型被限流/付不起，不代表账号在 B 模型不可用。空 reqModel / 未记录模型
+// → 退化为 healthy(now)。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if !e.healthy(now) && reqModel != "" && e.modelExempt() && e.softRateModel != reqModel {
-		// 非 healthy 但属于可豁免场景：仍受 disabled/breakerUntil 约束（modelExempt 已含）。
-		return true
-	}
-	return e.healthy(now)
+	return e.healthy(now) && !e.coolingOnModel(reqModel, now)
 }
 
-// expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
-// 供全冷却兜底选取"最早到期"账号用。
-func (e *entry) expiry(now time.Time) time.Time {
+// expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（账号级与指定模型级取较早者）；
+// 不在冷却期返回零值。供全冷却兜底选取"最早到期"账号用。
+func (e *entry) expiry(now time.Time, model string) time.Time {
 	var t time.Time
-	if !e.until.IsZero() && now.Before(e.until) {
-		t = e.until
-	}
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if t.IsZero() || e.breakerUntil.Before(t) {
-			t = e.breakerUntil
+	consider := func(cand time.Time) {
+		if cand.IsZero() || !now.Before(cand) {
+			return
 		}
+		if t.IsZero() || cand.Before(t) {
+			t = cand
+		}
+	}
+	if !e.until.IsZero() {
+		consider(e.until)
+	}
+	if !e.breakerUntil.IsZero() {
+		consider(e.breakerUntil)
+	}
+	if mc := e.modelCools[model]; mc != nil {
+		consider(mc.until)
 	}
 	return t
 }
 
 // fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却；breaker：熔断期）。
-// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
+// 只对参与兜底的账号调用（CoolSafety 已被 pickEarliestExpiryLocked 排除）。判定口径：
 // 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft。
-func (e *entry) fallbackKind(now time.Time) string {
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if e.until.IsZero() || !now.Before(e.until) || e.breakerUntil.Before(e.until) {
-			return "breaker"
-		}
+func (e *entry) fallbackKind(now time.Time, model string) string {
+	exp := e.expiry(now, model)
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) &&
+		(exp.IsZero() || !exp.Before(e.breakerUntil)) {
+		return "breaker"
 	}
 	return "soft"
 }

@@ -119,6 +119,24 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	return p
 }
 
+// modelCoolOf 取账号在指定模型上的模型级冷却明细。
+// 14018/6004/429/WAF 等失败按 (账号, 模型) 记账，不再写账号级的 until/coolKind——
+// 断言这些场景必须走本入口（pool.Status 的 ModelCools），看 Cooling/Until 只会得到 false。
+func modelCoolOf(t *testing.T, p *pool.Pool, uid, model string) pool.ModelCoolStatus {
+	t.Helper()
+	st, ok := p.Status(uid)
+	if !ok {
+		t.Fatalf("status(%s) missing", uid)
+	}
+	for _, mc := range st.ModelCools {
+		if mc.Model == model {
+			return mc
+		}
+	}
+	t.Fatalf("%s 在 %s 上应有模型级冷却，实得 %+v", uid, model, st.ModelCools)
+	return pool.ModelCoolStatus{}
+}
+
 // TestChatBodyLimitExactAllowed 恰好等于上限的请求体正常放行到上游（不被 413 误伤）。
 func TestChatBodyLimitExactAllowed(t *testing.T) {
 	var calls int
@@ -576,9 +594,10 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v", calls)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.Reason == "" {
-		t.Errorf("bad account should be cooling: %+v", st)
+	// 14018 按 (账号, 模型) 记账：该账号被封的是 glm-5.2，不是整个账号。
+	mc := modelCoolOf(t, p, "bad", "glm-5.2")
+	if mc.Kind != "hard_credit" || mc.Reason == "" {
+		t.Errorf("bad account should be model-cooled: %+v", mc)
 	}
 }
 
@@ -613,13 +632,13 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
+	mc := modelCoolOf(t, p, "bad", "glm-5.2")
+	if mc.Kind != "soft_rate" {
+		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", mc)
 	}
 	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	if max := int64(soft / time.Second); mc.RemainingSec <= 0 || mc.RemainingSec > max {
+		t.Errorf("cool_remaining_sec=%d want in (0,%d]", mc.RemainingSec, max)
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -785,7 +804,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	// 成功后 streak 归零 → 下次 404 回到 60s 基数。
 	// （签到解冻 ReenableIfCredits 不适用于本场景：它保留 streak，是冷却域的续期。）
-	p.NoteSuccess("u1")
+	p.NoteSuccess("u1", "")
 	h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
 	if st, _ := p.Status("u1"); st.SoftStreak != 1 || st.CoolRemaining > notFoundSec {
 		t.Errorf("success should reset 404 backoff: %+v", st)
@@ -813,12 +832,12 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
+	mc := modelCoolOf(t, p, "bad", "glm-5.2")
+	if mc.Kind != "soft_rate" {
+		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", mc)
 	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
+	if mc.RemainingSec <= 599 || mc.RemainingSec > 600 {
+		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", mc.RemainingSec)
 	}
 }
 
@@ -946,20 +965,17 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, ok := p.Status("bad")
-	if !ok || !st.Cooling {
-		t.Fatalf("bad should be cooling: %+v ok=%v", st, ok)
-	}
-	if st.Reason != "余额不足" {
-		t.Errorf("reason=%q", st.Reason)
+	mc := modelCoolOf(t, p, "bad", "glm-5.2")
+	if mc.Reason != "余额不足" {
+		t.Errorf("reason=%q", mc.Reason)
 	}
 	// 硬信贷冷却必须是次日 04:00，而不是固定 12h/配置时长。
-	if st.Until.Hour() != 4 {
-		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
+	if mc.Until.Hour() != 4 {
+		t.Errorf("until hour=%d want 4 (next-day 04:00)", mc.Until.Hour())
 	}
 	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
-	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
-		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
+	if d := time.Until(mc.Until); d <= 0 || d > 28*time.Hour {
+		t.Errorf("until %v not within (0,28h]: %v", mc.Until, d)
 	}
 	// 立即换号成功：good 被选中。
 	stGood, _ := p.Status("good")
@@ -1012,12 +1028,12 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 				t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
 			}
 			// bad 已进入 soft 冷却，until ≈ reset。
-			st, _ := p.Status("bad")
-			if !st.Cooling || st.CoolKind != "soft_rate" {
-				t.Fatalf("bad should be soft cooling from 6004: %+v", st)
+			mc := modelCoolOf(t, p, "bad", "glm-5.3")
+			if mc.Kind != "soft_rate" {
+				t.Fatalf("bad should be soft cooling from 6004: %+v", mc)
 			}
-			if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-				t.Errorf("until=%v want ~reset=%v (diff %v)：未按上游明说的重置时刻冷却", st.Until, reset, d)
+			if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+				t.Errorf("until=%v want ~reset=%v (diff %v)：未按上游明说的重置时刻冷却", mc.Until, reset, d)
 			}
 			// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
 			// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
@@ -1060,13 +1076,13 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling: %+v", st)
+	mc := modelCoolOf(t, p, "bad", "glm-5.3")
+	if mc.Kind != "soft_rate" {
+		t.Fatalf("bad should be soft cooling: %+v", mc)
 	}
 	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	if mc.RemainingSec <= 0 || mc.RemainingSec > 60 {
+		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", mc.RemainingSec)
 	}
 }
 
@@ -1694,10 +1710,10 @@ func TestStatusInFlightFull(t *testing.T) {
 func TestStatusPortraitFields(t *testing.T) {
 	// Phase 3：/status 单账号需返回健康画像字段。
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
-	p.NoteSuccess("u1")
-	p.NoteSuccess("u1")
+	p.NoteSuccess("u1", "")
+	p.NoteSuccess("u1", "")
 	p.NoteError("u1") // 记录 last_err + err_total（累计，不冷却）
-	p.Cooldown("u1", pool.CoolSoft, time.Hour, "429 rate limit")
+	p.Cooldown("u1", pool.CoolSoft, time.Hour, "429 rate limit", "")
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))

@@ -77,7 +77,7 @@ func TestNoteSuccessClearsSessionDeadCount(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1")
-	p.NoteSuccess("u1")
+	p.NoteSuccess("u1", "")
 	if p.NoteSessionDead("u1") {
 		t.Fatal("成功清计数后第 1 次不应禁用")
 	}
