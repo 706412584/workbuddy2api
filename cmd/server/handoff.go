@@ -210,6 +210,7 @@ func serveWithHandoff(
 	srv *http.Server,
 	p *pool.Pool,
 	restartCh <-chan string,
+	shutdownCh <-chan string,
 	hs handoffState,
 ) bool {
 	errCh := make(chan error, 1)
@@ -244,11 +245,15 @@ func serveWithHandoff(
 			return false
 
 		case <-ctx.Done():
-			log.Printf("收到退出信号，优雅停机（等待在途请求完成，最多 5s）…")
-			p.Flush() // 信号退出：先落盘再停机
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
+			log.Printf("收到退出信号，优雅停机（等待在途请求完成，最多 %s）…", drainGrace)
+			drainAndFlush(srv, p, "信号停机")
+			return false
+
+		case reason := <-shutdownCh:
+			// 远程优雅停机（stop 脚本）：与信号分支同一条收场。单独一条 case 而非
+			// 复用 ctx，是因为 ctx 由 signal.NotifyContext 管，无法从 HTTP 处理器 cancel。
+			log.Printf("收到远程停机请求（%s），优雅停机（等待在途请求完成，最多 %s）…", reason, drainGrace)
+			drainAndFlush(srv, p, "远程停机")
 			return false
 
 		case reason := <-restartCh:
@@ -332,6 +337,44 @@ func handoffRestart(srv *http.Server, p *pool.Pool, hs handoffState, reason stri
 
 	log.Printf("交接完成：本进程退出，pid=%d 继续服务", sp.pid)
 	return true
+}
+
+// drainAndFlush 普通停机的收场：先落盘，再排空在途请求。
+//
+// **为什么不用 srv.Shutdown**：本进程的监听句柄被 dupListener/File() 复制过
+// （为了零停机交接），而 File() 内部的 DisassociateIOCP 永久破坏了监听器的正常
+// 关闭路径 —— 此后 srv.Shutdown() 与 ln.Close() 都会永久阻塞（见文件头约束，
+// 2026-10-12 在 :7869 实测确认：调用后进程不退出、端口不释放）。信号路径原本也
+// 调的 srv.Shutdown，同样会卡死；这里统一改用交接路径那套「ConnState 记账排空」。
+//
+// 排空后直接返回，由 main 正常返回 → 进程退出 → Windows 回收全部句柄。
+// 与交接路径不同，这里**不** os.Exit：交接要立刻让旧进程消失好把端口完全交给新
+// 进程，而普通停机没有替代者，走 defer（stop() 等）更干净。
+//
+// p.Flush 在排空**之前**：在途请求可能继续改动池状态，但停机语义要的是「把已知
+// 状态落盘」；排空窗口内的最后改动由进程退出前的行为兜底（与信号路径一致）。
+func drainAndFlush(srv *http.Server, p *pool.Pool, why string) {
+	p.Flush()
+	tr := trackerOf(srv)
+	if tr == nil {
+		log.Printf("%s：无连接跟踪器，跳过排空", why)
+		return
+	}
+	if n := tr.closeIdle(); n > 0 {
+		log.Printf("%s：已关闭 %d 个空闲连接", why, n)
+	}
+	deadline := time.Now().Add(drainGrace)
+	for time.Now().Before(deadline) {
+		if tr.active() == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if a := tr.active(); a > 0 {
+		log.Printf("%s：等待在途请求超时（仍有 %d 个），切断后退出", why, a)
+	} else {
+		log.Printf("%s：在途请求已全部完成", why)
+	}
 }
 
 // waitReady 等新进程写来一个就绪字节。读到 1 字节且值为 1 → 就绪；

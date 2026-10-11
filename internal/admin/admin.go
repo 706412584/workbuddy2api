@@ -89,6 +89,13 @@ type Config struct {
 	// RequestRestart 请求一次零停机交接重启（见 cmd/server/handoff.go）。
 	// 非阻塞：投递后立即返回，交接在后台完成。nil = 不支持自动重启。
 	RequestRestart func(reason string)
+	// RequestShutdown 请求一次优雅停机：先落盘，再等在途请求跑完（与收到
+	// SIGINT/SIGTERM 同一条路径）。非阻塞，nil = 不支持远程停机。
+	//
+	// 为什么与 RequestRestart 分开：交接重启是「换进程继续服务」，停机是「本进程
+	// 退出、端口释放」。stop 脚本要的是后者——它比 taskkill /F 强的地方正是
+	// 会等 state.json 落盘、等在途请求收尾，而不是硬切。
+	RequestShutdown func(reason string)
 }
 
 // adminTokenHeader 管理员口令的请求头。
@@ -140,6 +147,7 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /__admin/system/check-updates", h.systemCheckUpdates)
 	h.mux.HandleFunc("POST /__admin/system/update", h.systemUpdate)
 	h.mux.HandleFunc("POST /__admin/system/restart", h.systemRestart)
+	h.mux.HandleFunc("POST /__admin/system/shutdown", h.systemShutdown)
 
 	return h
 }

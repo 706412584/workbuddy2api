@@ -162,6 +162,27 @@ func (h *Handler) systemRestart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// systemShutdown POST /__admin/system/shutdown —— 优雅停机（先落盘、等在途请求收尾）。
+//
+// 与 systemRestart 的差别：重启是「换进程继续服务」，停机是「本进程退出、端口释放」。
+// stop 脚本用它替代 taskkill /F：硬杀会跳过 p.Flush() 与在途请求收尾，把「最后一次
+// state.json 落盘」和在途的流式响应一起丢掉；本接口走的是与 SIGINT/SIGTERM 完全
+// 相同的路径（见 cmd/server/handoff.go 的 ctx.Done 分支）。
+//
+// 响应先于退出刷出：调用方投递信号后立刻返回，真正停机在后台进行。
+func (h *Handler) systemShutdown(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.RequestShutdown == nil {
+		fail(w, http.StatusNotImplemented, "本进程不支持远程停机，请用 Ctrl+C 或 taskkill")
+		return
+	}
+	logf("收到优雅停机请求")
+	h.cfg.RequestShutdown("手工触发停机")
+	ok(w, map[string]any{
+		"stopping": true,
+		"msg":      "正在优雅停机（先落盘、等在途请求收尾）",
+	})
+}
+
 // restartMsg 给用户一句准确的结果描述。
 // 不能统一说"已重启"：没有交接能力时文件已换但进程还是旧的，必须让人知道去手工重启。
 func restartMsg(restarting bool) string {

@@ -204,6 +204,10 @@ func main() {
 	// restartCh 更新重启请求通道：admin 的更新接口发信号，serveWithHandoff 收到后
 	// 做零停机交接（见 handoff.go）。容量 1 即可 —— 交接期间不会有第二次请求。
 	restartCh := make(chan string, 1)
+	// shutdownCh 远程优雅停机请求通道：admin 的 /system/shutdown 发信号，
+	// serveWithHandoff 收到后走与 SIGINT/SIGTERM 相同的收场（落盘 + Shutdown）。
+	// 让 stop 脚本能优雅停机，不必 taskkill /F 硬切。容量 1 同理。
+	shutdownCh := make(chan string, 1)
 
 	// h 先声明后赋值：admin 的新增回调要引用它，而它又需要 admin 才能构造。
 	var h *server.Handler
@@ -272,6 +276,14 @@ func main() {
 			default:
 				// 已有一个待处理请求：不排队（重复交接没有意义），如实记录。
 				log.Printf("更新重启请求已在处理中，忽略重复请求：%s", reason)
+			}
+		},
+		// RequestShutdown 非阻塞地投递一次优雅停机请求（stop 脚本用）。
+		RequestShutdown: func(reason string) {
+			select {
+			case shutdownCh <- reason:
+			default:
+				log.Printf("停机请求已在处理中，忽略重复请求：%s", reason)
 			}
 		},
 	})
@@ -344,7 +356,7 @@ func main() {
 	}
 	log.Printf("api keys: %s", describeAPIKeys(cfg))
 
-	handedOff := serveWithHandoff(ctx, ln, srv, p, restartCh, hs)
+	handedOff := serveWithHandoff(ctx, ln, srv, p, restartCh, shutdownCh, hs)
 	if handedOff {
 		log.Printf("bye（已交接给新进程）")
 		return
