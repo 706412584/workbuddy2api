@@ -4,6 +4,7 @@ package pool
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -149,6 +150,82 @@ func (p *Pool) NoteError(uid string) {
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
 	}
+}
+
+// NoteAttempt 上报一次**尝试结果**到近期失败率（EWMA），用于选号降权。
+//
+// 与 NoteError 的分工：NoteError 是"记账惩罚"（累计 errTotal + 喂熔断），只在
+// 该分类确实该罚账号时调用；NoteAttempt 是"学习信号"，**每次尝试都该调用**，
+// 包括那些刻意不罚号的分类（5xx 上游故障、400 参数错误、内容拦截误报）。
+//
+// 为什么必须分开：applyErrorPolicy 对 ErrServer 明确"不罚账号"（上游故障时熔断
+// 健康号是错的，见该分支注释），但代价是连"这个号刚刚失败过"的信号都丢了——
+// 于是同一批号被反复撞。实测 2026-10-15：4.1 返 500 时 22 个号里只有 5 个有积分
+// 因而进得了候选，这 5 个被逐轮撞满，请求卡 184~190s 后 503。
+//
+// model 参与记账键（与 modelCools / modelCost 同口径）：上游失败绝大多数只对一个
+// 模型成立，在 A 模型失败不该连带到 B 模型——上游文案明说 "you can switch to the
+// other models"。model 为空时退化到 "" 键（账号级语义，与无模型信息的路径一致）。
+//
+// success 语义：true = 本次尝试成功（上报 0），false = 失败（上报 1）。
+// 与 sub2api openai_account_scheduler.go 的 openAIAccountRuntimeStats.report 同口径。
+func (p *Pool) NoteAttempt(uid, model string, success bool) {
+	if uid == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if e.failEWMA == nil {
+		e.failEWMA = make(map[string]float64)
+		e.failEWMATime = make(map[string]time.Time)
+	}
+	sample := 1.0
+	if success {
+		sample = 0.0
+	}
+	// 从零值起步直接混合（与 sub2api updateEWMAAtomic 同口径）：首次失败 → 0.2，
+	// 首次成功 → 仍为 0。不做"首样本直接取 1.0"的特例——一次偶发抖动不该把账号
+	// 直接压到最低权重，EWMA 的意义正是让单次样本只有 alpha 的份量。
+	e.failEWMA[model] = failEWMAAlpha*sample + (1-failEWMAAlpha)*e.failEWMA[model]
+	e.failEWMATime[model] = time.Now()
+}
+
+// failEWMANow 返回该账号在指定模型上的近期失败率经时间衰减后的**生效值**
+// （纯读取，不修改 e）。model 为空时读 "" 键（账号级语义，与 NoteAttempt 记账键一致）。
+//
+// 为什么需要衰减：EWMA 没有时间维，失败率只能靠后续成功冲淡。若一个号失败后被冷却
+// 或长期闲置，failEWMA 会一直停在低位，等它重新回到候选集时仍背着陈年失败率——
+// 而当时的失败原因（上游瞬时故障/限流）多半早已消失。按经过时间做一步半衰期衰减，
+// 让"很久以前的失败"自然失效。
+//
+// 为什么是纯函数而非就地写：weightOf 在 pick 的写锁内、以及测试 helper 的读锁内
+// 都会被调用。就地写会让"只读路径改状态"，破坏锁纪律。衰减只影响**本次打分**，
+// 下一次 NoteAttempt 会用真实样本覆盖，无需持久化回去。
+//
+// 调用方需已持 p.mu（读或写均可）。now 由调用方统一取一次，避免热路径多次 time.Now。
+func (e *entry) failEWMANow(model string, now time.Time) float64 {
+	v, ok := e.failEWMA[model]
+	if !ok || v <= 0 {
+		return failEWMANeutral
+	}
+	ref := e.failEWMATime[model]
+	if ref.IsZero() {
+		return v
+	}
+	elapsed := now.Sub(ref)
+	if elapsed <= 0 {
+		return v
+	}
+	// 半衰期衰减：0.5^(elapsed/halfLife)
+	v *= math.Pow(0.5, elapsed.Seconds()/failEWMADecayHalfLife.Seconds())
+	if v < failEWMANeutral {
+		return failEWMANeutral
+	}
+	return v
 }
 
 // NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本。

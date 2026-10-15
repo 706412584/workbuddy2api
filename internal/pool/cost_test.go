@@ -201,3 +201,122 @@ func TestAvailableUIDsForModel(t *testing.T) {
 		t.Errorf("AvailableUIDsForModel(glm-5.3)=%v want 两个账号（u1 对其他模型豁免）", all)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 近期失败率降权（EWMA）
+// ---------------------------------------------------------------------------
+
+// entryWeightForModel 与 entryWeight 同，但可指定模型（读该模型上的失败率降权）。
+func (p *Pool) entryWeightForModel(uid, model string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e := p.byUID[uid]
+	var maxCredits int64
+	for _, x := range p.byUID {
+		if x.credits > maxCredits {
+			maxCredits = x.credits
+		}
+	}
+	return p.weightOf(e, maxCredits, time.Now(), model)
+}
+
+// TestNoteAttemptDropsWeight 一次失败即压低权重，成功把它拉回。
+func TestNoteAttemptDropsWeight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	base := p.entryWeightForModel("u1", "m")
+
+	p.NoteAttempt("u1", "m", false)
+	afterFail := p.entryWeightForModel("u1", "m")
+	if afterFail >= base {
+		t.Fatalf("一次失败后权重应下降: base=%v afterFail=%v", base, afterFail)
+	}
+
+	// 连续成功应把失败率摊薄回接近原始值（alpha=0.2，需若干次）。
+	for i := 0; i < 20; i++ {
+		p.NoteAttempt("u1", "m", true)
+	}
+	if got := p.entryWeightForModel("u1", "m"); got < base*0.99 {
+		t.Errorf("连续成功后权重应回到基线: base=%v got=%v", base, got)
+	}
+}
+
+// TestNoteAttemptScopedToModel 失败率按 (账号, 模型) 记账：
+// 在 A 模型失败不应连带到 B 模型——上游明说 "switch to the other models"。
+// 回归的是 TestChat6004ModelResetCoolsToParsedTime 暴露的问题。
+func TestNoteAttemptScopedToModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	p.NoteAttempt("u1", "glm-5.3", false)
+	if got := p.byUID["u1"].failEWMANow("glm-5.3", time.Now()); got <= 0 {
+		t.Fatalf("glm-5.3 上应记到失败率, got=%v", got)
+	}
+	if got := p.byUID["u1"].failEWMANow("hy3-x", time.Now()); got != 0 {
+		t.Errorf("hy3-x 未失败，失败率应为 0（模型级隔离），got=%v", got)
+	}
+}
+
+// TestPickPrefersCleanAccountAfterFailure 刚失败的号应让位给干净号：
+// 失败号即使积分高得多，也不该被优先撞——这正是本次修复的核心诉求。
+func TestPickPrefersCleanAccountAfterFailure(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "rich"})   // 高积分，原本必被优先选中
+	p.Add(&auth.Auth{UID: "clean"})  // 零积分
+	p.SetCredits("rich", 1000)
+	p.NoteAttempt("rich", "m", false) // rich 刚在这个模型上失败
+
+	// 注入 r=0（选权重最高者）：干净号应已排到 rich 之前。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	got := p.PickExcludingForModel(nil, "m")
+	if got == nil || got.UID != "clean" {
+		t.Fatalf("pick=%v, want clean（rich 刚失败应让位）", got)
+	}
+}
+
+// TestPickFailureDoesNotBlockOtherModel 在 A 模型失败不影响 B 模型的选号顺序。
+func TestPickFailureDoesNotBlockOtherModel(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "rich"})
+	p.Add(&auth.Auth{UID: "clean"})
+	p.SetCredits("rich", 1000)
+	p.NoteAttempt("rich", "glm-5.3", false) // 只记在 glm-5.3
+
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	got := p.PickExcludingForModel(nil, "hy3-x") // 换模型：rich 仍是最高权重
+	if got == nil || got.UID != "rich" {
+		t.Fatalf("pick=%v, want rich（其他模型不应受 glm-5.3 的失败影响）", got)
+	}
+}
+
+// TestFailEWMADecaysOverTime 失败率随半衰期衰减：很久以前的失败不该继续压制权重。
+func TestFailEWMADecaysOverTime(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteAttempt("u1", "m", false)
+
+	now := time.Now()
+	soon := p.byUID["u1"].failEWMANow("m", now)
+	// 手工把上报时刻做旧 4 个半衰期（10min × 4 = 40min）→ 衰减到约 1/16。
+	p.mu.Lock()
+	p.byUID["u1"].failEWMATime["m"] = now.Add(-40 * time.Minute)
+	fresh := p.byUID["u1"].failEWMA["m"]
+	p.mu.Unlock()
+
+	later := p.byUID["u1"].failEWMANow("m", now)
+	if later >= soon {
+		t.Fatalf("失败率应随时间衰减: soon=%v later=%v", soon, later)
+	}
+	if later > fresh/8 {
+		t.Errorf("40 分钟（4 个半衰期）后应衰减到不足 1/8: fresh=%v later=%v", fresh, later)
+	}
+}
+
+// TestNoteAttemptEmptyUIDIgnored 空 uid 不应 panic（models 拉取等路径可能传空）。
+func TestNoteAttemptEmptyUIDIgnored(t *testing.T) {
+	p := New("")
+	p.NoteAttempt("", "m", false)
+	p.NoteAttempt("not-exist", "m", false)
+}

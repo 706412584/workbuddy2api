@@ -133,6 +133,34 @@ type entry struct {
 	// 次才判为账号级。运行态语义（不持久化，与 inFlight/sessionDeadFails 同）。
 	// 由 pool.NoteSafetyBanned 累计，见 state.go。
 	safetyBannedFails int
+	// failEWMA 近期失败率（EWMA，alpha=failEWMAAlpha，运行态不持久化），**按模型**记账。
+	// 初值 0 = "尚未观测到失败" = 不降权，与 sub2api 的 openAIAccountRuntimeStat
+	// 从零值起步一致（首次失败经 alpha 混合后为 0.2，而非 1.0——避免一次抖动就把
+	// 账号打到最低权重）。
+	//
+	// 与熔断器 fails 的分工：fails 是"连续失败计数"，达阈值即熔断（惩罚）；failEWMA
+	// 是"近期失败占比"，只用于**降权**（soft demotion），永不暂停账号。二者刻意分离
+	// ——上游整体故障时把健康号逐批熔断是错的（见 handler.applyErrorPolicy 的 ErrServer
+	// 分支），但"这次失败"仍是真实的选号信号，丢掉它会让同一个号被反复撞。
+	//
+	// 关键设计：**每次尝试都上报**（成功上报 1、失败上报 0），与是否记账冷却无关。
+	// 这正是 sub2api openai_account_scheduler.go 的 openAIAccountRuntimeStats.report
+	// 口径：降权与惩罚解耦。500/transport error 这类"不罚号"的分类也照常降权。
+	//
+	// **为什么按模型记账**（与 modelCools / modelCost 同一哲学）：上游失败绝大多数
+	// 只对一个模型成立。若记成账号级，在 glm-5.3 上被 6004 限流的号会被连带到
+	// hy3-x 上一起降权——而上游明说 "you can switch to the other models"。
+	// 实测回归：TestChat6004ModelResetCoolsToParsedTime 断言换模型后该号应被优先
+	// 选中，账号级降权会让它被错误跳过。
+	//
+	// 键不存在 = 该模型无观测（不降权）；model 为空（无模型信息的路径，如 models
+	// 拉取/探活）时退化到 "" 键，即"账号级"语义，与既有无模型路径口径一致。
+	//
+	// 不持久化：重启清零可接受——重启后头几次请求无偏好，靠真实流量重新学习
+	// （与 modelCost 同语义）。
+	failEWMA map[string]float64
+	// failEWMATime 各模型最近一次上报时刻，供时间衰减计算（与 failEWMA 同键）。
+	failEWMATime map[string]time.Time
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
@@ -327,5 +355,35 @@ const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
 )
+
+// failEWMAAlpha 近期失败率的 EWMA 平滑系数。
+// 取 0.2（对齐 sub2api openAIAccountRuntimeStats.report 的 alpha）：约 5 次尝试收敛，
+// 单次抖动不主导决策，连续失败则快速压低权重。
+const failEWMAAlpha = 0.2
+
+// failEWMAWindow 降权衰减半衰期语义的时间常量：EWMA 不含时间维，故失败率靠
+// **成功请求自然冲淡**（每次成功上报 0）。账号长期不被选中时 failEWMA 不会自动回落，
+// 但那种情况下它本来也不该被选中——真回到候选集时，首次成功即把率拉低。
+// 这里额外用 failEWMADecay 在每次选号时做一步时间衰减，避免"冷却到期后仍背着
+// 陈年失败率"：按半衰期 10 分钟衰减。
+const failEWMADecayHalfLife = 10 * time.Minute
+
+// failEWMANeutral 无观测时的中性值。
+// 取 0：降权因子 = 1 - failEWMA，无观测即不降权。刻意不取 0.5——
+// 新号/重启后的号应被平等对待，而不是先背上一个"疑似一半会失败"的预设。
+const failEWMANeutral = 0.0
+
+// failEWMAFreshThreshold "仍然新鲜"的失败率上限。超过它视为**近期刚失败**，
+// 在选号排序里整档排到干净账号之后（见 pick 的 sort 键）。
+//
+// 为什么用整档排序而不只靠权重相乘：本仓库的权重里 credits 项 ×10，
+// 而失败降权最多 ×0.8（一次失败），压不动 14 vs 9 的差距——实测 2026-10-15，
+// 同一批号在 62s 周期上被反复选中，9 次失败/7479 次成功 在 lifetime 成功率里
+// 只占 0.1%，权重毫无变化。整档排序让"刚失败"立刻让位给没失败的账号，
+// 与用户诉求一致：优先能调的可用账号，而不是一直撞同一批。
+//
+// 取 0.15：单次失败经 alpha=0.2 混合后为 0.2 > 0.15 → 立刻降档；
+// 之后靠 failEWMADecayHalfLife 衰减，约 4 分钟跌破阈值自动回到干净档。
+const failEWMAFreshThreshold = 0.15
 
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。

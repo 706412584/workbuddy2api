@@ -1677,6 +1677,7 @@ func TestFallbackNilWhenAllDisabled(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // idleWeightOf 曝露 weightOf 的单因子拆解不便，改用完整权重断言（包内私有 helper）。
+// 走 "" 模型键：这些断言测的是三因子本身，不涉及模型级失败率降权。
 func (p *Pool) entryWeight(uid string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1687,7 +1688,7 @@ func (p *Pool) entryWeight(uid string) float64 {
 			maxCredits = x.credits
 		}
 	}
-	return p.weightOf(e, maxCredits, time.Now())
+	return p.weightOf(e, maxCredits, time.Now(), "")
 }
 
 func TestWeightHighCreditsDominates(t *testing.T) {

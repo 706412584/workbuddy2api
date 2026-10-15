@@ -26,7 +26,8 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
-	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
+	// 加权调优：闲置补偿参数（SetWeights 注入；默认值见 defaultIdle*）。
+	// 另一因子「近期失败率降权」按模型记账，见 entry.failEWMA，无需配置注入。
 	idleWeightPerHour float64
 	idleWeightMax     float64
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
@@ -82,7 +83,7 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	}
 }
 
-// SetWeights 注入三因子加权的闲置补偿参数。非正值保留原值（用默认）。
+// SetWeights 注入加权公式的闲置补偿参数。非正值保留原值（用默认）。
 func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

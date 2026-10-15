@@ -801,8 +801,18 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		}
 	}
 	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
+	//
+	// 同时上报一次**尝试失败**给选号降权（NoteAttempt）。这与 applyErrorPolicy 的
+	// "罚不罚账号"是两个正交维度：后者决定要不要冷却/熔断（惩罚），前者只是让本次
+	// 失败在下次选号时被扣分（降权）。
+	// 关键：ErrServer（上游 5xx）刻意不罚账号，但**必须**降权——否则上游故障期间
+	// 同一批号会被反复撞（实测 2026-10-15 4.1 返 500 时每轮 62s×3≈186s 才 503）。
+	// 降权只影响排序优先级、不做暂停，故不会重演"上游故障逐批熔断健康号"的旧问题。
 	fail := func(uid string) {
 		releaseHeld()
+		// 按 (账号, 模型) 记账：上游失败绝大多数只对一个模型成立，在 A 模型失败
+		// 不该连带到 B 模型（上游文案明说 "switch to the other models"）。
+		h.cfg.Pool.NoteAttempt(uid, o.model, false)
 		if stickyUID != "" && uid == stickyUID {
 			unbindSticky()
 		}
@@ -1057,9 +1067,14 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 				// 其余流错误（客户端断连、上游中断）：无法重试（响应已开始），如实记日志。
 				log.Printf("WARN: [server] stream uid=%s: %v", logfmt.UID8(acct.UID), serr)
 			}
-			// 粘性绑定与租约：流已写完，绑定成功号（多轮对话下一跳不再随机抽）。
+		// 粘性绑定与租约：流已写完，绑定成功号（多轮对话下一跳不再随机抽）。
 			if sessKey != "" && h.cfg.Session != nil {
 				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
+			// 流完整走完（未命中思考循环、serr 非致命）→ 上报成功，让近期失败率自然回落。
+			// 与 fail() 的失败上报配对：EWMA 需要两侧样本才能收敛到真实失败占比。
+			if serr == nil {
+				h.cfg.Pool.NoteAttempt(acct.UID, o.model, true)
 			}
 			return nil
 		}
@@ -1069,6 +1084,10 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
+		// 上游已回 2xx 且响应流交由调用方读取（非流式聚合）→ 上报成功。
+		// 放在这里而非 NoteSuccess 旁：调用方读流仍可能失败（客户端断连由各自入口处理），
+		// 但"上游接受了这次请求"已是账号可用的证据，值得记一次成功样本。
+		h.cfg.Pool.NoteAttempt(acct.UID, o.model, true)
 		// 租约不在此释放：由调用方在读尽响应流后统一归还（defer）。
 		// 成本账本随流式/非流式在此收尾——见下方调用方（读尽 stats 后才有 usage）。
 		return rc
