@@ -162,7 +162,9 @@ func (h *Handler) toggleAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Disabled {
-		h.cfg.Pool.Disable(uid, manualDisableReason)
+		// DisableManual（非 Disable）：标记来源为人工，使「测试连接」通过时
+		// 不会把这个号自动解禁（见 pool.NoteTestOK 注释）。
+		h.cfg.Pool.DisableManual(uid, manualDisableReason)
 	} else {
 		// 启用走 ReviveDisabled：清 disabled + reason + 两个连续计数，**不动冷却/熔断**
 		// （那是「重置」的职责，启用只负责把号放回轮换）。

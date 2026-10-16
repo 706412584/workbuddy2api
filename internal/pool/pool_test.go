@@ -2324,3 +2324,104 @@ func TestNoteTestOKUnknownUIDIsNoop(t *testing.T) {
 	p := New("")
 	p.NoteTestOK("nope")
 }
+
+// TestNoteTestOKKeepsManualDisable 「测试连接」通过**不解除人工禁用**。
+//
+// 回归背景（2026-10-16 用户报告）：面板「测试」成功后旧实现无条件 disabled=false，
+// 导致手动禁用的号点一次测试就被放回池中。人工禁用是运维决定，与凭证有效性无关——
+// 「测试通过」只证明 session 活着，不构成推翻该决定的依据。
+// 解除人工禁用只有两条显式路径：面板 toggle 启用、或「重置」勾选解除禁用。
+func TestNoteTestOKKeepsManualDisable(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.DisableManual("u1", "面板人工禁用")
+
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatal("前置条件未建立：应处于禁用")
+	}
+
+	p.NoteTestOK("u1")
+
+	st, _ = p.Status("u1")
+	if !st.Disabled {
+		t.Error("测试通过不应解除**人工**禁用")
+	}
+	if st.DisabledReason != "面板人工禁用" {
+		t.Errorf("人工禁用的 reason 应保留, got %q", st.DisabledReason)
+	}
+	if got := p.Pick(); got != nil {
+		t.Errorf("人工禁用的号不应被 Pick 选中, got %+v", got)
+	}
+}
+
+// TestNoteTestOKClearsManualDisableCooling 人工禁用期间点测试：禁用保留，
+// 但冷却/熔断应被清掉（测试确实证明了链路可用，重新启用后应能立即服务）。
+func TestNoteTestOKClearsManualDisableCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.DisableManual("u1", "面板人工禁用")
+	p.Cooldown("u1", CoolSoft, 600*time.Second, "429 rate limit", "")
+
+	p.NoteTestOK("u1")
+
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Error("人工禁用应保留")
+	}
+	if st.Cooling {
+		t.Errorf("冷却应被清掉: kind=%s until=%v", st.CoolKind, st.Until)
+	}
+}
+
+// TestNoteTestOKStillClearsAutoDisable 自动禁用（12153）仍被测试通过解除——
+// 这条既有行为不能因上面的人工禁用修复而回退。
+func TestNoteTestOKStillClearsAutoDisable(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead") // 自动禁用（非 Manual）
+
+	p.NoteTestOK("u1")
+
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Error("自动禁用应被测试通过解除（测试证明 session 活着）")
+	}
+}
+
+// TestManualDisableFlagSurvivesReload 人工禁用标记须持久化：否则重启后
+// 一次「测试连接」就会把人工禁用的号悄悄解禁。
+func TestManualDisableFlagSurvivesReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.DisableManual("u1", "面板人工禁用")
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.NoteTestOK("u1")
+
+	st, _ := p2.Status("u1")
+	if !st.Disabled {
+		t.Error("重载后人工禁用标记丢失：测试通过错误地解除了禁用")
+	}
+}
+
+// TestReviveDisabledClearsManualFlag 面板 toggle 启用是显式动作，须清掉人工标记，
+// 否则该号下次被自动禁用时仍会被当成人工禁用。
+func TestReviveDisabledClearsManualFlag(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.DisableManual("u1", "面板人工禁用")
+	p.ReviveDisabled("u1")
+
+	// 启用后再走一次自动禁用 + 测试通过：应被解除（标记已清）。
+	p.Disable("u1", "12153 session dead")
+	p.NoteTestOK("u1")
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Error("ReviveDisabled 应清掉人工标记，后续自动禁用可被测试解除")
+	}
+}

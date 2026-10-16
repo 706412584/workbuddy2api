@@ -99,7 +99,16 @@ type entry struct {
 	until        time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled     bool
 	reason       string
-	lastUsed     time.Time // 最近被选中时刻（防并发撞号）
+	// disabledByManual 标记该 disabled 是**人工禁用**（面板 toggle）还是自动禁用
+	// （12153 session dead）。用独立布尔而非比对 reason 文案：文案会改，语义不该跟着变；
+	// 而且 reason 是给人看的展示字段，不该兼职做逻辑判据。
+	//
+	// 用途：NoteTestOK（面板「测试连接」成功）只解除**自动**禁用，不解除人工禁用。
+	// 「测试通过」只证明 session 活着，不构成推翻用户显式禁用决定的理由。
+	// 持久化（stateAccount.DisabledByManual）：重启后仍能区分，否则人工禁用会被
+	// 一次测试悄悄抹掉。
+	disabledByManual bool
+	lastUsed         time.Time // 最近被选中时刻（防并发撞号）
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。
@@ -261,12 +270,16 @@ func (e *entry) fallbackKind(now time.Time, model string) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	Disabled     bool      `json:"disabled"`
-	Reason       string    `json:"reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
-	CoolKind     CoolKind  `json:"cool_kind"`
-	SuccessCount int64     `json:"success_count,omitempty"`
+	Credits  int64  `json:"credits"`
+	Disabled bool   `json:"disabled"`
+	Reason   string `json:"reason,omitempty"`
+	// DisabledByManual 该 disabled 是否来自人工禁用（面板 toggle）。
+	// 持久化：否则重启后无法区分来源，「测试连接」会把人工禁用的号自动解禁。
+	// 旧 state.json 缺此字段 → false，即按自动禁用对待（与旧行为一致）。
+	DisabledByManual bool      `json:"disabled_by_manual,omitempty"`
+	Until            time.Time `json:"until,omitempty"`
+	CoolKind         CoolKind  `json:"cool_kind"`
+	SuccessCount     int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64     `json:"err_total,omitempty"`

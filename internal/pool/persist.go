@@ -154,17 +154,18 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		p.byUID[uid] = &entry{
-			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:      s.Credits,
-			disabled:     s.Disabled,
-			reason:       s.Reason,
-			until:        s.Until,
-			coolKind:     s.CoolKind,
-			successCount: s.SuccessCount,
-			errTotal:     errTotal,
-			lastErr:      s.LastErr,
-			lastSuccess:  s.LastSuccess,
-			softStreak:   s.SoftStreak,
+			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:          s.Credits,
+			disabled:         s.Disabled,
+			disabledByManual: s.DisabledByManual,
+			reason:           s.Reason,
+			until:            s.Until,
+			coolKind:         s.CoolKind,
+			successCount:     s.SuccessCount,
+			errTotal:         errTotal,
+			lastErr:          s.LastErr,
+			lastSuccess:      s.LastSuccess,
+			softStreak:       s.SoftStreak,
 		}
 	}
 }
@@ -264,16 +265,17 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
-			SoftStreak:   e.softStreak,
+			Credits:          e.credits,
+			Disabled:         e.disabled,
+			DisabledByManual: e.disabledByManual,
+			Reason:           e.reason,
+			Until:            e.until,
+			CoolKind:         e.coolKind,
+			SuccessCount:     e.successCount,
+			ErrTotal:         e.errTotal,
+			LastSuccess:      e.lastSuccess,
+			LastErr:          e.lastErr,
+			SoftStreak:       e.softStreak,
 		}
 	}
 	return sf

@@ -12,12 +12,31 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// Disable 禁用账号（自动禁用：session 死亡等故障态）。
+// 人工禁用请用 DisableManual —— 二者在「测试通过能否自动解除」上语义不同。
 func (p *Pool) Disable(uid, reason string) {
+	p.disableWith(uid, reason, false)
+}
+
+// DisableManual 人工禁用（面板 toggle）：标记来源为人工，
+// 使 NoteTestOK 不会在「测试连接」通过时把它自动解除。
+//
+// 为什么人工禁用要区别对待：「测试通过」只证明**凭证/session 有效**，
+// 而人工禁用表达的是**运维决定**（比如这个号要留作他用、或正在排查问题）。
+// 二者不在同一维度，测试结果不构成推翻人工决定的依据。
+// 解除人工禁用只有两条显式路径：面板 toggle 启用、或「重置」勾选解除禁用。
+func (p *Pool) DisableManual(uid, reason string) {
+	p.disableWith(uid, reason, true)
+}
+
+// disableWith 两种禁用的共用实现。manual 决定来源标记。
+func (p *Pool) disableWith(uid, reason string, manual bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.disabled = true
 		e.reason = reason
+		e.disabledByManual = manual
 		p.dirty.Store(true)
 	}
 }
@@ -107,6 +126,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok && e.disabled {
 		e.disabled = false
+		e.disabledByManual = false
 		e.reason = ""
 		e.sessionDeadFails = 0
 		e.safetyBannedFails = 0
@@ -348,20 +368,28 @@ func (p *Pool) Reset(uid string, includeDisabled bool) (before, after string) {
 	e.sessionDeadFails = 0
 	e.safetyBannedFails = 0
 	if includeDisabled {
+		// 显式勾选解除禁用：人工禁用也一并解除（这是用户本人的显式动作，
+		// 与 NoteTestOK 的"测试通过顺带解禁"不同）。
+		e.disabledByManual = false
 		e.disabled = false
 	}
 	p.dirty.Store(true)
 	return before, "已重置"
 }
 
-// NoteTestOK 面板「测试连接」成功后写回池中状态：清冷却/退避/熔断，并解除禁用。
+// NoteTestOK 面板「测试连接」成功后写回池中状态：清冷却/退避/熔断。
 //
 // 为什么要单独一个方法，而不是复用 NoteSuccess：
 //   - 测试是诊断，不该计入 successCount/lastSuccess —— 那些字段描述的是**真实请求**
 //     的调度表现，把测试混进去会污染 /status 的「最近活动」与成功率权重。
-//   - 测试必须解除禁用：disabled 只在 session 死亡时设置，而测试通过恰好证明
-//     session 活着，二者直接矛盾。且 upsertLocked 重新导入凭证时保留旧状态，
-//     所以「重新登录 → 导入 → 测试通过」若不在此解除，就会永远卡在「已禁用」。
+//   - 测试通过证明 session 活着，故**自动**禁用（12153 session dead）应被解除；
+//     且 upsertLocked 重新导入凭证时保留旧状态，所以「重新登录 → 导入 → 测试通过」
+//     若不在此解除，就会永远卡在「已禁用」。
+//
+// **不解除人工禁用**（disabledByManual）：那是运维决定，与凭证有效性无关。
+// 旧行为无条件解禁，导致「手动禁用的号点一次测试就被放回池中」——
+// 2026-10-16 用户报告的问题。解除人工禁用只有两条显式路径：
+// 面板 toggle 启用、或「重置」勾选解除禁用。
 //
 // 只改池中状态，不碰凭证文件。
 func (p *Pool) NoteTestOK(uid string) {
@@ -371,7 +399,23 @@ func (p *Pool) NoteTestOK(uid string) {
 	if e == nil {
 		return
 	}
+	if e.disabled && e.disabledByManual {
+		// 人工禁用：保留 disabled 与 reason，只清冷却/熔断（测试确实证明了链路可用，
+		// 清掉这些让它在被重新启用后能立即服务，而不是还背着旧冷却）。
+		e.until = time.Time{}
+		e.coolKind = 0
+		e.softStreak = 0
+		p.clearModelCoolsLocked(e)
+		e.breakerUntil = time.Time{}
+		e.fails = 0
+		e.retryCount = 0
+		e.sessionDeadFails = 0
+		e.safetyBannedFails = 0
+		p.dirty.Store(true)
+		return
+	}
 	e.disabled = false
+	e.disabledByManual = false
 	e.until = time.Time{}
 	e.reason = ""
 	e.coolKind = 0

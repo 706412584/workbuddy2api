@@ -18,8 +18,6 @@ interface Props {
   onChanged: () => void
 }
 
-type Mode = 'oauth' | 'import'
-
 export function Accounts({ onChanged }: Props) {
   const [files, setFiles] = useState<AuthFileView[]>([])
   const [authDir, setAuthDir] = useState('')
@@ -28,7 +26,6 @@ export function Accounts({ onChanged }: Props) {
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const [mode, setMode] = useState<Mode>('oauth')
   const [region, setRegion] = useState<'cn' | 'global'>('cn')
 
   // 登录流程状态机
@@ -47,6 +44,10 @@ export function Accounts({ onChanged }: Props) {
   const pollGen = useRef(0)
   /** 本次登录会话标识，由 startLogin 返回；轮询时带回以隔离并发登录。 */
   const sessionIdRef = useRef('')
+  /** 导入区的隐藏文件输入；点按钮或拖放都走它，导入后清空 value 以便重复选同一文件。 */
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  /** 拖放悬停高亮（仅视觉反馈）。 */
+  const [dragOver, setDragOver] = useState(false)
 
   const load = useCallback(async () => {
     setBusy(true)
@@ -136,7 +137,13 @@ export function Accounts({ onChanged }: Props) {
     setLoginMsg('已取消本地轮询（上游 state 仍然有效，可稍后重新走一次）')
   }
 
-  const doImport = async () => {
+  /**
+   * 导入凭证。payload 省略时用粘贴框内容（兼容原调用点）。
+   * 支持单条（嵌套/扁平形）与导出批量格式（顶层 accounts 数组）自动判别。
+   */
+  const doImport = async (payload?: string) => {
+    const text = (payload ?? importText).trim()
+    if (!text) return
     setErr('')
     setLoginMsg('')
     try {
@@ -144,14 +151,14 @@ export function Accounts({ onChanged }: Props) {
       // 逐条导入且部分失败不中断；否则按单条（原有行为）。
       let isBatch = false
       try {
-        const probe = JSON.parse(importText)
+        const probe = JSON.parse(text)
         isBatch = Array.isArray(probe?.accounts) && probe.accounts.length > 0
       } catch {
         // 解析失败交给后端报明确错误（这里不抢先判）
       }
       if (isBatch) {
-        const r = await importAuthBatch(importText)
-        setImportText('')
+        const r = await importAuthBatch(text)
+        if (payload === undefined) setImportText('')
         const okN = r.imported.length
         const failN = r.failed.length
         setLoginMsg(
@@ -166,8 +173,8 @@ export function Accounts({ onChanged }: Props) {
         )
         if (failN > 0) setErr(`有 ${failN} 条未导入，详见上方说明`)
       } else {
-        const r = await importAuth(importText)
-        setImportText('')
+        const r = await importAuth(text)
+        if (payload === undefined) setImportText('')
         setLoginMsg(`已写入 ${r.file}，已生效`)
       }
       await load()
@@ -175,6 +182,26 @@ export function Accounts({ onChanged }: Props) {
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  /**
+   * 从文件导入（拖放或选择）。支持多选：逐个文件调用 doImport，
+   * 与批量格式一样「坏文件不中断其余」。
+   */
+  const importFromFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return
+    const names: string[] = []
+    for (const f of Array.from(fileList)) {
+      try {
+        const text = await f.text()
+        await doImport(text)
+        names.push(f.name)
+      } catch (e) {
+        setErr(`读取 ${f.name} 失败：${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    if (names.length > 0) setLoginMsg(`已从文件导入 ${names.length} 个：${names.join('、')}`)
+    if (fileInputRef.current) fileInputRef.current.value = '' // 允许重复选同一文件
   }
 
   /**
@@ -323,18 +350,9 @@ export function Accounts({ onChanged }: Props) {
             <h2>添加账号</h2>
           </header>
           <div className="body">
-            <div className="field">
-              <div className="tabs">
-                <button aria-selected={mode === 'oauth'} onClick={() => setMode('oauth')}>
-                  设备码登录
-                </button>
-                <button aria-selected={mode === 'import'} onClick={() => setMode('import')}>
-                  粘贴凭证
-                </button>
-              </div>
-            </div>
-
-            {mode === 'oauth' ? (
+            {/* 凭证导入已统一到右侧「导入 / 导出」面板（原「粘贴凭证」标签在此，
+                与导出分处两地导致用户找不到导入入口）。此处只保留设备码登录。 */}
+            {(
               <>
                 <div className="field">
                   <label>账号区域</label>
@@ -406,42 +424,82 @@ export function Accounts({ onChanged }: Props) {
                   </div>
                 )}
               </>
-            ) : (
-              <>
-                <div className="field">
-                  <label>凭证 JSON（网关读取的嵌套形）</label>
-                  <textarea
-                    rows={12}
-                    value={importText}
-                    onChange={(e) => setImportText(e.target.value)}
-                    placeholder={`{\n "account": {"uid":"...","enterpriseId":"...","nickname":"..."},\n "auth": {"accessToken":"...","refreshToken":"...","expiresAt":0,"domain":"copilot.tencent.com"}\n}`}
-                    style={{ width: '100%', fontSize: 11.5 }}
-                  />
-                  <div className="dim" style={{ fontSize: 11.5, marginTop: 6 }}>
-                    也接受扁平形（accessToken/uid 直接在顶层），以及导出的批量格式
-                    （顶层含 <span className="mono">accounts</span> 数组，一次导入多个，
-                    坏条目不影响其余）。文件名按 uid 生成，同 uid 会覆盖。
-                  </div>
-                </div>
-                <button className="btn primary" onClick={doImport} disabled={!importText.trim()}>
-                  写入账号文件
-                </button>
-              </>
             )}
 
             <div className="dim" style={{ fontSize: 11.5, marginTop: 14 }}>
               登录复用仓库根的 <span className="mono">login.exe</span>（设备码流程），
               该文件不存在时会尝试 <span className="mono">go build</span> 一次。
               此处不会代替网关做签到，签到由网关的定时任务负责。
+              已有凭证要导入请用右侧「<span className="mono">导入 / 导出</span>」。
             </div>
           </div>
         </div>
 
         <div className="panel">
           <header>
-            <h2>导出账号</h2>
+            <h2>导入 / 导出</h2>
           </header>
           <div className="body">
+            {/* 导入区：与导出并列，解决「有导出却找不到导入」的入口不对称。
+                支持拖放与文件选择（一次多个），也保留粘贴框。 */}
+            <div className="field">
+              <label>导入账号</label>
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  setDragOver(true)
+                }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  setDragOver(false)
+                  void importFromFiles(e.dataTransfer.files)
+                }}
+                onClick={() => fileInputRef.current?.click()}
+                style={{
+                  border: `1px dashed ${dragOver ? 'var(--accent)' : 'var(--border)'}`,
+                  borderRadius: 6,
+                  padding: '14px 12px',
+                  textAlign: 'center',
+                  cursor: 'pointer',
+                  fontSize: 12,
+                  color: 'var(--text-dim)',
+                  background: dragOver ? 'var(--bg-hover, rgba(0,0,0,.03))' : undefined,
+                }}
+                title="支持一次拖入多个 JSON 文件；也可点击选择"
+              >
+                拖入 JSON 文件到此处，或<span style={{ color: 'var(--accent)' }}>点击选择</span>
+                <div style={{ fontSize: 11, marginTop: 4 }}>
+                  支持导出文件（含 accounts 数组）与单个 auths/*.json，可多选
+                </div>
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,application/json"
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => void importFromFiles(e.target.files)}
+              />
+              <textarea
+                rows={4}
+                value={importText}
+                onChange={(e) => setImportText(e.target.value)}
+                placeholder="…或直接粘贴凭证 JSON（嵌套形 / 扁平形 / 导出的批量格式均可）"
+                style={{ width: '100%', fontSize: 11.5, marginTop: 8 }}
+              />
+              <button
+                className="btn"
+                onClick={() => void doImport()}
+                disabled={!importText.trim()}
+                style={{ marginTop: 8 }}
+              >
+                导入粘贴内容
+              </button>
+            </div>
+
+            <hr style={{ border: 0, borderTop: '1px solid var(--border)', margin: '16px 0' }} />
+
             <div className="field">
               <label>范围</label>
               <select
