@@ -754,7 +754,11 @@ func TestChatChunkReaderAbortsOnLoop(t *testing.T) {
 	}
 	sb.WriteString("data: [DONE]\n\n")
 
-	stats := newChatStatsReaderSince(strings.NewReader(sb.String()), time.Now().Add(-time.Minute))
+	stats := newChatStatsReaderSince(strings.NewReader(sb.String()), time.Now())
+	// 判据的耗时基准是 attemptStart（本次尝试开始），故回拨它来模拟「这次尝试已跑
+	// 了 60 秒」——满足 MinElapsed(30s) 的前置。不能只回拨 since 参数：它现在只作
+	// TTFB 基准，回拨不影响判据（见 chatStatsReader.attemptStart 注释）。
+	stats.attemptStart = time.Now().Add(-time.Minute)
 	stats.SetLoopGuard(&g)
 	reader := newChatChunkReader(stats)
 
@@ -843,5 +847,36 @@ func TestLoopGuardConfigThinkOnlyWiring(t *testing.T) {
 	// 负值 → 禁用（limit 返回 0）
 	if d := (LoopGuardConfig{Enabled: true, MaxThinkOnlySeconds: -1}).toLoopGuard().thinkOnlyLimit(); d != 0 {
 		t.Errorf("负值应禁用，got %v", d)
+	}
+}
+
+// TestLoopGuardElapsedIsPerAttempt 回归：判据的计时基准必须是**本次尝试**的开始时刻，
+// 不能是请求进入时刻。
+//
+// 背景（2026-10-17 生产实测）：一次请求在轮换里可能发起多次尝试，每次新建一个
+// chatStatsReader。若判据用「请求进入时刻」，第二次尝试一开跑 elapsed 就已超过
+// 120s 阈值 —— 于是「只思考超时」判据会在新尝试吐出第一个字符时立即命中，
+// 把正常请求误杀。日志实证：同一请求第 1 次 think_chars=56650（正常命中），
+// 第 2/3 次 think_chars=25/31（误杀，而该请求总耗时仅 4 秒）。
+func TestLoopGuardElapsedIsPerAttempt(t *testing.T) {
+	g := DefaultLoopGuard()
+
+	// 构造一个 reader：attemptStart 是「此刻」，start 是「很久以前」（模拟第 2 次尝试）。
+	old := time.Now().Add(-10 * time.Minute)
+	s := newChatStatsReaderSince(strings.NewReader(""), old)
+	s.SetLoopGuard(&g)
+
+	// 先确认两个时间基准确实不同（防接线写错成同一个）。
+	if s.attemptStart.IsZero() || s.start.IsZero() {
+		t.Fatal("attemptStart/start 未初始化")
+	}
+	if !s.attemptStart.After(s.start) {
+		t.Fatal("attemptStart 应晚于 start（构造时的固有差异）")
+	}
+
+	// 新尝试刚吐了少量思考：不该命中（本次尝试才刚开始，远未到 120s）。
+	s.noteThinking(strings.Repeat("x", 25))
+	if err := s.LoopGuardErr(); err != nil {
+		t.Error("新尝试刚开跑就命中 —— 计时基准用错成了请求进入时刻（会误杀正常请求）")
 	}
 }

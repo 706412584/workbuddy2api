@@ -55,9 +55,18 @@ func (s *chatStat) done() {
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
 	br       *bufio.Reader
-	start    time.Time
+	start    time.Time // 请求进入 handler 的时刻（TTFB 与总耗时基准，跨轮换不重置）
 	ttfb     time.Duration
 	seen     bool // 已见过首个 data 帧（TTFB 只记一次）
+	// attemptStart 本次**尝试**的开始时刻，仅用于思考循环判据。
+	//
+	// 必须与 start 分开（2026-10-17 修的真实 bug）：start 是请求进入时刻，
+	// 而一次请求在轮换里可能发起多次尝试（每次新建一个 reader）。若判据也用
+	// start，第二次尝试一开跑 elapsed 就已经超过阈值 —— 于是「只思考超时」
+	// 这条判据会在新尝试吐出第一个字符时立即命中，把正常请求误杀。
+	// 日志实证：同一请求第 1 次 think_chars=56650（正常命中），第 2/3 次
+	// think_chars=25/31（误杀，请求总耗时仅 4 秒）。
+	attemptStart time.Time
 	hasUsage bool // 末帧是否带 usage
 	tokens   int
 	credit   float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
@@ -137,16 +146,26 @@ func (s *chatStatsReader) LoopGuardErr() error {
 	// 停滞块数：自上次出现新块以来累积的块数。lastNovel 记录的是「发现新块那一刻的
 	// 总块数」，而总块数只增不减，故该差值恒 >= 0。
 	stale := total - s.lastNovel
-	if s.guard.Detect(s.thinkChars, s.textChars, stale, distinct, total, time.Since(s.start)) {
+	// 用 attemptStart（本次尝试开始）而非 start（请求进入）：一次请求可能在轮换里
+	// 发起多次尝试，每次新建 reader；用 start 会让第 2 次尝试一开跑 elapsed 就超阈值，
+	// 把正常请求误杀（2026-10-17 实测 think_chars=25 即命中）。
+	if s.guard.Detect(s.thinkChars, s.textChars, stale, distinct, total, time.Since(s.attemptStart)) {
 		s.loopTripped = true
 		return ErrThinkingLoop
 	}
 	return nil
 }
 
-// newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
+// newChatStatsReaderSince 构造 reader；since 为请求进入时刻（TTFB 基准）。
+//
+// attemptStart 单独取 time.Now()：本函数每轮换一次就调用一次，故它天然就是
+// 「本次尝试的开始时刻」，正是思考循环判据需要的基准（见 attemptStart 字段注释）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
+	return &chatStatsReader{
+		br:           bufio.NewReaderSize(r, 64*1024),
+		start:        since,
+		attemptStart: time.Now(),
+	}
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
