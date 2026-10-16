@@ -769,3 +769,79 @@ func TestChatChunkReaderAbortsOnLoop(t *testing.T) {
 		t.Fatalf("读到 %v want ErrThinkingLoop（中断未透出）", got)
 	}
 }
+
+// TestLoopGuardThinkOnlyTimeout 第三条判据：只思考不出正文超时。
+//
+// 回归背景（2026-10-17）：前两条判据（停滞/占比）都建立在「内容重复」上，
+// 抓不到「持续吐互不重复的 thinking、始终无正文」的形态。实测 #1045 挂了 2822s、
+// #1358 挂了 301s 全部漏判，最后由客户端 300s 看门狗先杀，用户看到
+// "Thinking stream exceeded 300s without producing text"。
+func TestLoopGuardThinkOnlyTimeout(t *testing.T) {
+	g := DefaultLoopGuard() // MaxThinkOnlyDuration = 120s
+	cases := []struct {
+		name            string
+		think, text     int
+		distinct, total int
+		elapsed         time.Duration
+		want            bool
+	}{
+		// 内容完全不重复（distinct==total，占比 1.0）+ 无正文 + 超 120s → 必须命中。
+		// 这是旧判据唯一抓不到的形态：stale=0（每块都新）、ratio=1.0（无重复）。
+		{"只思考不重复且超时", 20_000, 0, 20_000, 20_000, 121 * time.Second, true},
+		// 未超时（正是"正常深度推理"的空间）
+		{"只思考未到时限", 20_000, 0, 20_000, 20_000, 119 * time.Second, false},
+		// 有正文 → 永不干预（哪怕超时很久）
+		{"有正文则豁免", 20_000, 1, 20_000, 20_000, 600 * time.Second, false},
+		// 零思考字符 = 纯挂起，属 idle_timeout 职责，本判据不管
+		{"无任何思考内容", 0, 0, 0, 20_000, 600 * time.Second, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := g.Detect(c.think, c.text, 0, c.distinct, c.total, c.elapsed)
+			if got != c.want {
+				t.Errorf("Detect(think=%d,text=%d,distinct=%d,total=%d,%v)=%v want %v",
+					c.think, c.text, c.distinct, c.total, c.elapsed, got, c.want)
+			}
+		})
+	}
+}
+
+// TestLoopGuardThinkOnlyBypassesMinThinkChars 超时判据不受字符下限约束：
+// 慢模型可能思考 120 秒只吐几千字符，用 30000 门槛会把它整个屏蔽掉。
+func TestLoopGuardThinkOnlyBypassesMinThinkChars(t *testing.T) {
+	g := DefaultLoopGuard()
+	// think=5000 << MinThinkChars(30000)，但已超时 → 仍应命中。
+	if !g.Detect(5_000, 0, 0, 5_000, 5_000, 121*time.Second) {
+		t.Error("超时判据不应受 MinThinkChars 下限约束（慢模型思考 120s 可能只吐几千字符）")
+	}
+}
+
+// TestLoopGuardThinkOnlyDisabled 负值显式禁用该判据，退回只有停滞/占比的旧行为。
+func TestLoopGuardThinkOnlyDisabled(t *testing.T) {
+	g := DefaultLoopGuard()
+	g.MaxThinkOnlyDuration = -1
+	// 内容不重复 + 超时很久：禁用后不应命中。
+	if g.Detect(20_000, 0, 0, 20_000, 20_000, 3600*time.Second) {
+		t.Error("负值应禁用 thinking-only 判据")
+	}
+	// 但停滞判据仍须工作（只关一条，不是全关）。
+	if !g.Detect(500_000, 0, 2000, 500, 20_000, time.Minute) {
+		t.Error("禁用 thinking-only 不应影响停滞判据")
+	}
+}
+
+// TestLoopGuardConfigThinkOnlyWiring 配置接线：>0 生效、0 用默认、<0 禁用。
+func TestLoopGuardConfigThinkOnlyWiring(t *testing.T) {
+	// 未配置（0）→ 默认 120s
+	if d := (LoopGuardConfig{Enabled: true}).toLoopGuard().thinkOnlyLimit(); d != defaultMaxThinkOnlyDuration {
+		t.Errorf("未配置时=%v want %v", d, defaultMaxThinkOnlyDuration)
+	}
+	// 显式 60
+	if d := (LoopGuardConfig{Enabled: true, MaxThinkOnlySeconds: 60}).toLoopGuard().thinkOnlyLimit(); d != time.Minute {
+		t.Errorf("配置 60s 时=%v want 1m", d)
+	}
+	// 负值 → 禁用（limit 返回 0）
+	if d := (LoopGuardConfig{Enabled: true, MaxThinkOnlySeconds: -1}).toLoopGuard().thinkOnlyLimit(); d != 0 {
+		t.Errorf("负值应禁用，got %v", d)
+	}
+}

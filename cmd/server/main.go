@@ -312,12 +312,13 @@ func main() {
 		// 2 次仍不行则回明确错误。主判据是「连续 2000 块（48KB）没有新内容」，
 		// 配置项为 0 时 toLoopGuard 回落到内置默认，所以 Enabled 恒定 true。
 		LoopGuard: server.LoopGuardConfig{
-			Enabled:           true,
-			MinThinkChars:     cfg.Server.LoopGuardMinThinkChars,
-			MaxDistinctRatio:  cfg.Server.LoopGuardMaxDistinctRatio,
-			MinElapsedSeconds: cfg.Server.LoopGuardMinElapsedSeconds,
-			MaxRetries:        cfg.Server.LoopGuardMaxRetries,
-			MaxStaleChunks:    cfg.Server.LoopGuardMaxStaleChunks,
+			Enabled:             true,
+			MinThinkChars:       cfg.Server.LoopGuardMinThinkChars,
+			MaxDistinctRatio:    cfg.Server.LoopGuardMaxDistinctRatio,
+			MinElapsedSeconds:   cfg.Server.LoopGuardMinElapsedSeconds,
+			MaxRetries:          cfg.Server.LoopGuardMaxRetries,
+			MaxStaleChunks:      cfg.Server.LoopGuardMaxStaleChunks,
+			MaxThinkOnlySeconds: cfg.Server.LoopGuardMaxThinkOnlySeconds,
 		},
 	})
 

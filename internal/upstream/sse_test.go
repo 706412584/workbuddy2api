@@ -502,3 +502,74 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamInjectsFinishReasonWhenMissing 回归：上游流结束却没发过 finish_reason 时，
+// 必须补一帧，否则客户端报 "stream ended without finish_reason" 并当作传输错误重试 ——
+// 表现为「AI 反复重复同一段话」（重试重放已生成内容）。
+//
+// 触发场景：上游流中途断开、或网关按 loopguard 主动切断后不再重试。
+func TestStreamInjectsFinishReasonWhenMissing(t *testing.T) {
+	// 上游只发了 delta，没有任何 finish_reason，然后直接 EOF（无 [DONE]）。
+	src := "data: {\"id\":\"c1\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(src)); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	out := rec.Body.String()
+
+	if !strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Errorf("输出里没有任何 finish_reason:\n%s", out)
+	}
+	// 必须复用原帧的 id/model（客户端按 id 归组消息）。
+	if !strings.Contains(out, `"id":"c1"`) || !strings.Contains(out, `"model":"m1"`) {
+		t.Errorf("补帧未复用原 id/model:\n%s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Errorf("缺 [DONE]:\n%s", out)
+	}
+}
+
+// TestStreamDoesNotDuplicateFinishReason 上游已发过 finish_reason 时不补帧（避免重复收尾）。
+func TestStreamDoesNotDuplicateFinishReason(t *testing.T) {
+	src := "data: {\"id\":\"c1\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(src)); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if n := strings.Count(rec.Body.String(), `"finish_reason":"stop"`); n != 1 {
+		t.Errorf("finish_reason 出现 %d 次，want 1（不应重复补帧）", n)
+	}
+}
+
+// TestFinishReasonChunkShape 补帧的形状：choices[0] 含 index+finish_reason，delta 为空对象。
+func TestFinishReasonChunkShape(t *testing.T) {
+	var obj struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Index        int            `json:"index"`
+			Delta        map[string]any `json:"delta"`
+			FinishReason string         `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(finishReasonChunk("cid", "mdl")), &obj); err != nil {
+		t.Fatalf("补帧不是合法 JSON: %v", err)
+	}
+	if obj.ID != "cid" || obj.Model != "mdl" {
+		t.Errorf("id/model 未透传: %+v", obj)
+	}
+	if obj.Object != "chat.completion.chunk" {
+		t.Errorf("object=%q want chat.completion.chunk", obj.Object)
+	}
+	if len(obj.Choices) != 1 || obj.Choices[0].FinishReason != "stop" || obj.Choices[0].Index != 0 {
+		t.Errorf("choices 形状不对: %+v", obj.Choices)
+	}
+	// id/model 为空时给稳定合成值，不得留空。
+	empty := finishReasonChunk("", "")
+	if !strings.Contains(empty, `"id":"chatcmpl-fallback-finish"`) {
+		t.Errorf("空 id 未兜底: %s", empty)
+	}
+}

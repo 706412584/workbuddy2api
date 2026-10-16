@@ -90,6 +90,12 @@ type Config struct {
 		// 内容即判空转。默认 2000 块 = 48KB，是主判据，与循环周期长度无关。
 		// 调小会更快切断但误判面变大；调试时可临时调小以验证链路。
 		LoopGuardMaxStaleChunks int `json:"loopguard_max_stale_chunks"`
+		// LoopGuardMaxThinkOnlySeconds 只思考不出正文的时长上限（秒）。
+		// 默认 120；负值禁用该判据；0 = 用默认。
+		// 覆盖「思考内容不重复但迟迟不出正文」——停滞/占比两条判据都建立在
+		// 内容重复上，抓不到它（实测有请求因此挂到 2822 秒）。
+		// 取 120 是为了先于客户端（Claude Code 默认 300s）的同类看门狗切断。
+		LoopGuardMaxThinkOnlySeconds int `json:"loopguard_max_think_only_seconds"`
 	} `json:"server"`
 
 	Cooldown struct {

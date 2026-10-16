@@ -333,8 +333,38 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	// sawFinishReason 是否已向上游转发过带非空 finish_reason 的帧。
+	// 收尾时若仍为 false，补一帧：客户端（Claude Code 的 OpenAI→Anthropic 适配器）
+	// 要求流里至少出现一次 finish_reason，否则报
+	// "OpenAI Chat upstream stream ended without finish_reason" 并当作传输错误重试。
+	// 触发场景：上游流中途断开、或本函数因 loopguard 主动切断（见下方 abort）。
+	sawFinishReason := false
 	// abort 逐帧检查中断条件（思考死循环）。r 不实现 LoopAborter 时为 nil，零开销。
 	abort, _ := r.(LoopAborter)
+
+	// frameHasFinishReason 报告该 payload 是否带非空 finish_reason。
+	// 解析失败按 false 处理：无法确认就不算见过（宁可多补一帧，
+	// 补帧对已正常结束的流无害——客户端见到 finish_reason 即收尾）。
+	frameHasFinishReason := func(payload string) bool {
+		var obj struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(payload), &obj) != nil {
+			return false
+		}
+		for _, c := range obj.Choices {
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// lastChunkMeta 记录最近一帧的 id/model，供补帧复用（客户端按 id 归组消息）。
+	var lastID, lastModel string
+
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -345,7 +375,19 @@ readLoop:
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+			payload := strings.TrimPrefix(trimmed, "data: ")
+			if !sawFinishReason && frameHasFinishReason(payload) {
+				sawFinishReason = true
+			}
+			if id, model := peekChunkMeta(payload); id != "" || model != "" {
+				if id != "" {
+					lastID = id
+				}
+				if model != "" {
+					lastModel = model
+				}
+			}
+			n, werr := writeFrame(payload)
 			validFrames += n
 			if werr != nil {
 				return werr
@@ -379,6 +421,13 @@ readLoop:
 	if validFrames == 0 {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
 	}
+	// 补齐 finish_reason：上游漏发（流被中断 / 本函数按 loopguard 切断）时，
+	// 客户端会因"流结束却没有 finish_reason"把整个响应判为传输错误并重试，
+	// 表现为用户看到的"AI 反复重复同一段话"（重试会重放已生成内容）。
+	// 补一帧 stop 让客户端能正常收尾——内容已完整送达，缺的只是结束标记。
+	if !sawFinishReason && validFrames > 0 {
+		_ = writeRaw(finishReasonChunk(lastID, lastModel))
+	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 		return err
@@ -390,4 +439,38 @@ readLoop:
 		return fmt.Errorf("upstream stream contained no valid data events")
 	}
 	return nil
+}
+
+// peekChunkMeta 从一帧 payload 里取 id 与 model（供补帧复用）。
+// 解析失败返回空串（调用方保留上一次的值）。
+//
+// 为什么要复用上一帧的 id：客户端（Anthropic 适配器）按 id 归组同一条消息，
+// 补帧若换了新 id 会被当成"另一条消息"，可能触发多余的分段。
+func peekChunkMeta(payload string) (id, model string) {
+	var obj struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	if json.Unmarshal([]byte(payload), &obj) != nil {
+		return "", ""
+	}
+	return obj.ID, obj.Model
+}
+
+// finishReasonChunk 构造一帧只带 finish_reason 的收尾 chunk。
+//
+// 形状对齐 OpenAI 流式规范（choices[0] 只含 index + finish_reason，delta 为空对象），
+// 与上游正常收尾帧同形 —— 客户端据此判定"本轮正常结束"。
+// id/model 取自流内最后一帧；都为空时给一个稳定的合成值（客户端不校验其格式）。
+func finishReasonChunk(id, model string) string {
+	if id == "" {
+		id = "chatcmpl-fallback-finish"
+	}
+	if model == "" {
+		model = "unknown"
+	}
+	return fmt.Sprintf(
+		`{"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		id, time.Now().Unix(), model,
+	)
 }

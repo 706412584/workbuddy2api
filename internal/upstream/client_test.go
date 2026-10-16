@@ -982,3 +982,34 @@ func TestTransportHardeningValues(t *testing.T) {
 		t.Errorf("dialer.Timeout=%v want 10s", dialer.Timeout)
 	}
 }
+
+// TestContextExceededMessageEscapedGT 回归：上游把 `>` 转义成 `\u003e` 时，
+// 文案必须完整保留 "> N maximum"。
+//
+// 背景（2026-10-17 生产 bug）：旧正则 `prompt is too long: [^"\]{0,120}` 的
+// `[^"\]` **排除反斜杠**，遇到 `\u003e` 里的 `\` 就停止匹配，只抓出
+// "prompt is too long: 2200538 tokens" —— 丢了 "> 1048576 maximum"。
+// 而客户端正是按后者识别"该压缩了"：拿不到就原样重发超长上下文，
+// 表现为 AI 反复重复同一段话（日志实证 token 数不减反增）。
+func TestContextExceededMessageEscapedGT(t *testing.T) {
+	// 生产实测形态（Go 源码里写 \u003e 需再转义一层，故字符串里是 \u003e）。
+	prod := `{"code":11115,"msg":"prompt is too long: 2200538 tokens \u003e 1048576 maximum","requestId":"x","extError":{"code":"invalid_request_error"}}`
+	got := ContextExceededMessage(prod)
+	want := "prompt is too long: 2200538 tokens > 1048576 maximum"
+	if got != want {
+		t.Errorf("got  %q\nwant %q\n（转义形态下丢了 \"> N maximum\"，客户端认不出压缩信号）", got, want)
+	}
+	// 绝不能残留转义序列——客户端按字面 ">" 匹配。
+	if strings.Contains(got, `\u003e`) || strings.Contains(got, `\`) {
+		t.Errorf("残留 JSON 转义序列: %q", got)
+	}
+}
+
+// TestContextExceededMessageFallbackKeepsPhrase 兜底文案必须仍含触发压缩的关键短语。
+func TestContextExceededMessageFallbackKeepsPhrase(t *testing.T) {
+	// msg 缺失且全文也匹配不到时走兜底。
+	got := ContextExceededMessage(`{"code":11115,"extError":{}}`)
+	if !strings.Contains(got, "prompt is too long") {
+		t.Errorf("兜底文案 %q 丢了触发压缩的关键短语", got)
+	}
+}

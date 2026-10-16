@@ -216,20 +216,58 @@ const contextExceededCode = "context_length_exceeded"
 const contextExceededBizCode = `"code":11115`
 const contextExceededMsg = "prompt is too long"
 
-// contextExceededPattern 从上游 body 里提取可直接透传给客户端的错误消息。
+// contextExceededPattern 从上游 msg 字段内容里截取可直接透传的超限文案。
 //
 // 只取 "prompt is too long: N tokens > M maximum" 这一段（上游原话），
 // 因为下游客户端（Claude Code 等）正是按这句话识别"该压缩上下文了"。
 // Anthropic 官方 API 的原生文案也是这个格式，故透传即可被识别。
-var contextExceededPattern = regexp.MustCompile(`prompt is too long: [^"\\]{0,120}`)
+//
+// 上限 160 字符：语句本身约 60 字符，留足余量又不至于把后续字段带进来。
+var contextExceededPattern = regexp.MustCompile(`prompt is too long: [^"]{0,160}`)
 
 // ContextExceededMessage 返回可直接回给客户端的上下文超限消息。
-// 解析失败时回退到固定文案（不含上游 requestId 等噪声，那些对客户端无意义）。
+//
+// 解析顺序：**先取 msg 字段**（结构化取值，天然避开 JSON 转义），
+// 失败再回退到全文正则，最后回退固定文案。
+//
+// 为什么不能只用全文正则（2026-10-17 修的真实 bug）：
+// 上游把 `>` 转义成 `\u003e`，而旧正则写的是 `[^"\\]{0,120}` —— `[^"\\]` 明确
+// **排除反斜杠**，于是匹配在 `tokens ` 后遇到 `\` 就停，抓出来的是
+//
+//	"prompt is too long: 2200538 tokens"        ← 丢了 "> 1048576 maximum"
+//
+// 而客户端正是靠 `> N maximum` 这句识别"该压缩了"：拿不到就认不出压缩信号，
+// 原样重发同一份超长上下文 → 再次超限 → 再截断 → 用户看到 AI 反复重复同一段话。
+// 日志实证：#5254 → #5257 相隔 5 秒，token 从 1049043 涨到 1049503（若真在压缩
+// 只会减少），即"原样重发 + 追加"。
+//
+// 取 msg 字段可根治：解析出的字符串里 `\u003e` 已被还原成 `>`，
+// 不再有反斜杠参与正则匹配。
 func ContextExceededMessage(body string) string {
+	// 首选：结构化取 msg（走 JSON 解码，转义自动还原）。
+	var envelope struct {
+		Msg string `json:"msg"`
+	}
+	if json.Unmarshal([]byte(body), &envelope) == nil && envelope.Msg != "" {
+		if m := contextExceededPattern.FindString(envelope.Msg); m != "" {
+			return strings.TrimSpace(m)
+		}
+	}
+	// 回退：全文正则（应对 msg 不是标准 JSON 字段的形态）。
 	if m := contextExceededPattern.FindString(body); m != "" {
-		return strings.TrimSpace(m)
+		// 全文匹配时可能夹带 JSON 转义序列（\u003e 等），还原后再返回，
+		// 否则客户端同样识别不出 "> N maximum"。
+		return decodeJSONEscapes(strings.TrimSpace(m))
 	}
 	return "prompt is too long: this request exceeds the model's maximum context length"
+}
+
+// decodeJSONEscapes 把字符串里残留的 JSON 转义序列还原为字面量。
+// 目前只处理 `\u003e` → `>`（上游超限文案里唯一出现的转义，即 `>` 的转义形）。
+// 不做通用 JSON 解码：那会把 `\"` 之类也吃掉，而这里是"从半截文本里还原"，
+// 通用解码必然失败。
+func decodeJSONEscapes(s string) string {
+	return strings.ReplaceAll(s, `\u003e`, ">")
 }
 
 // IsContextExceeded 报告上游 body 是否为上下文超限错误。

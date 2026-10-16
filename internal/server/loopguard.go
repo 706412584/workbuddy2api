@@ -78,18 +78,46 @@ type LoopGuard struct {
 	// MaxStaleChunks 停滞窗口（单位：块），连续这么多块没有新内容即判空转。
 	// 默认 2000 块 = 48KB —— 正常行文做不到 48KB 里连一个全新的 24 字节片段都没有。
 	MaxStaleChunks int
+	// MaxThinkOnlyDuration 只思考不出正文的时长上限（第三条判据）。
+	//
+	// 前两条判据（停滞 / 占比）都建立在「内容重复」上，抓不到这种形态：
+	// 模型持续吐**互不重复**的 thinking 却始终不产出正文。实测（2026-10-17）
+	// #1045 TTFB=2822s、#1358 TTFB=301s 均漏判 —— distinctRatio 接近 1.0、
+	// staleChunks 永远不够，而请求挂了 47 分钟。
+	//
+	// 默认 120s：客户端（Claude Code）自带 300s 的「thinking 无正文」看门狗，
+	// 网关必须**先于它**切断并换号重试，用户才不会看到
+	// "Thinking stream exceeded 300s without producing text"。
+	// 120s 也给正常的深度推理留足空间——真在推理的请求通常几十秒内就会出正文。
+	//
+	// 负值表示**禁用**该判据（退回只有停滞/占比两条的旧行为）。
+	// 0 = 未配置 → 用默认值（与本结构其余字段的约定一致，见 toLoopGuard）。
+	MaxThinkOnlyDuration time.Duration
 }
+
+// defaultMaxThinkOnlyDuration MaxThinkOnlyDuration 的默认值（见该字段注释）。
+const defaultMaxThinkOnlyDuration = 120 * time.Second
 
 // DefaultLoopGuard 默认判据。
 func DefaultLoopGuard() LoopGuard {
 	return LoopGuard{
-		Enabled:          true,
-		MinThinkChars:    30_000,
-		MaxDistinctRatio: 0.15,
-		MinElapsed:       30 * time.Second,
-		MaxRetries:       maxLoopRetries,
-		MaxStaleChunks:   2000, // 48KB
+		Enabled:              true,
+		MinThinkChars:        30_000,
+		MaxDistinctRatio:     0.15,
+		MinElapsed:           30 * time.Second,
+		MaxRetries:           maxLoopRetries,
+		MaxStaleChunks:       2000, // 48KB
+		MaxThinkOnlyDuration: defaultMaxThinkOnlyDuration,
 	}
+}
+
+// thinkOnlyLimit 返回生效的 thinking-only 时长上限；<=0 表示禁用该判据。
+// 未配置（字段为 0）时由 toLoopGuard 填成默认值，故这里 0 也按禁用处理即可。
+func (g LoopGuard) thinkOnlyLimit() time.Duration {
+	if g.MaxThinkOnlyDuration < 0 {
+		return 0
+	}
+	return g.MaxThinkOnlyDuration
 }
 
 // maxRetries 返回生效的重试上限（<=0 回落到默认）。
@@ -103,12 +131,22 @@ func (g LoopGuard) maxRetries() int {
 // Detect 判断给定的流式统计是否命中思考死循环。
 //
 // staleChunks 是「自上次出现新块以来累积的块数」，由调用方维护。
-// 两条判据满足其一即命中，共同前提是正文为 0（有产出就不干预）。
+// 三条判据满足其一即命中，共同前提是正文为 0（有产出就不干预）：
+//
+//  1. 停滞（MaxStaleChunks）—— 连续多块无新内容（内容重复）
+//  2. 占比（MaxDistinctRatio）—— 唯一块占比过低（慢漂移式重复）
+//  3. **thinking-only 超时**（MaxThinkOnlyDuration）—— 持续思考但始终无正文，
+//     内容可以完全不重复。前两条都建立在「内容重复」上，抓不到这种形态
+//     （实测 2026-10-17：#1045 挂了 2822s、#1358 挂了 301s，distinctRatio 接近
+//     1.0、staleChunks 永远不够，全部漏判，最后由客户端 300s 看门狗先杀）。
+//
+// 判据 3 **不受 MinThinkChars 约束**：MinThinkChars（30000）是给「重复检测」
+// 设的样本下限——判断重复需要足够长的文本。而超时判据看的是**时间**，
+// 慢模型可能思考 120 秒只吐几千字符，用 30000 门槛会把它整个屏蔽掉。
+// 它的门槛是自己的 MaxThinkOnlyDuration，以及「至少有思考内容」（thinkChars>0，
+// 否则是纯挂起，属 idle_timeout 的职责）。
 func (g LoopGuard) Detect(thinkChars, textChars, staleChunks, distinctChunks, totalChunks int, elapsed time.Duration) bool {
 	if !g.Enabled {
-		return false
-	}
-	if thinkChars < g.MinThinkChars {
 		return false
 	}
 	// 正文有输出说明模型在正常工作（哪怕同时在想），不干预。
@@ -116,6 +154,14 @@ func (g LoopGuard) Detect(thinkChars, textChars, staleChunks, distinctChunks, to
 		return false
 	}
 	if totalChunks == 0 {
+		return false
+	}
+	// 判据 3：thinking-only 超时。放在重复检测之前——它不需要长文本样本。
+	if limit := g.thinkOnlyLimit(); limit > 0 && thinkChars > 0 && elapsed >= limit {
+		return true
+	}
+	// 以下两条（重复检测）需要足够长的文本样本才有判断力。
+	if thinkChars < g.MinThinkChars {
 		return false
 	}
 	if elapsed < g.MinElapsed {

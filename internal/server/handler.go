@@ -87,6 +87,10 @@ type LoopGuardConfig struct {
 	// MaxStaleChunks 停滞窗口（块数，默认 2000 = 48KB）：连续这么多块没有新内容
 	// 即判空转。主判据，与循环周期长度无关。
 	MaxStaleChunks int
+	// MaxThinkOnlySeconds 只思考不出正文的时长上限秒数（默认 120，负值禁用）。
+	// 第三条判据，覆盖「思考内容不重复但迟迟不出正文」——前两条（停滞/占比）
+	// 都建立在内容重复上，抓不到它。取 120 是为了先于客户端 300s 看门狗切断。
+	MaxThinkOnlySeconds int
 }
 
 // toLoopGuard 转成运行时判据。
@@ -106,6 +110,12 @@ func (c LoopGuardConfig) toLoopGuard() *LoopGuard {
 	}
 	if c.MaxStaleChunks > 0 {
 		g.MaxStaleChunks = c.MaxStaleChunks
+	}
+	// 负值 = 显式禁用该判据；0 = 未配置 → 保留 DefaultLoopGuard 的默认值。
+	if c.MaxThinkOnlySeconds < 0 {
+		g.MaxThinkOnlyDuration = -1
+	} else if c.MaxThinkOnlySeconds > 0 {
+		g.MaxThinkOnlyDuration = time.Duration(c.MaxThinkOnlySeconds) * time.Second
 	}
 	g.MaxRetries = c.MaxRetries
 	if g.MaxRetries <= 0 {
@@ -192,8 +202,12 @@ func NewHandler(cfg Config) *Handler {
 	// 生效判据落一行启动日志：这几项只能从配置推导，出问题时（误杀/漏判）第一件
 	// 事就是确认实际生效的阈值，没有这行只能去翻配置文件猜。
 	if g := h.loopGuard; g != nil {
-		log.Printf("[server] 思考循环判据：停滞窗口=%d 块(%dKB) 占比<%.2f 字符下限=%d 重试=%d",
-			g.MaxStaleChunks, g.MaxStaleChunks*loopChunkLen>>10, g.MaxDistinctRatio, g.MinThinkChars, g.maxRetries())
+		thinkOnly := "禁用"
+		if d := g.thinkOnlyLimit(); d > 0 {
+			thinkOnly = d.String()
+		}
+		log.Printf("[server] 思考循环判据：停滞窗口=%d 块(%dKB) 占比<%.2f 字符下限=%d 只思考超时=%s 重试=%d",
+			g.MaxStaleChunks, g.MaxStaleChunks*loopChunkLen>>10, g.MaxDistinctRatio, g.MinThinkChars, thinkOnly, g.maxRetries())
 	} else {
 		log.Printf("[server] 思考循环判据：关闭")
 	}
