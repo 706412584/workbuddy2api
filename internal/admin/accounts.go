@@ -682,7 +682,8 @@ func (h *Handler) probeAccount(uid, model string) (res testResult) {
 	})
 
 	// 空 clientIP：测试连接是诊断，不透传客户端 IP（面板请求来自本机，透传无意义）。
-	rc, status, respBody, err := h.cfg.Upstream.ChatStream(acct, reqBody, "")
+	// 空 convID：一次性探测没有会话连续性，由 ChatHeaders 现场生成（上游只要求非空）。
+	rc, status, respBody, err := h.cfg.Upstream.ChatStream(acct, reqBody, "", "")
 	res.HTTPStatus = status
 	if err != nil {
 		res.Message = "请求上游失败：" + err.Error()

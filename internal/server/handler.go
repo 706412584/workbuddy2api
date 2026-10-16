@@ -884,7 +884,13 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 
 		// 客户端 IP 透传（仅 PassthroughIP 开启）：由调用方按请求取首段放进 o.clientIP，
 		// 不读写共享字段——并发请求各自携带独立 IP，互不串扰（issue：ClientIP 竞态）。
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, o.clientIP)
+		//
+		// convID：上游 2026-10-16 起强制要求 X-Conversation-ID 三头（见
+		// upstream.injectConversationHeaders）。这里把**会话键**（o.sessKey，取自客户端
+		// 请求体）作为 conversation id 传下去 —— 同一会话在上游看到稳定 ID，
+		// 对上游的会话维度风控与前缀缓存都更接近真实客户端行为。
+		// 无会话键（客户端未带 conversation_id）时传空，由 ChatHeaders 生成随机 UUID。
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, o.clientIP, o.sessKey)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。

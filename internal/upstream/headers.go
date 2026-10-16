@@ -3,8 +3,10 @@
 package upstream
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -156,7 +158,8 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
-func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
+// convID 为本次会话标识（见 injectConversationHeaders），空则由本函数生成一个。
+func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP, convID string) {
 	c.CommonHeaders(req, a)
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
@@ -186,11 +189,59 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
 	// 默认（ClientName 空）保持 X-Product="SaaS" 兼容现状，不设 X-IDE-*（不突变归因）；
 	// 配 ClientName（如 "WorkBuddy"）则四头跟随该值，对齐官方桌面端。
 	c.injectAttribution(req)
+	// 会话三头：上游 2026-10-16 起强制校验（见 injectConversationHeaders）。
+	c.injectConversationHeaders(req, convID)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
 	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)
+}
+
+// injectConversationHeaders 注入上游强制要求的三个会话头。
+//
+// 背景（2026-10-16 01:21 起全池 400 code=11-128）：上游给 /v2/chat/completions
+// 新增了会话头校验，**三个头缺一不可**，且判定顺序分两档：
+//
+//	无 X-Conversation-ID          → msg="conversation id missing"
+//	有 ID 但缺另外两个            → msg="request illegal"
+//	三头齐全                      → 200
+//
+// 实测（2026-10-16，global 账号直连上游 A/B/C 三组）：
+//
+//	A. 不带头               → 400 conversation id missing
+//	B. 仅 X-Conversation-ID → 400 request illegal
+//	C. 三头齐全             → 200，且响应体的 id 字段回显 X-Conversation-Message-ID
+//
+// 只校验**存在性**，不校验格式与唯一性：UUID / "wb2api-xxx" / 纯数字 / 三个头同值
+// 全部 200（实测 4 组）。因此这里只需保证非空即可，取值自由度留给上层
+// （handler 传会话键派生值，使同一会话在上游看到稳定 ID，见 forwardChat）。
+//
+// convID 为空（如面板「测试连接」的一次性探测、scheduler 的上报路径）时现场生成
+// 随机 UUID：上游要的只是"有值"，一次性请求没有会话连续性可言。
+func (c *Client) injectConversationHeaders(req *http.Request, convID string) {
+	if convID == "" {
+		convID = newConversationID()
+	}
+	req.Header.Set("X-Conversation-ID", convID)
+	// Request-ID 标识"这一轮请求"，Message-ID 标识"这一条消息"。
+	// 上游不校验二者与 Conversation-ID 的关系，各自独立生成即可。
+	req.Header.Set("X-Conversation-Request-ID", newConversationID())
+	req.Header.Set("X-Conversation-Message-ID", newConversationID())
+}
+
+// newConversationID 生成一个会话标识（UUID v4 形态，与官方桌面端一致）。
+// 用 crypto/rand：这些值会随请求出站，不应用可预测的伪随机源。
+func newConversationID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 在受支持的平台上不会失败；真失败时退化为固定串也比空值好
+		// （空值会被上游判 11-128，整请求失败）。
+		return "wb2api-fallback-conversation-id"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。

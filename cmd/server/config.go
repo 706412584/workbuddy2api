@@ -177,6 +177,27 @@ type Config struct {
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
+	// Update 自更新（检查 GitHub Releases / 下载发布包）的出站代理。
+	//
+	// 为什么需要**独立**配置，而不是沿用环境变量：
+	// 启动脚本为避免"残留代理端口导致 login 失败"会清空 HTTP_PROXY/HTTPS_PROXY
+	// （见 start.cmd 注释），而 updater 走 http.DefaultClient 只认 env —— 于是
+	// GitHub 直连不通的机器上，自更新必然卡在下载超时。实测 2026-10-15：
+	// 网关进程只剩下 HTTP_PROXY + ALL_PROXY（无 HTTPS_PROXY），而 Go 的
+	// ProxyFromEnvironment 对 https 只认 HTTPS_PROXY，最终走直连 → 20s 超时。
+	// 显式配置后不再依赖启动环境，换代理端口也只改这一处。
+	//
+	// 注意 Proxy 只作用于 updater，不影响 chat 上游（后者自建 Transport、
+	// Proxy 字段为 nil，恒直连）。
+	Update struct {
+		// Proxy 代理 URL（http/https/socks5/socks5h）；空 = 直连（默认）。
+		// 例："http://127.0.0.1:7887"。
+		Proxy string `json:"proxy"`
+		// NoProxy 逗号分隔的主机后缀白名单，命中则绕过 Proxy 直连。
+		// 支持精确主机名与 "*.example.com" / ".example.com" 后缀形式；空 = 全部走 Proxy。
+		NoProxy string `json:"no_proxy"`
+	} `json:"update"`
+
 	Pool struct {
 		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
@@ -337,6 +358,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_ADMIN_TOKEN"); v != "" {
 		c.Admin.Token = v
+	}
+	if v := os.Getenv("WB2A_UPDATE_PROXY"); v != "" {
+		c.Update.Proxy = v
+	}
+	if v := os.Getenv("WB2A_UPDATE_NO_PROXY"); v != "" {
+		c.Update.NoProxy = v
 	}
 }
 

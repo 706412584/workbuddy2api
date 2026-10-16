@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -267,7 +268,11 @@ func main() {
 		},
 		// 更新：检查本仓库 GitHub Releases（见 internal/updater），安装后经 restartCh
 		// 触发零停机交接。Updater 为 nil（未接线）时相关接口返回明确错误。
-		Updater: updater.New(),
+		//
+		// 代理显式注入（config 的 update.proxy），不靠环境变量：启动脚本会清空
+		// HTTP(S)_PROXY 以避免残留代理影响 login，而 GitHub 直连不通的机器上
+		// 自更新会卡在下载超时（实测 2026-10-15，见 internal/updater/proxy.go）。
+		Updater: newUpdater(cfg),
 		// RequestRestart 非阻塞地投递一次交接请求。交接是异步的：接口先返回，
 		// 让用户看到「已更新，正在交接」，再真正重启。
 		RequestRestart: func(reason string) {
@@ -371,6 +376,34 @@ func loginBin() string {
 		return "login.exe"
 	}
 	return "login"
+}
+
+// newUpdater 构造自更新客户端并注入代理配置。
+//
+// 代理走显式配置（config 的 update.proxy / update.no_proxy）而非环境变量：
+// 启动脚本会清空 HTTP(S)_PROXY 以避免残留代理让 login 失败，靠 env 就等于在
+// GitHub 直连不通的机器上自更新必然失败（见 internal/updater/proxy.go）。
+// 未配置时不打印任何代理日志——默认直连是绝大多数部署形态。
+func newUpdater(cfg *Config) *updater.Client {
+	c := updater.New()
+	c.Proxy = cfg.Update.Proxy
+	c.NoProxy = cfg.Update.NoProxy
+	if c.Proxy != "" {
+		log.Printf("[updater] 出站代理：%s（no_proxy=%q）", sanitizeProxyForLog(c.Proxy), c.NoProxy)
+	}
+	return c
+}
+
+// sanitizeProxyForLog 抹掉代理 URL 里的凭据再打日志（形如 http://user:pass@h:p）。
+func sanitizeProxyForLog(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "<非法 URL>"
+	}
+	if u.User != nil {
+		u.User = nil
+	}
+	return u.String()
 }
 
 // serverAPIKeys 把配置里的密钥列表转成 server 包的规范类型。

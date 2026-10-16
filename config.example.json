@@ -58,6 +58,10 @@
     "url": "",
     "token": ""
   },
+  "update": {
+    "proxy": "",
+    "no_proxy": ""
+  },
   "pool": {
     "max_in_flight": 3,
     "breaker_threshold": 3,

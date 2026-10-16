@@ -106,25 +106,52 @@ type Client struct {
 	Token string
 	// GOOS/GOARCH 目标平台；空 = runtime 实际值。测试注入用。
 	GOOS, GOARCH string
-	// HTTPClient 出站客户端；nil = http.DefaultClient。测试注入用，
-	// 也留给将来需要走代理的场景。
+	// HTTPClient 出站客户端；nil = 按 Proxy/NoProxy 构造（见 httpClient）。测试注入用。
 	HTTPClient *http.Client
+	// Proxy 出站代理 URL（http/https/socks5/socks5h）；空 = 直连。
+	// 由 config 的 update.proxy 注入（main 接线），**不读环境变量** —— 启动脚本
+	// 会清空 HTTP(S)_PROXY，靠 env 就等于在那些机器上必然失败。见 proxy.go 文件头。
+	Proxy string
+	// NoProxy 逗号分隔的主机后缀白名单，命中则绕过 Proxy 直连。
+	// 仅 http/https 代理生效（socks5 走 DialContext，无法按主机区分）。
+	NoProxy string
 
 	mu     sync.Mutex
 	cached *UpdateInfo
 	// checkedAt 上次实际发起网络请求的时刻（缓存新鲜度只看它）。
 	checkedAt time.Time
+	// client 按 Proxy/NoProxy 构造出的客户端（惰性初始化并缓存）。
+	// 目的是复用连接池：一次更新要发 4+ 个请求（API + SHA256SUMS + 包）。
+	client *http.Client
 }
 
 // httpClient 返回出站客户端。
+//
+// 优先级：测试注入的 HTTPClient > 按 Proxy/NoProxy 构造 > 直连。
+// 刻意**不回落 http.DefaultClient**：那是「读环境变量」的隐式行为，正是本次要
+// 修掉的坑（env 里可能残留失效代理，或缺 https 该有的 HTTPS_PROXY）。
 func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return http.DefaultClient
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client == nil {
+		tr, err := newTransport(c.Proxy, c.NoProxy)
+		if err != nil {
+			// 代理 URL 非法：不 panic（更新失败该是可见错误，不是进程崩溃），
+			// 回落直连让请求自己失败并如实报错。
+			tr, _ = newTransport("", "")
+		}
+		// 不设总超时：单请求超时由各处 ctx 控制（apiTimeout / downloadTimeout），
+		// 与原先 http.DefaultClient（Timeout=0）的行为一致。
+		c.client = &http.Client{Transport: tr}
+	}
+	return c.client
 }
 
 // New 用环境变量构造一个 Client（WB2A_UPDATE_REPO / WB2A_UPDATE_TOKEN / GITHUB_TOKEN）。
+// 代理不走环境变量，由调用方设置 Proxy/NoProxy（见 cmd/server/main.go 的接线）。
 func New() *Client {
 	token := os.Getenv("WB2A_UPDATE_TOKEN")
 	if token == "" {

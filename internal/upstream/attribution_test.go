@@ -4,6 +4,7 @@ package upstream
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -29,7 +30,7 @@ func chatHeadersReq(t *testing.T, c *Client, a *auth.Auth, clientIP string) http
 	if err != nil {
 		t.Fatalf("new req: %v", err)
 	}
-	c.ChatHeaders(req, a, clientIP)
+	c.ChatHeaders(req, a, clientIP, "")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
@@ -195,7 +196,7 @@ func TestClientIPConcurrentNoCrossTalk(t *testing.T) {
 				return
 			}
 			// 每个请求独立构造头：clientIP 作为参数传入，不存在共享可污染。
-			c.ChatHeaders(req, a, myIP)
+			c.ChatHeaders(req, a, myIP, "")
 			resp, err := c.HTTP.Do(req)
 			if err != nil {
 				t.Errorf("do: %v (ip=%s)", err, myIP)
@@ -239,5 +240,82 @@ func TestExtractClientIP(t *testing.T) {
 				t.Errorf("ExtractClientIP = %q want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 会话三头（上游 2026-10-16 起强制校验，缺失回 400 code=11-128）
+// ---------------------------------------------------------------------------
+
+// TestConversationHeadersAlwaysPresent 三个会话头必须始终存在且非空。
+//
+// 回归背景：上游 2026-10-16 01:21 起对 /v2/chat/completions 新增强制校验，
+// 三个头缺一不可（实测：无 ID 头 → "conversation id missing"；
+// 有 ID 缺其余 → "request illegal"；三头齐全 → 200）。此前网关完全不发这三头，
+// 导致全池 400，而同一账号在 IDE 里正常（IDE 发三头）。
+func TestConversationHeadersAlwaysPresent(t *testing.T) {
+	c := &Client{}
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	req, _ := http.NewRequest("POST", "https://example.com/v2/chat/completions", nil)
+	c.ChatHeaders(req, a, "", "")
+
+	for _, h := range []string{
+		"X-Conversation-ID",
+		"X-Conversation-Request-ID",
+		"X-Conversation-Message-ID",
+	} {
+		if v := req.Header.Get(h); v == "" {
+			t.Errorf("头 %s 缺失或为空（上游会回 400 code=11-128）", h)
+		}
+	}
+}
+
+// TestConversationIDUsesProvidedValue 传入的 convID 用作 X-Conversation-ID，
+// 使同一会话在上游看到稳定 ID（会话粘性对齐）。
+func TestConversationIDUsesProvidedValue(t *testing.T) {
+	c := &Client{}
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	req, _ := http.NewRequest("POST", "https://example.com/v2/chat/completions", nil)
+	c.ChatHeaders(req, a, "", "conv-abc-123")
+
+	if got := req.Header.Get("X-Conversation-ID"); got != "conv-abc-123" {
+		t.Errorf("X-Conversation-ID=%q want conv-abc-123", got)
+	}
+}
+
+// TestConversationIDsAreIndependent Request-ID 与 Message-ID 各自独立生成
+// （上游不校验三者关系，但同一请求内不应出现重复值）。
+func TestConversationIDsAreIndependent(t *testing.T) {
+	c := &Client{}
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	req, _ := http.NewRequest("POST", "https://example.com/v2/chat/completions", nil)
+	c.ChatHeaders(req, a, "", "conv-fixed")
+
+	cid := req.Header.Get("X-Conversation-ID")
+	rid := req.Header.Get("X-Conversation-Request-ID")
+	mid := req.Header.Get("X-Conversation-Message-ID")
+	if rid == mid {
+		t.Error("Request-ID 与 Message-ID 不应相同")
+	}
+	if rid == cid || mid == cid {
+		t.Error("Request-ID/Message-ID 不应复用 Conversation-ID")
+	}
+}
+
+// TestNewConversationIDShape 生成的 ID 为 UUID v4 形态且每次不同。
+func TestNewConversationIDShape(t *testing.T) {
+	a, b := newConversationID(), newConversationID()
+	if a == b {
+		t.Error("两次生成不应相同")
+	}
+	if len(a) != 36 {
+		t.Errorf("长度=%d want 36（UUID 形态）", len(a))
+	}
+	// 版本位与变体位：第 15 个字符为 '4'，第 20 个字符属 [89ab]
+	if a[14] != '4' {
+		t.Errorf("version nibble=%c want '4'", a[14])
+	}
+	if !strings.ContainsRune("89ab", rune(a[19])) {
+		t.Errorf("variant nibble=%c want 8/9/a/b", a[19])
 	}
 }

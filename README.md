@@ -235,6 +235,8 @@ cd frontend && npm run dev     # :7864，/api 与 /__admin 都反代到 :7863
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
+| `update.proxy` | 空 | **自更新**出站代理（`http`/`https`/`socks5`/`socks5h`）；空 = 直连。只作用于「检查更新 / 下载发布包」，不影响 chat 上游（后者恒直连）。**不读环境变量** —— 启动脚本会清空 `HTTP(S)_PROXY`，靠 env 会在 GitHub 直连不通的机器上必然失败。可用 `WB2A_UPDATE_PROXY` 覆盖 |
+| `update.no_proxy` | 空 | 逗号分隔的主机后缀白名单，命中则绕过 `update.proxy` 直连（支持 `*.example.com` / `.example.com`）。仅 http/https 代理生效（socks5 走 DialContext，无法按主机区分） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
