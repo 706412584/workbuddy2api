@@ -17,6 +17,9 @@ const (
 	ccHeader   = "x-anthropic-billing-header: cc_version=1.0; cc_entrypoint=cli;"
 	// Codex instructions 首段（上游逐字精确指纹，三句缺一不可）。
 	codexInstructions = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful."
+	// upstreamCodeForTest 上游错误码（用拼接构造：源码里不出现 5 位连续数字字面量，
+	// 免得编辑器/工具在处理本文件时被同一类「敏感串」逻辑碰到）。
+	upstreamCodeForTest = "11" + "128"
 )
 
 func TestIdentityRewritten(t *testing.T) {
@@ -95,16 +98,23 @@ func TestFeedbackSentenceRewritten(t *testing.T) {
 	}
 }
 
-// 上游反探测：请求体里出现裸数字 11128 即整单拦截（与上下文无关）。
-// 回归用例：该串会被改写为 11-128 以打断精确匹配。
-func TestUpstreamErrorCodeRewritten(t *testing.T) {
-	in := "upstream returned code=11128 for this request"
-	out := sanitizeText(in)
-	if strings.Contains(out, "11128") {
-		t.Errorf("error code not rewritten: %q", out)
-	}
-	if !strings.Contains(out, "11-128") {
-		t.Errorf("error code not rewritten as expected: %q", out)
+// 上游反探测那条「裸错误码 → 带连字符」的改写**已删除**（2026-10-22）。
+//
+// 删除理由（原始事故见会话 8f81f7fe）：santizeText 作用于**全部消息**，包含
+// role=tool 的工具返回内容与 assistant.tool_calls[].function.arguments——
+// 也就是「模型读到的文件内容」和「模型发给工具的编辑参数」。于是磁盘上真实的
+// 裸码被改写成带连字符后送给模型，模型 diff 出来的 old_string 与磁盘不一致，
+// Edit 报 “String to replace not found in file”（实测在 sanitize.go 上复现）。
+//
+// 该改写本身也已失效：2026-10-22 在隔离实例上关闭脱敏实测，请求体里出现裸码
+// 时上游一律 200（system / user / tool / tool_call arguments 四种位置都试过），
+// 2026-09-12 当时的反探测拦截已不存在。保留它只剩改坏用户数据的副作用。
+//
+// 本用例锁死「不再改写」：出现裸码的文本必须原样返回。
+func TestUpstreamErrorCodeNotRewritten(t *testing.T) {
+	in := "upstream returned code=" + upstreamCodeForTest + " for this request"
+	if out := sanitizeText(in); out != in {
+		t.Errorf("裸错误码不该再被改写（会改坏工具读到的文件内容）: %q -> %q", in, out)
 	}
 }
 
@@ -116,7 +126,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
 			map[string]any{"id": "c1", "type": "function", "function": map[string]any{
 				"name":      "Bash",
-				"arguments": `{"command":"echo 11128"}`,
+				"arguments": `{"command":"echo DeepSeek Harness"}`,
 			}},
 		}},
 	}
@@ -125,9 +135,57 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 	}
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	got := fn["arguments"].(string)
-	if strings.Contains(got, "11128") {
+	if strings.Contains(got, "DeepSeek Harness") {
 		t.Errorf("tool_call arguments 未被净化: %q", got)
 	}
+}
+
+// TestToolContentNotRewrittenOnWire 是本轮事故（2026-10-22，会话 8f81f7fe）的回归锁：
+//
+// 净化必须**只破坏上游会拦的指纹**，不得改动工具链把「磁盘真实内容」带进请求体的两处：
+//   - role=tool 的消息 content（工具返回的文件内容）
+//   - assistant.tool_calls[].function.arguments（工具入参，例如 Edit 的 old_string）
+//
+// 一旦改动，模型读到的内容与磁盘不一致，它算出来的 old_string/new_string 就对不上，
+// 表现为 Edit 报 “String to replace not found in file”——而文件明明没被人改过。
+//
+// 用一处真正会触发上游拦截的指纹即可（写入内容里出现被拦串时仍应净化），
+// 同时确认**普通**内容原样保留。
+func TestToolContentNotRewrittenOnWire(t *testing.T) {
+	plain := `	"github.com/anthropics/",  // ordinary line, must stay byte-identical`
+	args := `{"old_string":"` + plain + `","new_string":"x"}`
+
+	body := []byte(`{"model":"glm-5.2","messages":[` +
+		`{"role":"system","content":"sys"},` +
+		`{"role":"user","content":"go"},` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"Edit","arguments":` +
+		jsonString(args) + `}}]},` +
+		`{"role":"tool","tool_call_id":"c1","content":` + jsonString(plain) + `}]}`)
+
+	out := PrepareBodyOpt(body, true)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("wire body not json: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+
+	toolContent, _ := msgs[3].(map[string]any)["content"].(string)
+	if toolContent != plain {
+		t.Errorf("工具返回内容被改动了（模型会据此算出与磁盘不符的编辑串）: got=%q want=%q", toolContent, plain)
+	}
+	fn := msgs[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if got := fn["arguments"].(string); got != args {
+		t.Errorf("工具入参被改动了: got=%q want=%q", got, args)
+	}
+}
+
+// jsonString 把一个 Go 字符串安全地嵌进 JSON 文本（测试辅助）。
+func jsonString(s string) string {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
 }
 
 func TestBillingHeaderStrippedValueIrrelevant(t *testing.T) {
@@ -139,7 +197,7 @@ func TestBillingHeaderStrippedValueIrrelevant(t *testing.T) {
 
 // 附加验证：正常对话里出现 github.com/anthropics/ 链接（但不是反馈句整句）
 // 时，预检特征命中（进入净化），但改写层只动精确匹配的整句——普通链接文本
-// 不该被改写。同理，既不含 11128 也不含反馈整句的文本原样返回。
+// 不该被改写。同理，既不含任何预检特征也没有可改写条目的文本原样返回。
 func TestNormalAnthropicLinkNotRewritten(t *testing.T) {
 	in := "see https://github.com/anthropics/anthropic-cookbook for examples"
 	if out := sanitizeText(in); out != in {

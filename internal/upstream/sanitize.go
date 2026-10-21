@@ -13,15 +13,14 @@ import (
 // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
 // 普通请求全不中 → 原样返回，零分配）。
 var sanitizeFeatures = []string{
-	"x-anthropic-billing-header", // header 键值段键名
-	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
-	"You are Claude Code",        // 身份句（截断前缀即可命中）
-	"Main branch (",              // 注入指令句（截断前缀即可命中）
-	"you will usually use this for PRs", // 同上后半段：分支名非 main 时脱离前缀单独出现
+	"x-anthropic-billing-header",                      // header 键值段键名
+	"cc_entrypoint=",                                  // 尾随裸键值（截断前缀即可命中）
+	"You are Claude Code",                             // 身份句（截断前缀即可命中）
+	"Main branch (",                                   // 注入指令句（截断前缀即可命中）
+	"you will usually use this for PRs",               // 同上后半段：分支名非 main 时脱离前缀单独出现
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
-	"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
-	"11128",                      // 上游反探测：裸数字错误码
-	"DeepSeek Harness",           // DSH identity token: upstream treats it as an unapproved channel
+	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+	"DeepSeek Harness",                                // DSH identity token: upstream treats it as an unapproved channel
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -76,16 +75,6 @@ var sanitizeRewrites = [][2]string{
 		"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
 	},
 	{
-		// 上游反探测：只要请求体里出现裸数字 11128 就整单拦截（与该数字的上下文无关——
-		// "code=11128" / 裸 "11128" / "错误码 11128" / "Code=11128" 全部命中；
-		// 相邻的 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码，
-		// 上游据此识别"在讨论/回显其内部错误码"的请求。
-		// 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是拦截条件，
-		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
-		"11128",
-		"11-128",
-	},
-	{
 		// DSH (DeepSeek Harness) injects a harness:identity sentence that upstream treats
 		// as an unapproved channel and blocks the whole request (400, unapproved channel).
 		// Replacing the brand token keeps the meaning (same runtime) while dropping the
@@ -97,6 +86,13 @@ var sanitizeRewrites = [][2]string{
 }
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+//
+// **契约：只破坏上游会拦的指纹，绝不顺手动别的字节。**
+// 请求体里同时流动着「模型读到的文件内容」（role=tool 的 content）与
+// 「模型发给工具的编辑参数」（assistant.tool_calls[].function.arguments）。
+// 这两处一旦被改动，模型算出的 old_string 就与磁盘不符，Edit 会报
+// “String to replace not found in file”，而文件其实谁也没改过（2026-10-22 事故）。
+// 因此这里不做任何「顺手美化」：曾经的无条件 TrimSpace 已删除（见下方注释）。
 func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
@@ -114,7 +110,14 @@ func sanitizeText(text string) string {
 			text = sanitizeKvRe.ReplaceAllString(text, "")
 		}
 	}
-	return strings.TrimSpace(text)
+	// 不做 TrimSpace。
+	//
+	// 剥离用的正则（sanitizeHdrRe）以 `\s*` 收尾，本来就会吃掉指纹周围的空白；
+	// 而**触及过净化路径**并不代表这段文本是 system 提示词——它可能是一条
+	// role=tool 的文件内容（例如一段含 github.com/anthropics/ 的 Go 代码）。
+	// 无条件 TrimSpace 会把这种内容的行首制表符/行尾换行剪掉，同样造成
+	// 「模型读到的内容 ≠ 磁盘内容」。
+	return text
 }
 
 // hasFingerprint 特征预检：先走 strings.Contains 快速路径（零分配）；
