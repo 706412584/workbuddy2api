@@ -176,21 +176,36 @@ var contentBlockedMarkers = []string{
 	"illegal api invocation",
 }
 
-// safetyBanned 账号级内容安全封控的识别标记（生产实测形态，2026-09-27）：
+// safetyBanned 账号级风控封控的识别标记（生产实测形态）。
+//
+// 历史形态（2026-09-27，语义偏「内容审核」）：
 //
 //	{"code":11140,"msg":"request illegal","requestId":"...",
 //	 "displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.",
 //	               "zh":"内容未通过安全审核，请调整后重试"}}
 //
-// **两个标记必须同时命中**：11140 是复用码——模型级限流也用它
-// （{"code":11140,"msg":"The model provider is rate-limiting requests."}，
-// 由 softRateMarkers 先接住判为 ErrSoftRate）。只看 code 会把限流误判成封禁，
-// 把一个十分钟自愈的号罚成长期停用。
+// 当前形态（2026-10-20 起实测全量变为，语义是**账号级风控**）：
+//
+//	{"code":11140,"msg":"request illegal","requestId":"...",
+//	 "displayMsg":{"en":"Your account has been restricted due to unusual activity",
+//	               "zh":"账号存在异常行为，已被限制使用"}}
+//
+// **判据不变，只改文案含义**：仍要求 code 与 msg **同时命中**，因为
+//   - 11140 是**复用码**——模型级限流也用它
+//     （{"code":11140,"msg":"The model provider is rate-limiting requests."}，
+//     由 softRateMarkers 先接住判为 ErrSoftRate）；只看 code 会把限流误判成封禁。
+//   - "request illegal" 这段 msg 与 11128（HTTP 400，通道/内容校验）**完全相同**，
+//     故必须靠 HTTP 状态区分：11128 是 400，本形态是 403（见 status 检查）。
+//   - displayMsg 不作为判据：上游改过两次文案，且日志里该字段常被截断。
+//
+// 不看 displayMsg 只靠 code+status+msg 三条件，恰好对上游文案变化免疫。
 const safetyBannedBizCode = `"code":11140`
 const safetyBannedMsg = "request illegal"
 
-// IsSafetyBanned 报告 403 响应是否为账号级内容安全封控（11140 + request illegal）。
+// IsSafetyBanned 报告 403 响应是否为账号级风控封控（11140 + request illegal）。
 // 与 IsWafBlocked 互补：后者要求「无业务信封」，本形态带完整业务信封，故不冲突。
+// 命名保留 safetyBanned 是历史沿革（错误类型 ErrSafetyBanned 被多处引用），
+// 语义应按「账号级风控封控（restricted）」理解，不是「内容安全审核」。
 func IsSafetyBanned(status int, body string) bool {
 	if status != http.StatusForbidden {
 		return false

@@ -678,17 +678,26 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	}
 }
 
-// TestChatSafetyBannedEventuallyLongCools 端到端回归 2026-09-27 生产事故：
-// 上游对某账号的 chat 通道持续返回 403 + 11140 + request illegal
-// （displayMsg「内容未通过安全审核」）。修复前 Classify 归 ErrClient →
-// applyErrorPolicy 走 default「只换号不罚」，该死号在 15 小时内被反复选中 50 次，
-// 每个请求白吃一个 MaxRotate 名额，把正常请求拖成 503。
+// TestChatSafetyBannedEventuallyLongCools 端到端回归 2026-09-27 生产事故 +
+// 2026-10-21 语义/策略更新：
+// 上游对某账号的 chat 通道返回 403 + 11140 + request illegal。
 //
-// 修复后：未达阈值先短冷却（挡在轮换之外），连续达到阈值转长冷却，
-// 且该号不再被任何后续请求选中。
+// 历史（2026-09-27）：修复前 Classify 归 ErrClient → default「只换号不罚」，
+// 该死号在 15 小时内被反复选中 50 次，白吃 MaxRotate 名额把请求拖成 503。
+//
+// 当时策略是两段式（未达阈值先短冷却，达阈值转长冷却）。**2026-10-21 改为即时长冷却
+// + fail-fast**，依据：
+//   - 上游 displayMsg 已全量变为「账号存在异常行为，已被限制使用」（账号级风控，
+//     与内容无关），故"怕是单条内容误伤整池"的顾虑不再成立，无需过渡态；
+//   - 短冷却会让被封号在几十秒后回到池中被反复打（实测 dd41d8ba 16:22 被拒后
+//     16:25 又被重打），而官方口径是 1-3 天不可用；
+//   - 社区红线：11140 后**严禁换号继续打同一设备**（设备指纹连坐）。
+//
+// 本测试锁定新的两条性质：① 首次命中即长冷却（不再有短冷却过渡态）；
+// ② **fail-fast —— 本次请求不再换号打 good**，直接 503。
 func TestChatSafetyBannedEventuallyLongCools(t *testing.T) {
 	const bannedBody = `{"code":11140,"msg":"request illegal","requestId":"x",` +
-		`"displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试"}}`
+		`"displayMsg":{"en":"Your account has been restricted due to unusual activity","zh":"账号存在异常行为，已被限制使用"}}`
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
@@ -711,47 +720,42 @@ func TestChatSafetyBannedEventuallyLongCools(t *testing.T) {
 			strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 		return rec
 	}
-	// 第一轮：bad 被尝试 1 次（吃到 403），随后被短冷却挡在轮换之外，good 兜住 200。
-	// 短冷却下 bad 只被尝试一次，正是「不放大请求量」的那条性质。
+	// 第一轮：bad 吃到 403 → fail-fast 终止轮换，直接 503。
+	// 关键断言：**good 一次都没被打**（防同设备连坐的红线）。
 	rec := req()
-	if rec.Code != 200 {
-		t.Fatalf("round 1: code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("round 1: code=%d want 503（fail-fast 应终止轮换）body=%s", rec.Code, rec.Body)
 	}
 	if calls["Bearer at-bad"] != 1 {
 		t.Fatalf("round 1: bad 应被尝试 1 次，实际 %d", calls["Bearer at-bad"])
 	}
+	if calls["Bearer at-good"] != 0 {
+		t.Errorf("fail-fast 后不应再换号打 good（防设备连坐），实际 %d 次", calls["Bearer at-good"])
+	}
+
+	// 首次命中即长冷却（无短冷却过渡态），cool_kind 必须是 safety_banned。
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("未达阈值应先短冷却（soft_rate）: %+v", st)
-	}
-
-	// 阈值达成前的其余命中直接驱动 applyErrorPolicy —— 走完整 HTTP 需要等短冷却
-	// 自然到期（真实 sleep），而这里要验的是「连续命中累积到阈值」本身。
-	// Classify→applyErrorPolicy 的接线已由本轮真实请求覆盖。
-	for i := 2; i <= pool.SafetyBannedThreshold(); i++ {
-		h.applyErrorPolicy("bad", upstream.ErrSafetyBanned, bannedBody, "glm-5.2")
-	}
-
-	// 阈值达成 → 长冷却，cool_kind 必须是 safety_banned。
-	st, _ = p.Status("bad")
 	if !st.Cooling || st.CoolKind != "safety_banned" {
-		t.Fatalf("bad 应进入 safety_banned 长冷却: %+v", st)
+		t.Fatalf("首次命中即应进入 safety_banned 长冷却（无过渡态）: %+v", st)
 	}
-	// 长冷却带 ±25% 抖动（jitterDur）：断言落在 [0.75×, 1.25×] 区间内。
-	lo := int64(float64(safetyBannedCooldown) / float64(time.Second) * 0.75)
-	hi := int64(float64(safetyBannedCooldown) / float64(time.Second) * 1.25)
+	// 24h 带 ±25% 抖动（jitterDur）：断言落在 [0.75×, 1.25×] 区间内。
+	lo := int64(float64(restrictedCooldown) / float64(time.Second) * 0.75)
+	hi := int64(float64(restrictedCooldown) / float64(time.Second) * 1.25)
 	if st.CoolRemaining < lo || st.CoolRemaining > hi {
-		t.Errorf("cool_remaining_sec=%d want in [%d,%d]（6h ±25%% 抖动）", st.CoolRemaining, lo, hi)
+		t.Errorf("cool_remaining_sec=%d want in [%d,%d]（24h ±25%% 抖动）", st.CoolRemaining, lo, hi)
 	}
 
-	// 关键回归：长冷却生效后，bad 不再被选中（修复前它会被无限选中）。
-	before := calls["Bearer at-bad"]
+	// 关键回归：长冷却生效后，bad 不再被选中——后续请求应打到 good 并 200。
+	// wait 让长冷却内的号被跳过（bad 仍在冷却，选号直接落到 good）。
 	rec = req()
 	if rec.Code != 200 {
 		t.Fatalf("post-ban code=%d body=%s", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-bad"] != before {
+	if calls["Bearer at-bad"] != 1 {
 		t.Errorf("长冷却中的账号不应再被选中: calls=%v", calls)
+	}
+	if calls["Bearer at-good"] == 0 {
+		t.Errorf("长冷却生效后 good 应兜住请求: calls=%v", calls)
 	}
 }
 

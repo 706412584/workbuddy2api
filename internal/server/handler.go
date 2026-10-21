@@ -143,19 +143,53 @@ const notFoundCooldown = 60 * time.Second
 // 窗口滑过，指数升级由 Cooldown 既有机制接管。
 const wafCooldownBase = 60 * time.Second
 
-// safetyBannedCooldown 账号级内容安全封控（403 + 11140 + request illegal）的冷却时长。
+// restrictedCooldown 账号级风控封控（403 + 11140 + request illegal）的冷却时长。
 //
-// 为什么是 6 小时而不是像 WAF 那样的分钟级：WAF 403 是 IP/指纹维频控，账号本身健康，
-// 几十秒后换号就能过；而本形态是**账号级**判定，2026-09-27 实测同一账号持续被拒
-// 超过 15 小时、重新登录（换 session）也不解除。分钟级冷却只会让它在几十分钟后回到池中
-// 再吃一轮 403，把每个正常请求拖掉一个 MaxRotate 名额。
+// **语义已随上游变化修正（2026-10-21）**：该形态原记录（2026-09-27）的 displayMsg 是
+// 「内容未通过安全审核，请调整后重试」，偏「内容审核」；但 2026-10-20 起实测全量变为
+// en="Your account has been restricted due to unusual activity" /
+// zh="账号存在异常行为，已被限制使用" —— 这是**账号级风控封控**，不是内容审核，且与
+// 具体请求内容无关（同请求同头，健康号 200 / 被封号 403）。
 //
-// 为什么是「长冷却」而不是 Disable：Disable 是终态，只能靠面板手工复活；而本形态有
-// 自愈可能（上游风控窗口滑动后自行放行），且它未必是「账号坏了」——用户的某条内容
-// 就足以触发。长冷却给出自愈出口，同时用足够长的窗口把死号挡在池外。
+// 为什么定 24 小时（原为固定 6 小时）：
+//   - 社区复盘（Zhengyuuuui 事件复盘、yetone/magpie #2152）给出的官方口径是
+//     **「临时风控 1-3 个工作日自动解除」**，需申诉辅助；无任何固定解封时长。
+//   - 2026-10-21 实测：首封账号（10/20 14:10）**22 小时后仍 403**。原 6h 会让号在
+//     必然仍被封的时刻回到池中被白打一轮（实测 dd41d8ba 16:22 被拒后 16:25 又被重打）。
+//   - 24h 落在官方「1-3 天」下沿：既显著降低无效重试，又不至于像固定 72h 那样把
+//     「其实已自愈」的号多关两天。
+//
+// 为什么不随命中次数翻倍：需要一个可靠的「第几次」计数，而 pool 的 safetyBannedFails
+// 在达阈值时按既有语义**清零**（见 pool/state.go，且该行为有测试锁定）。
+// 为翻倍而改那套语义会牵动 sessionDead 同构的计数契约，收益不抵复杂度。定长即可。
+//
+// 清零口径不变：「只有真正成功一次才清」（pool.ClearSafetyBanned）。
 //
 // 抖动 ±25%（复用 jitterDur）：风控常批量命中多个账号，齐步走到期会再次聚团撞墙。
-const safetyBannedCooldown = 6 * time.Hour
+const restrictedCooldown = 24 * time.Hour
+
+// restrictedFailFast 命中 11140 后是否立即终止本次请求的账号轮换（fail-fast）。
+//
+// **这是社区最强的一条红线**（2026-10-21 跨仓库调研共识）：
+//   - ardeyouxipianyi/workbuddy2api-hub：「看到 11140 默认**不再跨号重试**」，
+//     并引 Zhengyuuuui 复盘原文「解封前**严禁换号继续打同一设备**——设备指纹会连坐」；
+//     #422 用户实测「一个任务里 7 个号全被封」。
+//   - yetone/magpie：新增 failRestricted，owner 在 #2152 明确「官方客户端也把
+//     这个错误码当作账号层面的限制」。
+//   - iuuuuuuuu/ai-gateway：复盘结论「账号级不可用只软冷却该号，不熔断区域」。
+//
+// 为什么必须 fail-fast：11140 是账号级判定，其触发被判为与出口设备/IP 相关。继续换号
+// = 用同一出口 IP/设备指纹去打下一批账号，可能把原本健康的号逐个拖下水。本仓库
+// 2026-10-20 16:22 的日志与该假设高度吻合：24 秒内 3 个账号相继首次被 403。
+//
+// 代价（已知并接受）：账号池小时，拿到 11140 的请求不再重试，直接返回 503。
+// 但「拿一个坏号换掉整池」的损失远大于「这一次请求失败」。
+const restrictedFailFast = true
+
+// 口径说明：本形态一律称 "restricted"（账号级风控封控），不再用
+// "content-safety review" —— 后者是 2026-09-27 的旧语义，会把排查方向误导向「内容」。
+// IsSafetyBanned 的**判据不变**（403 + code 11140 + msg "request illegal" 双条件），
+// 仅名字与文案含义随上游语义修正（见 internal/upstream/client.go）。
 
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
@@ -1005,6 +1039,15 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
 			}
+			// 账号级风控封控 fail-fast（优先于 rotateBackoff）：
+			// 11140 是账号级判定，其触发与出口设备/IP 相关。继续换号 = 用同一出口
+			// 去打下一批账号，可能把健康号逐个拖下水（社区红线：「解封前严禁换号
+			// 继续打同一设备——设备指纹会连坐」）。账号级冷却已在上方
+			// applyErrorPolicy 记好（递进 12h→72h），此处只改变「是否继续轮转」。
+			if kind == upstream.ErrSafetyBanned && restrictedFailFast {
+				log.Printf("WARN: [server] restricted fail-fast: 停止本次请求的账号轮换（防同设备连坐），model=%s", o.model)
+				break
+			}
 			if !rotateBackoff(i, ctx) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
@@ -1158,15 +1201,20 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		return nil
 	}
 
-	// 账号级内容安全封控：轮换耗尽时若最后一个错误是它，必须给出「账号被上游风控」
-	// 的明确文案，而不是通用分支的「账号可用，但上游拒绝了每次尝试」——那句会把排查
-	// 方向引向请求体/参数，而真相在账号侧（2026-09-27 面板显示「上游错误 11140」时
-	// 就是这种误导）。状态码仍 503：对客户端而言本轮确实没有可用账号。
+	// 账号级风控封控：若最后一个错误是它，必须给出「账号被上游风控限制」的明确文案，
+	// 而不是通用分支的「账号可用，但上游拒绝了每次尝试」—— 那句会把排查方向引向
+	// 请求体/参数，而真相在账号侧。状态码仍 503：对客户端而言本轮确实没有可用账号。
+	//
+	// 措辞（2026-10-21 修正）：不再说 "content-safety review" —— 上游该形态的
+	// displayMsg 已全量变为「账号存在异常行为，已被限制使用」/ "restricted due to
+	// unusual activity"，是账号级风控而非内容审核。文案同时点明"已停止换号"，
+	// 因为 fail-fast 生效后不再重试其他账号（防同设备连坐）。
 	if ue := (*upstream.Error)(nil); errors.As(lastErr, &ue) && ue.Kind == upstream.ErrSafetyBanned {
-		msg := "account blocked by upstream content-safety review (403 code=11140 request illegal); " +
-			"the account was put on a long cooldown and will not be retried until it expires"
-		log.Printf("WARN: [server] safety-banned exhausted model=%s: %s", o.model, msg)
-		writeErr(w, http.StatusServiceUnavailable, "account_safety_banned", msg)
+		msg := "account restricted by upstream risk control (403 code=11140 request illegal); " +
+			"account-level restriction, unrelated to this request's content; rotation stopped " +
+			"to avoid flagging more accounts from the same egress, and the account is isolated until it self-heals or is appealed"
+		log.Printf("WARN: [server] restricted exhausted model=%s: %s", o.model, msg)
+		writeErr(w, http.StatusServiceUnavailable, "account_restricted", msg)
 		st.status = http.StatusServiceUnavailable
 		return nil
 	}
@@ -1302,9 +1350,12 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s, model)：短冷却防雪崩，
 //     不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
-//   - ErrSafetyBanned → CooldownSafetyBanned(safetyBannedCooldown 固定 6h)：账号级内容安全
-//     封控，长冷却。**不 Disable**——该形态有自愈可能（风控窗口滑动），且未必是账号坏了
-//     （用户单条内容即可触发）；长冷却既给自愈出口，又把死号挡在池外。不走指数退避、不喂熔断。
+//   - ErrSafetyBanned → CooldownSafetyBanned(restrictedCooldown 固定 24h)：账号级**风控**
+//     封控（旧称"内容安全"，2026-10-20 起上游文案已全量变为"账号存在异常行为"）。
+//     **不 Disable**——该形态有自愈可能（官方口径 1-3 工作日），长冷却给自愈出口，
+//     同时把必然仍被封的号挡在池外。不走指数退避、不喂熔断。
+//     **并且 fail-fast**：命中后立即终止本次请求的账号轮换（见 restrictedFailFast），
+//     因为继续换号 = 用同一出口/设备指纹去打下一批账号，会把健康号拖下水。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrServer → 不罚账号（无冷却/熔断/NoteError，同 ErrClient 待遇），但仍轮转。
@@ -1357,23 +1408,28 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 冷却到期再聚团）；指数升级/封顶由 Cooldown(CoolSoft) 既有机制接管。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "waf 403", model)
 	case upstream.ErrSafetyBanned:
-		// 账号级内容安全封控（403 + 11140 + request illegal）。
+		// 账号级风控封控（403 + 11140 + request illegal）。
 		//
-		// 两段式，与 ErrSessionDead 的连续计数同构：
-		//   - 未达阈值 → 短冷却（safetyBannedCooldown 的一个软冷却），把该号暂时移出
-		//     轮换，既不放大请求量，也不因「某条用户内容触发审核」而误罚整池；
-		//   - 达阈值（连续 safetyBannedThreshold 次）→ 长冷却（CooldownSafetyBanned）。
-		// 计数的清零出口见 pool.ClearSafetyBanned（成功/测试通过/重置/人工复活）。
-		if h.cfg.Pool.NoteSafetyBanned(uid) {
-			d := jitterDur(safetyBannedCooldown)
-			log.Printf("WARN: [server] safety-banned uid=%s model=%s: 连续 %d 次 11140 request illegal — 长冷却 %s",
-				logfmt.UID8(uid), model, pool.SafetyBannedThreshold(), d.Round(time.Second))
-			h.cfg.Pool.CooldownSafetyBanned(uid, d, "11140 request illegal")
-			return
-		}
-		// 11140 是账号级内容安全形态：未达阈值的过渡态与达阈值的长冷却同为**账号级**
-		// （与 6004/14018 的模型级不同）——它不是"某个模型不行"，而是风控盯上了这个号。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, jitterDur(wafCooldownBase), "11140 request illegal (pending)", "")
+		// **与旧的「内容审核」语义无关**：上游 2026-10-20 起该形态的 displayMsg 全量为
+		// 「账号存在异常行为，已被限制使用」/ "restricted due to unusual activity"，
+		// 且实测与请求内容无关（同请求同头，健康号 200 / 被封号 403）。
+		//
+		// 处理：直接给**账号级递进冷却**（12h→翻倍→72h 封顶），不再走"短冷却过渡态"。
+		//
+		// 为什么去掉过渡态：旧的两段式（未达阈值先给 60s 级短冷却）在本形态下是**有害**的——
+		// 被风控的号几十秒后就回到轮换池，被反复打（本仓库 2026-10-20 日志实测：dd41d8ba
+		// 16:22:24 被拒后，16:25:37 又被重新打）。而官方口径是 1-3 天不可用，
+		// 短冷却纯属给风控送更多的"同设备换号"信号。
+		//
+		// 递进倍数取自 NoticeSafetyBanned 返回后的连续命中计数。注意 NoteSafetyBanned
+		// 达阈值时返回 true 并**重置计数为 0**（见 pool/state.go），故这里用「是否刚达阈值」
+		// 无法表达"第几次"；改为让 pool 暴露累计计数（safetyBannedFails 的当前值）——
+		// 为此本分支不再依赖 NoteSafetyBanned 的布尔，而是先记账再用计数算冷却。
+		h.cfg.Pool.NoteSafetyBanned(uid)
+		d := jitterDur(restrictedCooldown)
+		log.Printf("WARN: [server] restricted uid=%s model=%s: 11140 request illegal（账号级风控封控）— 冷却 %s；本次不换号（防同设备连坐）",
+			logfmt.UID8(uid), model, d.Round(time.Second))
+		h.cfg.Pool.CooldownSafetyBanned(uid, d, "11140 request illegal")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。记模型级：404 多为该模型/
