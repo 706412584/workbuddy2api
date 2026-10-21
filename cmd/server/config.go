@@ -113,6 +113,10 @@ type Config struct {
 
 	// AccountGroups 账号 uid → 分组名（见 AccountGroups 类型说明）。
 	AccountGroups AccountGroups `json:"account_groups"`
+	// AccountGroupNames 显式创建、但可能还没有账号的分组名（面板「新建分组」）。
+	// 与 AccountGroups 的并集才是界面上可见的全部组：否则「先建组、再放号」
+	// 这个顺序做不到 —— 没有成员的组在数据上不存在。
+	AccountGroupNames []string `json:"account_group_names,omitempty"`
 
 	// CallLogDir 账号调用历史（成功/失败原因）的落盘目录。
 	// 空 = 不落盘（仅内存保留最近 N 次，重启即丢）。相对路径按可执行文件目录解析。

@@ -359,7 +359,14 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 // 空转是模型侧现象而非账号侧（实测 7 个不同账号都中过、全部同一模型），
 // 按密钥区域切开只会让形态更难看清。要看跨重启的长期趋势请查 gateway.log。
 func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
-	pred := h.keyPickPred(key, nil)
+	// 区域这一维必须显式传进去：keyPickPred 的 regions 参数是「本次可用区域」，
+	// 传 nil 等于不限区域。8d81554 统一谓词时这里漏了，导致绑定区域的密钥在
+	// /status 看到两区全部账号（计数口径也跟着错）。
+	var regions []auth.Region
+	if key != nil && key.Region != "" {
+		regions = []auth.Region{key.Region}
+	}
+	pred := h.keyPickPred(key, regions)
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailedWhere(pred)
 	sticky := 0
 	if h.cfg.StickyCount != nil {
@@ -1642,6 +1649,22 @@ func GroupNames() []string {
 		return nil
 	}
 	return groups.Names()
+}
+
+// SetEmptyGroupNames 整体替换「显式创建但暂无账号」的分组名。
+func SetEmptyGroupNames(names []string) {
+	if groups == nil {
+		groups = groupreg.New(nil)
+	}
+	groups.SetExtra(names)
+}
+
+// EmptyGroupNames 返回显式创建但暂无账号的分组名。
+func EmptyGroupNames() []string {
+	if groups == nil {
+		return nil
+	}
+	return groups.ExtraNames()
 }
 
 // GroupOf 返回某账号的分组名（空 = 未分组）。

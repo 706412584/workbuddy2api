@@ -20,26 +20,32 @@ type GroupsController interface {
 	Snapshot() map[string]string
 	// SetAll 整体替换分组表并热重载。
 	SetAll(m map[string]string)
-	// Names 返回出现过的分组名（供面板下拉）。
+	// Names 返回出现过的分组名（供面板下拉）。含显式创建的空组。
 	Names() []string
 	// GroupOf 返回某账号的分组名（空 = 未分组）。
 	GroupOf(uid string) string
+	// EmptyNames 返回显式创建、但当前没有任何账号的分组名。
+	EmptyNames() []string
+	// SetEmpty 整体替换空组名列表。
+	SetEmpty(names []string)
 }
 
 // getGroups GET /__admin/groups —— 分组表与分组名列表。
 func (h *Handler) getGroups(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Groups == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"groups":    map[string]string{},
-			"names":     []string{},
-			"available": false,
+			"groups":     map[string]string{},
+			"names":      []string{},
+			"emptyNames": []string{},
+			"available":  false,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"groups":    h.cfg.Groups.Snapshot(),
-		"names":     h.cfg.Groups.Names(),
-		"available": true,
+		"groups":     h.cfg.Groups.Snapshot(),
+		"names":      h.cfg.Groups.Names(),
+		"emptyNames": h.cfg.Groups.EmptyNames(),
+		"available":  true,
 	})
 }
 
@@ -84,25 +90,61 @@ func (h *Handler) postGroups(w http.ResponseWriter, r *http.Request) {
 		clean[uid] = g
 	}
 
-	raw, err := os.ReadFile(h.cfg.ConfigPath)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "读取 config.json 失败：%v", err)
-		return
-	}
-	text, err := setTopLevelValue(string(raw), "account_groups", clean)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "写入 account_groups 失败：%v", err)
-		return
-	}
-	if _, err := h.persistConfigEdits(raw, text, map[string]any{
-		"account_groups": toAny(clean),
-	}); err != nil {
+	// 空组名里凡是这次拿到了成员的，就不必再单独记着（映射本身已代表它）
+	if err := h.writeGroups(clean, minusUsed(h.cfg.Groups.EmptyNames(), clean)); err != nil {
 		fail(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	h.cfg.Groups.SetAll(clean)
 	logf("账号分组已保存：%d 个账号有分组", len(clean))
 	ok(w, nil)
+}
+
+// postGroupCreate POST /__admin/groups/create —— 新建一个（可能还没有账号的）分组。
+//
+// 入参 {"name":"受限"}。为什么需要独立端点：分组的唯一数据是 uid→名 的映射，
+// 没有成员的组在数据上不存在。要支持「先建组、再把账号放进去」就必须显式记下
+// 组名（config 的 account_group_names）。
+//
+// 已存在（有账号或已建过）时幂等返回，不报错。
+func (h *Handler) postGroupCreate(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Groups == nil {
+		fail(w, http.StatusServiceUnavailable, "分组功能未接线")
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		fail(w, http.StatusBadRequest, "分组名不能为空")
+		return
+	}
+	if strings.ContainsAny(name, "\r\n\t/\\") {
+		fail(w, http.StatusBadRequest, "分组名 %q 含非法字符（不允许换行/制表/斜杠）", name)
+		return
+	}
+	if len([]rune(name)) > 40 {
+		fail(w, http.StatusBadRequest, "分组名 %q 过长（上限 40 字）", name)
+		return
+	}
+	for _, n := range h.cfg.Groups.Names() {
+		if n == name {
+			ok(w, map[string]any{"name": name, "created": false})
+			return
+		}
+	}
+	extra := append(append([]string{}, h.cfg.Groups.EmptyNames()...), name)
+	if err := h.writeGroups(h.cfg.Groups.Snapshot(), extra); err != nil {
+		fail(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	h.cfg.Groups.SetEmpty(extra)
+	logf("新建分组 %q", name)
+	ok(w, map[string]any{"name": name, "created": true})
 }
 
 // postGroupSet POST /__admin/groups/set —— 给一批账号设置同一个分组。
@@ -144,25 +186,237 @@ func (h *Handler) postGroupSet(w http.ResponseWriter, r *http.Request) {
 		}
 		n++
 	}
-	// 复用整体保存路径
-	raw, err := os.ReadFile(h.cfg.ConfigPath)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "读取 config.json 失败：%v", err)
-		return
-	}
-	// 排序输出保证确定性（便于 diff/备份对比）
-	text, err := setTopLevelValue(string(raw), "account_groups", m)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "写入 account_groups 失败：%v", err)
-		return
-	}
-	if _, err := h.persistConfigEdits(raw, text, map[string]any{
-		"account_groups": toAny(m),
-	}); err != nil {
+	// 复用整体保存路径。目标组若是新建的，顺手从「空组名」里摘掉（它现在有成员了）。
+	extra := dropName(h.cfg.Groups.EmptyNames(), g)
+	if err := h.writeGroups(m, extra); err != nil {
 		fail(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	h.cfg.Groups.SetAll(m)
+	h.cfg.Groups.SetEmpty(extra)
 	logf("批量分组：%d 个账号 → 分组 %q", n, g)
 	ok(w, map[string]any{"updated": n, "group": g})
+}
+
+// minusUsed 返回 names 中「没有被 m 里任何账号使用」的部分。
+func minusUsed(names []string, m map[string]string) []string {
+	used := make(map[string]bool, len(m))
+	for _, g := range m {
+		used[g] = true
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if n != "" && !used[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// dropName 返回去掉 name 后的副本（name 为空时原样返回副本）。
+func dropName(names []string, name string) []string {
+	if name == "" {
+		return append([]string{}, names...)
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if n != name {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// postGroupRename POST /__admin/groups/rename —— 重命名分组（批量改归属）。
+//
+// 入参 {"from":"旧名","to":"新名"}。to 为空 = 拒绝（要解散请用 delete 或逐个清空）。
+// 账号归属按 from→to 批量改写；不影响 key 绑定 —— key 里存的是组名，故**同时**
+// 把绑定了 from 的 key 改成 to（否则 key 会指向一个已不存在的组，行为变成"组内无账号"）。
+func (h *Handler) postGroupRename(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Groups == nil {
+		fail(w, http.StatusServiceUnavailable, "分组功能未接线")
+		return
+	}
+	var body struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	from := strings.TrimSpace(body.From)
+	to := strings.TrimSpace(body.To)
+	if from == "" || to == "" {
+		fail(w, http.StatusBadRequest, "from/to 都不能为空")
+		return
+	}
+	if from == to {
+		ok(w, map[string]any{"accounts": 0, "keys": 0})
+		return
+	}
+	if strings.ContainsAny(to, "\r\n\t/\\") || len([]rune(to)) > 40 {
+		fail(w, http.StatusBadRequest, "分组名 %q 非法", to)
+		return
+	}
+	// 账号归属
+	m := h.cfg.Groups.Snapshot()
+	n := 0
+	for uid, g := range m {
+		if g == from {
+			m[uid] = to
+			n++
+		}
+	}
+	// 空组名里若记着 from，一并改名（否则旧名残留成幽灵组）
+	extra := h.cfg.Groups.EmptyNames()
+	for i := range extra {
+		if extra[i] == from {
+			extra[i] = to
+		}
+	}
+	extra = append(extra, to)
+	extra = uniqStrings(extra)
+	if err := h.writeGroups(m, extra); err != nil {
+		fail(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	h.cfg.Groups.SetAll(m)
+	h.cfg.Groups.SetEmpty(extra)
+	// key 绑定同步改写（否则 key 指向不存在的组）
+	kn, err := h.rewriteKeyGroups(from, to)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "账号已改名，但 key 绑定改写失败：%v", err)
+		return
+	}
+	logf("分组重命名：%q → %q（%d 个账号，%d 个密钥）", from, to, n, kn)
+	ok(w, map[string]any{"accounts": n, "keys": kn})
+}
+
+// postGroupDelete POST /__admin/groups/delete —— 删除分组（解散）。
+//
+// 入参 {"name":"分组名"}。语义：**只解除归属，不删账号**（账号变回未分组）。
+// 绑定了该组的 key 会被解绑（Group 置空）—— 否则它们会指向不存在的组、
+// 变成「组内无账号」而全部失败。这是显式选择：删组后这些 key 回到未分组语义。
+func (h *Handler) postGroupDelete(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Groups == nil {
+		fail(w, http.StatusServiceUnavailable, "分组功能未接线")
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		fail(w, http.StatusBadRequest, "缺少分组名")
+		return
+	}
+	m := h.cfg.Groups.Snapshot()
+	n := 0
+	for uid, g := range m {
+		if g == name {
+			delete(m, uid)
+			n++
+		}
+	}
+	extra := dropName(h.cfg.Groups.EmptyNames(), name)
+	if err := h.writeGroups(m, extra); err != nil {
+		fail(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	h.cfg.Groups.SetAll(m)
+	h.cfg.Groups.SetEmpty(extra)
+	kn, err := h.rewriteKeyGroups(name, "")
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "分组已删除，但 key 解绑失败：%v", err)
+		return
+	}
+	logf("删除分组 %q：解除 %d 个账号归属，解绑 %d 个密钥", name, n, kn)
+	ok(w, map[string]any{"accounts": n, "keys": kn})
+}
+
+// writeGroups 把分组表 + 空组名一起写进 config.json（一次原子替换）。
+//
+// 两个键必须同一次落盘：分成两次写的话，中间态会出现「组已删但空组名还在」
+// 这类不一致；而且第二次失败会让第一次的结果留在盘上、内存却没更新。
+func (h *Handler) writeGroups(m map[string]string, extra []string) error {
+	raw, err := os.ReadFile(h.cfg.ConfigPath)
+	if err != nil {
+		return err
+	}
+	text, err := setTopLevelValue(string(raw), "account_groups", m)
+	if err != nil {
+		return err
+	}
+	text, err = setTopLevelValue(text, "account_group_names", extra)
+	if err != nil {
+		return err
+	}
+	_, err = h.persistConfigEdits(raw, text, map[string]any{
+		"account_groups":      toAny(m),
+		"account_group_names": toAny(extra),
+	})
+	return err
+}
+
+// uniqStrings 去重并丢弃空串（保持首次出现顺序）。
+func uniqStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// rewriteKeyGroups 把 api_keys 里 Group==from 的项改成 to（to 为空 = 解绑）。
+// 返回改动条数。空 from 不做任何事。
+func (h *Handler) rewriteKeyGroups(from, to string) (int, error) {
+	if from == "" {
+		return 0, nil
+	}
+	keys, legacy, err := h.readKeys()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for i := range keys {
+		if strings.TrimSpace(keys[i].Group) == from {
+			keys[i].Group = to
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	raw, err := os.ReadFile(h.cfg.ConfigPath)
+	if err != nil {
+		return 0, err
+	}
+	text, err := setTopLevelValue(string(raw), "api_keys", keys)
+	if err != nil {
+		return 0, err
+	}
+	if legacy != "" {
+		if text, err = setTopLevelValue(text, "api_key", legacy); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := h.persistConfigEdits(raw, text, map[string]any{
+		"api_keys": toAny(keys),
+	}); err != nil {
+		return 0, err
+	}
+	// 热重载密钥表（让 server 侧立刻看到新 Group）
+	if h.cfg.ReloadKeys != nil {
+		h.cfg.ReloadKeys(legacy, keys)
+	}
+	return n, nil
 }

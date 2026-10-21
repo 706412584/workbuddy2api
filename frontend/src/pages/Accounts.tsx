@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AuthFileView, CallRecord } from '../api/types'
 import {
   ApiError,
+  createGroup,
   deleteAuth,
   exportAccounts,
   fmtTime,
-  getLoadedAccounts,
   getGroups,
+  getLoadedAccounts,
   saveGroups,
   importAuth,
   importAuthBatch,
@@ -20,6 +21,9 @@ interface Props {
   onChanged: () => void
 }
 
+/** 分组下拉里的「新建分组…」哨兵值。真实分组名不允许以 __ 开头（后端未禁，但这里约定）。 */
+const NEW_GROUP = '__new__'
+
 export function Accounts({ onChanged }: Props) {
   const [files, setFiles] = useState<AuthFileView[]>([])
   const [authDir, setAuthDir] = useState('')
@@ -29,8 +33,15 @@ export function Accounts({ onChanged }: Props) {
   // 账号分组：草稿表（uid → 分组名）+ 是否有未保存改动。
   // 后端把分组表存在 config.json 的 account_groups，本页只做编辑与保存。
   const [groups, setGroups] = useState<Record<string, string>>({})
+  /** 已存在的分组名（下拉选项）。来自后端 Names()，不含只有本页草稿里出现的新名字。 */
+  const [groupNames, setGroupNames] = useState<string[]>([])
   const [groupsAvailable, setGroupsAvailable] = useState(true)
   const [groupsDirty, setGroupsDirty] = useState(false)
+  /** 批量分组的勾选集合（uid）。与「测试/删除」无关，仅本页表格用。 */
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  /** 批量分组的目标组名（草稿，不立即生效） */
+  const [bulkGroup, setBulkGroup] = useState('')
+
   const setGroupDraft = useCallback((uid: string, g: string) => {
     setGroups((m) => {
       const n = { ...m }
@@ -41,16 +52,7 @@ export function Accounts({ onChanged }: Props) {
     })
     setGroupsDirty(true)
   }, [])
-  const doSaveGroups = useCallback(async () => {
-    try {
-      await saveGroups(groups)
-      setGroupsDirty(false)
-      setErr('')
-      setRowMsg('分组已保存')
-    } catch (e) {
-      setErr(e instanceof ApiError ? e.message : String(e))
-    }
-  }, [groups])
+
   const [busy, setBusy] = useState(false)
 
   const [region, setRegion] = useState<'cn' | 'global'>('cn')
@@ -94,6 +96,7 @@ export function Accounts({ onChanged }: Props) {
     try {
       const g = await getGroups()
       setGroups(g.groups)
+      setGroupNames(g.names)
       setGroupsAvailable(g.available)
       setGroupsDirty(false)
     } catch {
@@ -112,6 +115,56 @@ export function Accounts({ onChanged }: Props) {
   useEffect(() => {
     void load()
   }, [load])
+
+  /**
+   * 新建一个空分组（后端 account_group_names），返回组名；取消/失败返回 null。
+   *
+   * 空组必须走这个端点而不是「给账号设个新组名」：后者一旦没有成员，组就消失了，
+   * 下拉里选「新建分组」会立刻回退成空白。
+   */
+  const doCreateGroup = useCallback(async (): Promise<string | null> => {
+    const name = prompt('新分组名（先建组，再把账号放进去）')?.trim()
+    if (!name) return null
+    try {
+      const r = await createGroup(name)
+      setGroupNames((ns) => (ns.includes(name) ? ns : [...ns, name].sort()))
+      setRowMsg(r.created ? `已新建分组「${name}」` : `分组「${name}」已存在`)
+      setErr('')
+      return name
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e))
+      return null
+    }
+  }, [])
+
+  const doSaveGroups = useCallback(async () => {
+    try {
+      await saveGroups(groups)
+      setGroupsDirty(false)
+      setPicked(new Set())
+      setErr('')
+      setRowMsg('分组已保存')
+      // 重新拉一次：Names() 由后端从落盘表推导，新建/清空的组要反映到下拉里
+      void load()
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e))
+    }
+  }, [groups, load])
+
+  /** 下拉里选「新建分组…」：问一个名字，再写进该账号的草稿。 */
+  const pickGroup = useCallback(
+    (uid: string, v: string) => {
+      if (v !== NEW_GROUP) {
+        setGroupDraft(uid, v)
+        return
+      }
+      // 新组名走 doCreateGroup（落 account_group_names，空组才不会消失）
+      void doCreateGroup().then((name) => {
+        if (name) setGroupDraft(uid, name)
+      })
+    },
+    [setGroupDraft, doCreateGroup],
+  )
 
   // 组件卸载时停掉轮询，避免登录结束后定时器还在跑
   useEffect(() => () => clearInterval(pollTimer.current), [])
@@ -366,16 +419,6 @@ export function Accounts({ onChanged }: Props) {
               <span className="mono">auths/</span> 里改动（绕开了面板）才需要点右侧按钮。
             </div>
           </div>
-          {groupsDirty && (
-            <>
-              <span className="badge warn" title="有未保存的分组改动">
-                分组未保存
-              </span>
-              <button className="btn primary" onClick={() => void doSaveGroups()}>
-                保存分组
-              </button>
-            </>
-          )}
           <button className="btn primary" onClick={() => void doRescan()} disabled={rescanning}>
             {rescanning ? <span className="spin" /> : null}
             {rescanning ? ' 扫描中' : '重新扫描 auths'}
@@ -603,11 +646,74 @@ export function Accounts({ onChanged }: Props) {
             {files.length} 个
           </span>
           <div className="spacer" />
+          {groupsDirty && (
+            <span className="badge warn" title="有未保存的分组改动">
+              分组未保存
+            </span>
+          )}
+          <button
+            className="btn primary"
+            onClick={() => void doSaveGroups()}
+            disabled={!groupsDirty}
+          >
+            保存分组
+          </button>
           <button className="btn" onClick={() => void load()} disabled={busy}>
             {busy ? <span className="spin" /> : null}
             {busy ? ' 读取中' : '重新读取'}
           </button>
         </header>
+
+        {/* 批量分组：勾选若干账号 → 选/填组名 → 写进草稿，再「保存分组」生效。
+            与「分组」页的区别：那里是即时生效（每次操作单独落盘），这里是草稿式，
+            便于一次调整多个账号后统一保存。 */}
+        {groupsAvailable && (
+          <div className="toolbar">
+            <span className="dim" style={{ fontSize: 12 }}>
+              把勾选的 {picked.size} 个账号设为
+            </span>
+            <select
+              value={bulkGroup}
+              onChange={(e) => {
+                if (e.target.value === NEW_GROUP) {
+                  void doCreateGroup().then((n) => {
+                    if (n) setBulkGroup(n)
+                  })
+                } else setBulkGroup(e.target.value)
+              }}
+              style={{ width: 160 }}
+            >
+              <option value="">未分组（移出分组）</option>
+              {groupNames.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+              <option value={NEW_GROUP}>＋ 新建分组…</option>
+            </select>
+            <button
+              className="btn"
+              disabled={picked.size === 0}
+              onClick={() => {
+                for (const uid of picked) setGroupDraft(uid, bulkGroup)
+                setPicked(new Set())
+              }}
+            >
+              写入草稿（{picked.size}）
+            </button>
+            <button className="btn" disabled={picked.size === 0} onClick={() => setPicked(new Set())}>
+              清空勾选
+            </button>
+            <div className="spacer" />
+            <button
+              className="btn"
+              disabled={files.length === 0}
+              onClick={() => setPicked(new Set(files.map((f) => f.uid).filter(Boolean)))}
+            >
+              全选
+            </button>
+          </div>
+        )}
 
         {/* 启用/禁用的结果紧贴在表格上方 —— 它是表格内的动作，反馈不该跑到上面的面板里 */}
         {rowMsg && (
@@ -629,6 +735,21 @@ export function Accounts({ onChanged }: Props) {
             <table>
               <thead>
                 <tr>
+                  <th style={{ width: 30 }}>
+                    <input
+                      type="checkbox"
+                      checked={files.length > 0 && files.every((f) => picked.has(f.uid))}
+                      onChange={(e) =>
+                        setPicked(
+                          e.target.checked
+                            ? new Set(files.map((f) => f.uid).filter(Boolean))
+                            : new Set(),
+                        )
+                      }
+                      disabled={!groupsAvailable}
+                      title="全选（用于批量分组）"
+                    />
+                  </th>
                   <th>账号</th>
                   <th>区域</th>
                   <th>状态</th>
@@ -653,6 +774,21 @@ export function Accounts({ onChanged }: Props) {
                     typeof f.inPool === 'boolean' ? f.inPool : (loadedUids?.has(f.uid) ?? null)
                   return (
                     <tr key={f.file}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={picked.has(f.uid)}
+                          disabled={!groupsAvailable || !f.uid}
+                          onChange={() =>
+                            setPicked((s) => {
+                              const n = new Set(s)
+                              if (n.has(f.uid)) n.delete(f.uid)
+                              else n.add(f.uid)
+                              return n
+                            })
+                          }
+                        />
+                      </td>
                       <td>
                         <div style={{ color: 'var(--text-strong)' }}>
                           {f.nickname || '（无昵称）'}
@@ -687,14 +823,24 @@ export function Accounts({ onChanged }: Props) {
                         )}
                       </td>
                       <td style={{ fontSize: 11.5 }}>
-                        <input
+                        <select
                           value={groups[f.uid] ?? ''}
-                          placeholder="未分组"
                           title="改分组后按「保存分组」生效；空 = 移出分组"
-                          onChange={(e) => setGroupDraft(f.uid, e.target.value)}
-                          style={{ width: 86 }}
+                          onChange={(e) => pickGroup(f.uid, e.target.value)}
+                          style={{ width: 120 }}
                           disabled={!groupsAvailable}
-                        />
+                        >
+                          <option value="">未分组</option>
+                          {/* 草稿里刚新建、后端还不认识的名字也要能显示，否则选中后回显成空白 */}
+                          {[...new Set([...groupNames, ...(groups[f.uid] ? [groups[f.uid]] : [])])]
+                            .sort()
+                            .map((n) => (
+                              <option key={n} value={n}>
+                                {n}
+                              </option>
+                            ))}
+                          <option value={NEW_GROUP}>＋ 新建分组…</option>
+                        </select>
                       </td>
                       <td style={{ fontSize: 11 }}>
                         <CallHistory calls={f.calls} lastSuccess={f.lastSuccess} />

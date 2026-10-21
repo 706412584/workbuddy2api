@@ -219,6 +219,8 @@ export interface APIKeyEntry {
   key: string
   region: string
   name: string
+  /** 绑定的账号分组名。空/缺省 = 未分组（只能用未分组账号）。 */
+  group?: string
 }
 
 export interface APIKeysResponse {
@@ -476,6 +478,9 @@ export interface CallRecord {
 /** GET /__admin/groups 的响应。 */
 export interface GroupsStatus {
   groups: Record<string, string>
+  /** 全部组名（含显式创建但暂无账号的空组） */
   names: string[]
+  /** 显式创建、当前没有任何账号的组名 */
+  emptyNames?: string[]
   available: boolean
 }

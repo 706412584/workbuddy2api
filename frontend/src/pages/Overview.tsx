@@ -11,6 +11,7 @@ import {
   breakerActive,
   fmtDuration,
   fmtTime,
+  getGroups,
   getRegionModels,
   getSchedule,
   resetAccounts,
@@ -280,6 +281,27 @@ function ScheduleCard({
 
 export function Overview({ status, health, now, onChanged, keyRegion, poolTotal }: Props) {
   const [regionFilter, setRegionFilter] = useState<'all' | 'cn' | 'global'>('all')
+  /**
+   * 分组筛选：'' = 全部，'__none__' = 未分组，其它 = 该组。
+   *
+   * 分组表只能从 /__admin/groups 取（/status 不带分组字段），所以这里单独拉一次。
+   * 只拉一次、不跟 5s 轮询：分组变更要走「分组」页，改完回总览时本组件会重挂载。
+   */
+  const [groupFilter, setGroupFilter] = useState('')
+  const [groups, setGroups] = useState<Record<string, string>>({})
+  useEffect(() => {
+    let cancelled = false
+    getGroups()
+      .then((g) => {
+        if (!cancelled && g.available) setGroups(g.groups)
+      })
+      .catch(() => {
+        // 取不到就退化成「没有分组」：筛选下拉只剩「全部/未分组」，不影响其它功能
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
   const [onlyProblem, setOnlyProblem] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>('status')
   const [sortDesc, setSortDesc] = useState(true)
@@ -539,6 +561,10 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
   const accounts = status.accounts
     .filter((a) => {
       if (regionFilter !== 'all' && a.region !== regionFilter) return false
+      if (groupFilter !== '') {
+        const g = groups[a.uid] ?? ''
+        if (groupFilter === '__none__' ? g !== '' : g !== groupFilter) return false
+      }
       if (onlyProblem && !(a.disabled || a.cooling || breakerActive(a, now))) return false
       return true
     })
@@ -553,6 +579,10 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
     })
 
   const regions = new Set(status.accounts.map((a) => a.region ?? 'cn'))
+  /** 出现过的分组名（按 /status 里的账号过滤，避免列出网关未返回的组） */
+  const groupNameList = [
+    ...new Set(status.accounts.map((a) => groups[a.uid] ?? '').filter(Boolean)),
+  ].sort()
 
   // 批量重置只针对「异常」账号：正常账号没有可重置的东西，全量重置毫无收益。
   const problemUids = status.accounts
@@ -726,6 +756,25 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
             </button>
           </label>
 
+          <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span className="dim" style={{ fontSize: 12 }}>
+              分组
+            </span>
+            <select
+              value={groupFilter}
+              onChange={(e) => setGroupFilter(e.target.value)}
+              title="按账号分组筛选。分组在「分组」页维护"
+            >
+              <option value="">全部</option>
+              <option value="__none__">未分组</option>
+              {groupNameList.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <div className="spacer" />
 
           <button
@@ -778,6 +827,7 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
                 <tr>
                   <th>账号</th>
                   <th>区域</th>
+                  <th>分组</th>
                   <th>状态</th>
                   <th>额度</th>
                   <th>在途</th>
@@ -804,6 +854,15 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
                         </div>
                       </td>
                       <td>{regionBadge(a.region)}</td>
+                      <td>
+                        {groups[a.uid] ? (
+                          <span className="badge accent">{groups[a.uid]}</span>
+                        ) : (
+                          <span className="dim" style={{ fontSize: 11.5 }}>
+                            未分组
+                          </span>
+                        )}
+                      </td>
                       <td>
                         <span className={'badge ' + st.cls}>{st.label}</span>
                         {a.cooling && a.cool_remaining_sec ? (

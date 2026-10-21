@@ -17,8 +17,18 @@ import { Proxy } from './pages/Proxy'
 import { APIKeys } from './pages/APIKeys'
 import { Logs } from './pages/Logs'
 import { Stats } from './pages/Stats'
+import { Groups } from './pages/Groups'
 
-type Tab = 'overview' | 'stats' | 'accounts' | 'apikeys' | 'models' | 'proxy' | 'playground' | 'logs'
+type Tab =
+  | 'overview'
+  | 'stats'
+  | 'accounts'
+  | 'groups'
+  | 'apikeys'
+  | 'models'
+  | 'proxy'
+  | 'playground'
+  | 'logs'
 
 const KEY_STORAGE = 'wb2api.admin.key'
 const POLL_MS = 5000
@@ -27,6 +37,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: '总览' },
   { id: 'stats', label: '统计' },
   { id: 'accounts', label: '账号' },
+  { id: 'groups', label: '分组' },
   { id: 'apikeys', label: '密钥' },
   { id: 'models', label: '模型' },
   { id: 'proxy', label: '代理' },
@@ -386,6 +397,7 @@ export default function App() {
             />
           )}
           {tab === 'accounts' && <Accounts onChanged={refresh} />}
+          {tab === 'groups' && <Groups onChanged={refresh} />}
           {tab === 'apikeys' && <APIKeys activeKey={apiKey} onChanged={refresh} />}
           {tab === 'models' && <Models models={models} keyRegion={keyRegion} />}
           {tab === 'proxy' && <Proxy onChanged={refresh} />}

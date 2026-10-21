@@ -550,7 +550,19 @@ export const assignSidecar = (uids?: string[]) =>
 
 /** 分组表（uid → 分组名）与出现过的分组名。 */
 export const getGroups = () =>
-  adminJSON<{ groups: Record<string, string>; names: string[]; available: boolean }>('/__admin/groups')
+  adminJSON<{
+    groups: Record<string, string>
+    names: string[]
+    emptyNames?: string[]
+    available: boolean
+  }>('/__admin/groups')
+
+/** 新建一个（可先于分配账号的）分组。已存在时幂等返回。 */
+export const createGroup = (name: string) =>
+  adminJSON<{ name: string; created: boolean }>('/__admin/groups/create', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  })
 
 /** 整体保存分组表（空分组名 = 移出分组）。 */
 export const saveGroups = (groups: Record<string, string>) =>
@@ -561,4 +573,18 @@ export const setAccountGroup = (uids: string[], group: string) =>
   adminJSON<{ updated: number; group: string }>('/__admin/groups/set', {
     method: 'POST',
     body: JSON.stringify({ uids, group }),
+  })
+
+/** 重命名分组（批量改账号归属 + 同步改写 key 绑定）。 */
+export const renameGroup = (from: string, to: string) =>
+  adminJSON<{ accounts: number; keys: number }>('/__admin/groups/rename', {
+    method: 'POST',
+    body: JSON.stringify({ from, to }),
+  })
+
+/** 删除分组（只解除归属，不删账号；绑定的 key 会被解绑）。 */
+export const deleteGroup = (name: string) =>
+  adminJSON<{ accounts: number; keys: number }>('/__admin/groups/delete', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
   })

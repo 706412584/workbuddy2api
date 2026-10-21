@@ -29,6 +29,11 @@ type Registry struct {
 	mu sync.RWMutex
 	// groups uid → 分组名（空串不存，等价未分组）
 	groups map[string]string
+	// extra 没有任何账号、但**显式创建**过的分组名。
+	// 为什么需要：分组在数据上只是 uid→名 的映射，删光成员就等于组不存在。
+	// 但面板要求「新建分组」先于分配账号（先建组、再往里放号），所以把空组名
+	// 单独存一份，Names() 取两者的并集。
+	extra map[string]struct{}
 }
 
 // New 构造注册表。
@@ -52,6 +57,36 @@ func (r *Registry) Set(m map[string]string) {
 	r.mu.Lock()
 	r.groups = next
 	r.mu.Unlock()
+}
+
+// SetExtra 整体替换「空组名」列表（面板新建/删除空组时调用）。
+func (r *Registry) SetExtra(names []string) {
+	next := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		next[n] = struct{}{}
+	}
+	r.mu.Lock()
+	r.extra = next
+	r.mu.Unlock()
+}
+
+// ExtraNames 返回显式创建但当前无账号的分组名（排序）。
+func (r *Registry) ExtraNames() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.extra))
+	for n := range r.extra {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // GroupOf 返回该账号的分组名；空串 = 未分组。
@@ -79,14 +114,18 @@ func (r *Registry) All() map[string]string {
 }
 
 // Names 返回出现过的分组名（去重、排序；供面板下拉框）。
+// 含「显式创建但还没有账号」的空组 —— 否则刚建好的组在下拉里立刻消失。
 func (r *Registry) Names() []string {
 	if r == nil {
 		return nil
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	set := make(map[string]bool, len(r.groups))
+	set := make(map[string]bool, len(r.groups)+len(r.extra))
 	for _, g := range r.groups {
+		set[g] = true
+	}
+	for g := range r.extra {
 		set[g] = true
 	}
 	out := make([]string, 0, len(set))

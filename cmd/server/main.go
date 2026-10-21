@@ -163,7 +163,10 @@ func main() {
 	}
 
 	// 账号分组注册表（uid → 分组）。空配置 = 全部未分组 → 不过滤（行为不变）。
-	server.SetGroups(groupreg.New(cfg.AccountGroups))
+	// 空组名一并注入：面板可以「先建组、再放号」。
+	groupsReg := groupreg.New(cfg.AccountGroups)
+	groupsReg.SetExtra(cfg.AccountGroupNames)
+	server.SetGroups(groupsReg)
 
 	// mihomo sidecar（订阅 → N 个本地出口端口 → 槽位）：启用时起子进程并自动同步。
 	// 未启用（enabled=false 或未填订阅）时完全不启动，行为零变化。

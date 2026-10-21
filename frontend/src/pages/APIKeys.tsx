@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { APIKeyEntry } from '../api/types'
-import { ApiError, generateKey, getAPIKeys, saveAPIKeys } from '../api/client'
+import { ApiError, generateKey, getAPIKeys, getGroups, saveAPIKeys } from '../api/client'
 
 interface Props {
   /** 顶栏当前在用的密钥，用于提示「你正在删除自己正在用的密钥」 */
@@ -20,6 +20,10 @@ export function APIKeys({ activeKey, onChanged }: Props) {
   const [configPath, setConfigPath] = useState('')
   const [revealed, setRevealed] = useState<Set<number>>(new Set())
   const [dirty, setDirty] = useState(false)
+  /** 可选分组名 + 每组账号数（用于提示「绑了空组 = 这把密钥打不出去」） */
+  const [groupNames, setGroupNames] = useState<string[]>([])
+  const [groupCounts, setGroupCounts] = useState<Record<string, number>>({})
+  const [groupsAvailable, setGroupsAvailable] = useState(true)
 
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
@@ -45,6 +49,20 @@ export function APIKeys({ activeKey, onChanged }: Props) {
   useEffect(() => {
     void load()
   }, [load])
+
+  // 分组选项：密钥绑定分组后只走该组账号，所以下拉必须反映「当前有哪些组」。
+  // 账号数一并取来 —— 绑到空组会让这把密钥 100% 失败，需要在界面上提前示警。
+  useEffect(() => {
+    getGroups()
+      .then((g) => {
+        setGroupNames(g.names)
+        const c: Record<string, number> = {}
+        for (const name of Object.values(g.groups)) c[name] = (c[name] ?? 0) + 1
+        setGroupCounts(c)
+        setGroupsAvailable(g.available)
+      })
+      .catch(() => setGroupsAvailable(false))
+  }, [])
 
   const mutate = (next: APIKeyEntry[]) => {
     setKeys(next)
@@ -154,6 +172,9 @@ export function APIKeys({ activeKey, onChanged }: Props) {
           <div className="dim" style={{ fontSize: 11.5, marginBottom: 12 }}>
             密钥绑定区域后，该密钥的请求只走对应区域的账号，其 <span className="mono">/v1/models</span> 与{' '}
             <span className="mono">/status</span> 也按该区域过滤；选「不限」则两区通吃。
+            <br />
+            绑定<b>分组</b>后，该密钥只能使用该组账号（未绑定则只能用未分组账号，两者
+            <b>互不通用、不互相回退</b>）。分组在「分组」页维护。
             改动写入 <span className="mono">config.json</span>，保存后立即生效。
           </div>
 
@@ -189,6 +210,9 @@ export function APIKeys({ activeKey, onChanged }: Props) {
               <tr>
                 <th style={{ width: 150 }}>名称</th>
                 <th style={{ width: 110 }}>区域</th>
+                <th style={{ width: 170 }} title="绑定账号分组：未绑定只能用未分组账号；绑定后只能用该组账号（互不通用、不回退）">
+                  分组
+                </th>
                 <th>密钥</th>
                 <th style={{ width: 210 }} />
               </tr>
@@ -217,6 +241,31 @@ export function APIKeys({ activeKey, onChanged }: Props) {
                         <option value="cn">cn</option>
                         <option value="global">global</option>
                       </select>
+                    </td>
+                    <td>
+                      <select
+                        value={k.group ?? ''}
+                        onChange={(e) => patch(i, { group: e.target.value })}
+                        style={{ width: '100%' }}
+                        disabled={!groupsAvailable}
+                        title="绑定后该密钥只使用该组账号"
+                      >
+                        <option value="">未绑定</option>
+                        {[...new Set([...groupNames, ...(k.group ? [k.group] : [])])]
+                          .sort()
+                          .map((n) => (
+                            <option key={n} value={n}>
+                              {n}（{groupCounts[n] ?? 0} 个账号）
+                            </option>
+                          ))}
+                      </select>
+                      {k.group && (groupCounts[k.group] ?? 0) === 0 && (
+                        <div style={{ marginTop: 4 }}>
+                          <span className="badge err" title="该分组下没有账号，这把密钥的请求会全部失败">
+                            空组
+                          </span>
+                        </div>
+                      )}
                     </td>
                     <td>
                       <input
@@ -258,7 +307,7 @@ export function APIKeys({ activeKey, onChanged }: Props) {
               })}
               {keys.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="empty">
+                  <td colSpan={5} className="empty">
                     还没有密钥。点「新增密钥」会自动生成一把 48 位随机密钥。
                   </td>
                 </tr>

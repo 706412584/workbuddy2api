@@ -103,3 +103,5 @@ func (groupsAdapter) Snapshot() map[string]string { return server.GroupsSnapshot
 func (groupsAdapter) SetAll(m map[string]string)  { server.SetAccountGroups(m) }
 func (groupsAdapter) Names() []string             { return server.GroupNames() }
 func (groupsAdapter) GroupOf(uid string) string   { return server.GroupOf(uid) }
+func (groupsAdapter) EmptyNames() []string        { return server.EmptyGroupNames() }
+func (groupsAdapter) SetEmpty(names []string)     { server.SetEmptyGroupNames(names) }

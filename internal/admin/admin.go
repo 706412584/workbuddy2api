@@ -32,6 +32,8 @@ type KeyEntry struct {
 	Key    string `json:"key"`
 	Region string `json:"region"`
 	Name   string `json:"name"`
+	// Group 绑定的账号分组名。空 = 未分组（只能用未分组账号）。
+	Group string `json:"group,omitempty"`
 }
 
 // Config admin 的依赖。
@@ -154,6 +156,9 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /__admin/groups", h.getGroups)
 	h.mux.HandleFunc("POST /__admin/groups", h.postGroups)
 	h.mux.HandleFunc("POST /__admin/groups/set", h.postGroupSet)
+	h.mux.HandleFunc("POST /__admin/groups/create", h.postGroupCreate)
+	h.mux.HandleFunc("POST /__admin/groups/rename", h.postGroupRename)
+	h.mux.HandleFunc("POST /__admin/groups/delete", h.postGroupDelete)
 	h.mux.HandleFunc("GET /__admin/proxy/sidecar", h.getSidecar)
 	h.mux.HandleFunc("POST /__admin/proxy/sidecar/sync", h.postSidecarSync)
 	h.mux.HandleFunc("POST /__admin/proxy/sidecar/assign", h.postSidecarAssign)

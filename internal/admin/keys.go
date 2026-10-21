@@ -294,6 +294,9 @@ func (h *Handler) saveKeys(w http.ResponseWriter, r *http.Request) {
 			Key:    strings.TrimSpace(k.Key),
 			Region: strings.ToLower(strings.TrimSpace(k.Region)),
 			Name:   strings.TrimSpace(k.Name),
+			// Group 必须原样带上：本函数是**整表替换**写 config.json，
+			// 漏掉它会在用户保存密钥时静默抹掉分组绑定（实测踩到过）。
+			Group: strings.TrimSpace(k.Group),
 		})
 	}
 	if bad := validateKeys(legacyKey, keys); bad != "" {
