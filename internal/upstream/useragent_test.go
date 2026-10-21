@@ -47,7 +47,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "",
+			wantUA: "axios/1.16.1",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -157,8 +157,8 @@ const (
 	defaultUAString      = "WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0"
 	explicitString       = "MyCustomAgent/3.1"
 	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"
-	billingUAWorkBuddy   = "WorkBuddy/5.8.4"
-	billingUACustomVer   = "WorkBuddy/6.0.0"
+	billingUAWorkBuddy   = "axios/1.16.1"
+	billingUACustomVer   = "axios/1.16.1"
 	billingUAAgentString = "BillingAgent/1"
 )
 
@@ -296,8 +296,12 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	}
 }
 
-// TestBillingUA_WhenClientNameEmpty client_name 空 = 保持现状：不设 UA（Go 默认 UA），
-// 即使 version 配置了也不上 UA。
+// TestBillingUA_WhenClientNameEmpty client_name 空 = 仍然发 axios/1.16.1。
+//
+// 官方客户端 billing 域（report/balance/checkin）走 axios 实例，UA 恒为
+// `axios/1.16.1`（本机 5.8.4 分发包内 node_modules/axios/package.json 的 version），
+// 与 client_name / client_version 无关。旧实现"未配 client_name 就不设 UA"会让出站
+// 落到 Go 默认 `Go-http-client/1.1`，是与真机不符的指纹。
 func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	var ua string
@@ -314,12 +318,94 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	if _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
-	if ua != "" {
-		t.Errorf("billing UA = %q want empty (client_name unset)", ua)
+	if ua != billingUAWorkBuddy {
+		t.Errorf("billing UA = %q want %q (client_name unset)", ua, billingUAWorkBuddy)
 	}
-	if got := c.billingUA(); got != "" {
-		t.Errorf("billingUA() = %q want empty", got)
+	if got := c.billingUA(); got != billingUAWorkBuddy {
+		t.Errorf("billingUA() = %q want %q", got, billingUAWorkBuddy)
 	}
 }
 
 var _ = io.Discard
+
+// TestUserAgentBrandPerRealm 出站 UA 第二段按 realm 换品牌：国内版驼峰
+// `WorkBuddy`，国际版小写连字符 `workbuddy-ai`（本机 5.8.4 分发包内
+// cli/product.json 的 applicationName = "workbuddy-ai"，buildUserAgent 取
+// applicationName || productName）。首段恒为驼峰 WorkBuddy。
+func TestUserAgentBrandPerRealm(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		domain string
+		want   string
+	}{
+		{"cn", "www.codebuddy.cn", "WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0"},
+		{"global", "www.workbuddy.ai", "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ua string
+			c := &Client{
+				HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+					ua = r.Header.Get("User-Agent")
+					return jsonResp(200, `{"code":0}`), nil
+				})},
+				ChatBaseCN:     "https://chat.example",
+				ChatBaseGlobal: "https://chat.example",
+			}
+			a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: tc.domain}
+			rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", "")
+			if status != 200 || err != nil {
+				t.Fatalf("chat: status=%d err=%v", status, err)
+			}
+			if rc != nil {
+				rc.Close()
+			}
+			if ua != tc.want {
+				t.Errorf("UA = %q want %q", ua, tc.want)
+			}
+		})
+	}
+}
+
+// TestCommonHeadersIdentityAndLanguage 公共头契约：
+//   - Accept-Language 恒为 zh（跟随系统区域，双版本真机一致）；
+//   - X-CodeBuddy-Request: 1 在所有出站路径（含 billing）都在；
+//   - 身份头族按账号形态条件发送：个人号（无 enterpriseId、token 无 token_source）
+//     三头全不发；带 token_source 的号发 X-Auth-Method + X-Userinfo。
+func TestCommonHeadersIdentityAndLanguage(t *testing.T) {
+	capture := func(c *Client, a *auth.Auth) http.Header {
+		var h http.Header
+		c.HTTP = &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h = r.Header.Clone()
+			return jsonResp(200, `{"code":0,"data":{"response":{"data":{"accounts":[]}}}}`), nil
+		})}
+		c.BillingBaseCN = "https://billing.example"
+		if _, err := c.UserResource(a); err != nil {
+			t.Fatalf("userResource: %v", err)
+		}
+		return h
+	}
+
+	personal := &auth.Auth{AccessToken: "at", UID: "u1"}
+	h := capture(&Client{}, personal)
+	if got := h.Get("Accept-Language"); got != "zh" {
+		t.Errorf("Accept-Language = %q want zh", got)
+	}
+	if got := h.Get("X-CodeBuddy-Request"); got != "1" {
+		t.Errorf("X-CodeBuddy-Request = %q want 1 (billing path)", got)
+	}
+	for _, k := range []string{"X-Auth-Method", "X-Id-Source", "X-Userinfo"} {
+		if got := h.Get(k); got != "" {
+			t.Errorf("personal account must not send %s (got %q)", k, got)
+		}
+	}
+
+	// JWT 只带 token_source 声明（payload 段 base64url 无填充）。
+	jwt := "h.eyJ0b2tlbl9zb3VyY2UiOiJlbnRlcnByaXNlX3N3aXRjaCJ9.s"
+	h2 := capture(&Client{}, &auth.Auth{AccessToken: jwt, UID: "u2"})
+	if got := h2.Get("X-Auth-Method"); got != "enterprise_switch" {
+		t.Errorf("X-Auth-Method = %q want enterprise_switch", got)
+	}
+	if got := h2.Get("X-Userinfo"); got == "" {
+		t.Errorf("X-Userinfo should be sent when token_source present")
+	}
+}

@@ -5,7 +5,9 @@ package upstream
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,14 +16,16 @@ import (
 )
 
 const (
-	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
-	// （resources/install-manifest.json 的 appVersion，以及 app.asar 内
-	// package.json 的 version；2026-10-15 分发包 = 5.8.4）。
+	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `<brand>/<ver>` 与
+	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy AI（国际版）分发包版本：
+	// 本机 `resources/install-manifest.json` 实测 appVersion = 5.8.4
+	// （generatedAt 2026-10-15），app.asar 内 package.json 同版本。
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
 	//
-	// 版本滞后本身不是封禁判据（2026-10-21 实测：同账号分别用 5.5.4 与 5.8.4 的 UA
-	// 请求，200/403 结果完全一致），但对齐当前分发包可减少"旧客户端"归因面。
+	// **两版共用一值**：社区抓包（misakano7545 fork，2026-10-20 同机双版本）称
+	// 国内版分发包为 5.8.3，但本机只装了国际版 5.8.4，无法本地复核；版本号本身
+	// 也不是封禁判据（2026-10-21 实测：同账号 5.5.4 与 5.8.4 的 UA 结果一致）。
+	// 故不按 realm 拆版本号，只拆**品牌段**（品牌段有本地 asar 证据，见 uaBrandFor）。
 	defaultClientVersion = "5.8.4"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
 	// （同分发包 app.asar.unpacked/cli/dist/*.mjs 内嵌 package.json 的
@@ -58,36 +62,62 @@ func (c *Client) cliVersion() string {
 }
 
 // defaultWorkBuddyUA 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`
-// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>；
-// SaaS 默认形态下 applicationName 与 platform 同为 WorkBuddy，两段相同）。
-// 与旧值 `CLI/2.63.2 CodeBuddy/2.63.2` 的差异：CodeBuddy 老品牌换为 WorkBuddy 三段式，
-// CLI 版本对齐官方内置 2.137.1。官方无任何 UA 随机化（step1 §4），故默认确定性。
+// `WorkBuddy/<clientVersion> <brand>/<clientVersion> CLI/<cliVersion>`
+// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
+//
+// 首段**恒为驼峰 `WorkBuddy`**（platform 段），只有第二段（applicationName 段）
+// 随 realm 换品牌：国际版分发包 `resources/app.asar.unpacked/cli/product.json`
+// 实测 `applicationName = "workbuddy-ai"`、`productName = "WorkBuddy AI"`
+// （本机 5.8.4 分发包），而国内版沿用驼峰 `WorkBuddy`。
+// 与旧值 `CLI/2.63.2 CodeBuddy/2.63.2` 的差异：CodeBuddy 老品牌换为 WorkBuddy 三段式。
+// 官方无任何 UA 随机化，故默认确定性。
+func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
+	ver := c.clientVersion()
+	return "WorkBuddy/" + ver + " " + uaBrandFor(a) + "/" + ver + " CLI/" + c.cliVersion()
+}
+
+// uaBrandFor 出站 UA 第二段的品牌：国内版驼峰 `WorkBuddy`，国际版小写连字符
+// `workbuddy-ai`。
+//
+// 依据（本机可复核）：国际版 5.8.4 分发包内 `product.json` 的 applicationName
+// 就是 `workbuddy-ai`，而 buildUserAgent() 取的是 `applicationName || productName`
+// （app.asar 内 UserAgentHttpInterceptor.buildUserAgent），故第二段必然是该 slug。
+// 国内版没有本地安装可复核，沿用驼峰（社区双版本抓包同样结论）。
+func uaBrandFor(a *auth.Auth) string {
+	if a != nil && a.Region() == auth.RegionGlobal {
+		return "workbuddy-ai"
+	}
+	return "WorkBuddy"
+}
+
+// defaultWorkBuddyUA 返回国内版形态的默认 UA（无账号上下文时使用）。
 func (c *Client) defaultWorkBuddyUA() string {
-	return "WorkBuddy/" + c.clientVersion() + " WorkBuddy/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	return c.defaultWorkBuddyUAFor(nil)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
-// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 默认 WorkBuddy 三段式。
-// 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
-// 未配则走官方桌面端默认形态（本任务 A 段核心变更）。
-func (c *Client) userAgent() string {
+// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认三段式。
+// 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本）。
+func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
 	}
-	return c.defaultWorkBuddyUA()
+	return c.defaultWorkBuddyUAFor(a)
 }
 
-// billingUA 白名单类（billing/checkin/banner）出站 UA。
-// 语义对齐官方 application-manifest.js:27590-27601（banner 白名单接口显式头组）：
-// 这类接口用单段 `WorkBuddy/<clientVersion>`（不带 CLI 段——官方 banner 显式覆写 UA
-// 为 `WorkBuddy/<pkgVer>`，RestOperations 层的 CLI 扩展段被业务层固化覆盖掉）。
-// 仅当 client_name 配置（非空）才生效；未配保持现状（BillingHeaders 不设 UA，Go 默认 UA）。
+// billingUA 白名单类（billing/checkin/banner）出站 UA：**恒为 axios 默认串**。
+//
+// 依据（本机可复核）：分发包内 `node_modules/axios/package.json` 的 version =
+// 1.16.1，billing 域的 RestOperations 走 axios 实例而非 SDK 客户端，因此请求头
+// 不带任何品牌段。此前我们发 `WorkBuddy/<ver>`（仅 client_name 非空时）或干脆
+// 不发（Go 默认 `Go-http-client/1.1`）——两者都是与官方客户端不符的指纹。
+//
+// 逃生开关保留：client_name == "SaaS" 时不设 UA（还原 Go 默认），与既有语义一致。
 func (c *Client) billingUA() string {
-	if c == nil || c.ClientName == "" {
+	if c == nil || c.ClientName == "SaaS" {
 		return ""
 	}
-	return "WorkBuddy/" + c.clientVersion()
+	return "axios/1.16.1"
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
@@ -151,12 +181,70 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", c.userAgent())
+	req.Header.Set("User-Agent", c.userAgent(a))
+	// Accept-Language：真机双版本抓包（社区 fork，2026-10-20）显示它**不按账号域切**，
+	// 而是跟随操作系统区域；中文系统上多数请求不带，显式带上时以 `zh`（billing 层
+	// 固定）与 `zh-CN`（渲染层）为主。网关无系统区域可言，统一取 billing 层实测值 `zh`。
+	// 旧实现完全不发该头，属可区分的缺失特征。
+	req.Header.Set("Accept-Language", "zh")
+	// X-CodeBuddy-Request：官方客户端所有 API 请求必带的风控闸门头
+	// （cli 5.8.4 runIdentityHeaders 之外的另一处，见 injectClientFingerprint）。
+	// chat 路径由 injectClientFingerprint 设置；此处覆盖 billing/refresh/FetchModels
+	// 等不走 chat 的出站路径，保证全量一致。
+	req.Header.Set("X-CodeBuddy-Request", "1")
 	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
 	// injectAccountStableHeaders）。注入在 CommonHeaders 而非 ChatHeaders——hub 在
 	// 所有出站路径的公共 headers() 注入（wb_accounts.py:250-251），本网关同样全覆盖
 	// （chat 经 ChatHeaders 叠加 CommonHeaders 天然继承；billing 域另行注入）。
 	c.injectAccountStableHeaders(req, a)
+	// 身份头族（X-Auth-Method / X-Id-Source / X-Userinfo）：官方 CLI 的
+	// runIdentityHeaders() 在**所有** axios 请求上注入，故放在公共层。
+	c.injectIdentityHeaders(req, a)
+}
+
+// injectIdentityHeaders 注入官方客户端的身份头族（X-Auth-Method / X-Id-Source /
+// X-Userinfo）。
+//
+// 依据（本机 5.8.4 分发包 `cli/dist/codebuddy-lite-wb.mjs` 的 runIdentityHeaders，
+// 可直接复核）：
+//
+//	有 uid           → X-User-Id = uid
+//	有 enterpriseId  → X-Enterprise-Id = enterpriseId
+//	有 auth.method   → X-Auth-Method = method
+//	有 idSource      → X-Id-Source = idSource
+//	有 uid 且 (enterpriseId || idSource || method) →
+//	    X-Userinfo = base64(JSON{uin, owner_uin?, id_source?, token_source?})
+//
+// 关键点是**条件发送**：X-Userinfo 的各段缺哪个就不出现在 JSON 里，而不是写空串；
+// 个人号三维度全缺时三头一个都不发。凭"个人号也该有 X-Userinfo"去补空值反而是
+// 伪造指纹，比不发更容易被识别。
+//
+// X-User-Id / X-Enterprise-Id 已由 ChatHeaders 按 X-No-* 约定处理，此处不重复。
+// idSource 在 auth 文件里没有对应字段（实测 26 个凭证均无），故本网关不产生该头。
+func (c *Client) injectIdentityHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || a.UID == "" {
+		return
+	}
+	method := a.TokenSource()
+	if method != "" {
+		req.Header.Set("X-Auth-Method", method)
+	}
+	enterprise := strings.TrimSpace(a.EnterpriseID)
+	if enterprise == "" && method == "" {
+		return // 个人号且 token 无 token_source：与官方客户端同样三头全不发
+	}
+	payload := map[string]any{"uin": a.UID}
+	if enterprise != "" {
+		payload["owner_uin"] = enterprise
+	}
+	if method != "" {
+		payload["token_source"] = method
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Userinfo", base64.StdEncoding.EncodeToString(raw))
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -409,6 +497,13 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	if d := a.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	}
+	// Accept-Language / X-CodeBuddy-Request / 身份头族：billing 域不走 CommonHeaders，
+	// 需单独注入才能与 chat 路径一致。官方客户端在**所有** axios 请求上带这三样
+	// （Accept-Language 见双版本抓包；X-CodeBuddy-Request 是安全头；
+	// 身份头族见 cli 的 runIdentityHeaders）。
+	req.Header.Set("Accept-Language", "zh")
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	c.injectIdentityHeaders(req, a)
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)
 }

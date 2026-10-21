@@ -162,6 +162,11 @@ func TestClassify(t *testing.T) {
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
+		// 网关 401（APISIX/openresty HTML 页，无业务信封）：token 被判无效 → session dead。
+		// 落 ErrClient 只换号不罚，死号会永远留在池里被反复打（2026-10-17 现场：
+		// 18 个号里 16 个已死，一次请求打空一整排）。
+		{401, `<html><body>401 Unauthorized</body></html>`, ErrSessionDead},
+		{401, ``, ErrSessionDead},
 		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},

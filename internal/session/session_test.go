@@ -143,6 +143,42 @@ func TestExtractKeyPriority(t *testing.T) {
 	}
 }
 
+// TestConversationIDNeverUsesUserID 出站 X-Conversation-ID 的取值契约：
+// metadata.user_id 是「用户」维度，绝不能当会话 ID（否则同一用户的所有会话在
+// 上游看到同一个 conversation id，会话维度指纹异常）。ExtractKey 允许它，
+// ConversationID 必须不认。
+func TestConversationIDNeverUsesUserID(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string // 空表示「不该从 user_id 取到值」；具体派生键另断言非空
+	}{
+		{"metadata.user_id only", `{"metadata":{"user_id":"mu"}}`, ""},
+		{"top-level user_id only", `{"user_id":"mu"}`, ""},
+		{"metadata.conversation_id", `{"metadata":{"conversation_id":"mc","user_id":"mu"}}`, "mc"},
+		{"metadata.conversationId", `{"metadata":{"conversationId":"camel","user_id":"mu"}}`, "camel"},
+		{"top-level conversation_id", `{"conversation_id":"top","user_id":"mu"}`, "top"},
+		{"prompt_cache_key", `{"prompt_cache_key":"pck"}`, "pck"},
+		{"bad json", `not-json`, ""},
+		{"empty", ``, ""},
+	}
+	for _, c := range cases {
+		if got := ConversationID([]byte(c.body)); got != c.want {
+			t.Errorf("%s: ConversationID(%s)=%q want %q", c.name, c.body, got, c.want)
+		}
+	}
+	// 无显式会话 id 时按 system+首条 user 派生：同一对话稳定、不同对话不同。
+	a := ConversationID([]byte(`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`))
+	b := ConversationID([]byte(`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`))
+	c := ConversationID([]byte(`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"other"}]}`))
+	if a == "" || a != b {
+		t.Errorf("derived key not stable: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Errorf("different conversations share derived key: %q", a)
+	}
+}
+
 func TestConcurrentSameKeyAssignsOnce(t *testing.T) {
 	avail := []string{"a1", "a2", "a3", "a4", "a5"}
 	r := routerWith(newCountingStore(), avail, time.Minute)

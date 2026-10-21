@@ -402,3 +402,18 @@ func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
 }
+
+// TestDSHIdentityTokenRewritten DSH（@deepseek-ai/dsh-system-prompt）注入的
+// harness:identity 段里带 "DeepSeek Harness"，上游按「非官方渠道」整单拦截
+// （400 Illegal API invocation from an unapproved channel）。品牌词必须被改写，
+// 且同一词在长正文里出现多次时全部替换。
+func TestDSHIdentityTokenRewritten(t *testing.T) {
+	in := "harness:identity\nYou are running under DeepSeek Harness. DeepSeek Harness injects this."
+	out := sanitizeText(in)
+	if strings.Contains(out, "DeepSeek Harness") {
+		t.Errorf("DSH identity token not rewritten: %q", out)
+	}
+	if !strings.Contains(out, "DeepSeekRuntime") {
+		t.Errorf("replacement token missing: %q", out)
+	}
+}

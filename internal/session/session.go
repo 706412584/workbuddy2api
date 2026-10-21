@@ -10,8 +10,11 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -333,6 +336,139 @@ func ExtractKey(body []byte) string {
 		return v
 	}
 	return strOrEmpty(obj["conversationId"])
+}
+
+// ConversationID 提取用于出站 X-Conversation-ID 的**对话标识**（不是粘性键）。
+//
+// 与 ExtractKey 的分工：
+//   - ExtractKey 是**粘性路由键**，metadata.user_id 也算（user 维度足以钉住账号）；
+//   - 本函数是**上游会话指纹**，metadata.user_id 绝不能用 —— 那是"同一个用户"，
+//     不是"同一次对话"。Claude Code 只带 metadata.user_id 时，若把它当会话 ID，
+//     该用户的所有会话在上游看到同一个 conversation id，会话维度指纹立刻异常。
+//
+// 优先级：
+//  1. metadata.conversation_id / metadata.conversationId
+//  2. 顶层 conversation_id / conversationId
+//  3. prompt_cache_key（语义就是"同一会话复用同一前缀"）
+//  4. 由 system + 首条 user 内容派生的稳定键（deriveKey）
+//  5. 都取不到 → 空串，由调用方（upstream.ChatHeaders）现场生成 UUID
+//
+// 与 ExtractKey 的另一处差异：派生回退**不设 user_id 闸**。ExtractKey 对带 user_id
+// 的请求返回空串，是为了"不把 user 钉到某个账号"；而会话 ID 必须每对话稳定，
+// 否则上游看到的是每次随机的会话。
+func ConversationID(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["conversation_id"]); v != "" {
+			return v
+		}
+		if v := strOrEmpty(meta["conversationId"]); v != "" {
+			return v
+		}
+	}
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	return DeriveCacheKey(body)
+}
+
+// DeriveCacheKey 从消息内容派生稳定会话键（SHA-256(system 文本 + 首条 user 内容)）。
+//
+// 与 ExtractKey 的派生回退同源，但**不设 user_id 闸**：ExtractKey 对带 user_id 的
+// 请求返回空串是「不把 user 钉到某个账号」的契约，而 prompt_cache_key 的会话段
+// 与账号绑定是两件事 —— 空串会让缓存键退化成「每账号一个常量槽」，
+// 同一账号上所有对话互相覆盖前缀缓存，交错对话时每次切换都是大前缀全 miss。
+//
+// 取不到用户文本（纯图片等）时返回空串：调用方据此退化为无会话段（安全降级）。
+func DeriveCacheKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	return deriveKey(obj)
+}
+
+// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+//
+// 为什么用「system + 首条 user」而不是全部消息：
+//   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
+//   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
+//   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
+//
+// 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
+func deriveKey(obj map[string]any) string {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return ""
+	}
+	systemText, firstUserText := "", ""
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		text := messageText(msg["content"])
+		switch strOrEmpty(msg["role"]) {
+		case "system", "developer":
+			if systemText == "" {
+				systemText = text
+			}
+		case "user":
+			if firstUserText == "" {
+				firstUserText = text
+			}
+		}
+		if firstUserText != "" && systemText != "" {
+			break // 都已拿到：停止遍历长历史
+		}
+	}
+	if firstUserText == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
+// 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
+const derivedKeyPrefix = "d-"
+
+// messageText 把消息 content 归一为纯文本（兼容字符串与多段数组）。
+// 非文本 part（图片等）以空串占位：同一张图的多轮对话仍由 system/文本区分。
+func messageText(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, part := range c {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := pm["text"].(string); t != "" {
+				b.WriteString(t)
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。

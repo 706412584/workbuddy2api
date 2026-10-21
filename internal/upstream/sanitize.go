@@ -21,6 +21,7 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
 	"11128",                      // 上游反探测：裸数字错误码
+	"DeepSeek Harness",           // DSH identity token: upstream treats it as an unapproved channel
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -83,6 +84,15 @@ var sanitizeRewrites = [][2]string{
 		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
 		"11128",
 		"11-128",
+	},
+	{
+		// DSH (DeepSeek Harness) injects a harness:identity sentence that upstream treats
+		// as an unapproved channel and blocks the whole request (400, unapproved channel).
+		// Replacing the brand token keeps the meaning (same runtime) while dropping the
+		// exact-match fingerprint. Global phrase replace, not prefix-only: the token can
+		// repeat inside long prompts.
+		"DeepSeek Harness",
+		"DeepSeekRuntime",
 	},
 }
 

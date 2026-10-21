@@ -15,6 +15,7 @@ import (
 
 	"workbuddy2api/internal/apicompat"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -106,6 +107,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request, key 
 		ctx:            r.Context(),
 		pickPred:       h.keyPickPred(key, allowedRegions),
 		sessKey:        h.sessionKey(body),
+		convID:         session.ConversationID(body),
 		key:            key,
 		st:             st,
 		allowedRegions: allowedRegions,

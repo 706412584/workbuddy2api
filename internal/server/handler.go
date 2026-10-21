@@ -762,6 +762,10 @@ type forwardOpt struct {
 	pickPred func(*auth.Auth) bool
 	// sessKey 会话键（取自客户端原始请求体，未加区域前缀）；空 = 不走粘性。
 	sessKey string
+	// convID 出站 X-Conversation-ID 用的**对话标识**（session.ConversationID）：
+	// 与 sessKey 分开是因为后者允许 metadata.user_id（用户维度），而会话头必须是
+	// 对话维度。空 = 由 upstream.ChatHeaders 现场生成 UUID。
+	convID string
 	// key 本次请求命中的密钥；用于给会话键加区域前缀（nil = 未鉴权）。
 	key *APIKeySpec
 	// st 请求级统计；成功与失败都会写入 uid/status，由调用方负责收尾输出。
@@ -947,7 +951,13 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 连续计数语义（与 scheduler 的 keepalive/checkin 一致）：12153 会被
+					// 临时触发（网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用会
+					// 误杀健康号（P0-1：13 个 disabled 号 refresh 全部成功）。
+					if h.cfg.Pool.NoteSessionDead(acct.UID) {
+						log.Printf("WARN: [server] chat refresh uid=%s: 连续 %d 次 12153 session dead — 禁用",
+							logfmt.UID8(acct.UID), pool.SessionDeadThreshold())
+					}
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -964,11 +974,12 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		// 不读写共享字段——并发请求各自携带独立 IP，互不串扰（issue：ClientIP 竞态）。
 		//
 		// convID：上游 2026-10-16 起强制要求 X-Conversation-ID 三头（见
-		// upstream.injectConversationHeaders）。这里把**会话键**（o.sessKey，取自客户端
-		// 请求体）作为 conversation id 传下去 —— 同一会话在上游看到稳定 ID，
-		// 对上游的会话维度风控与前缀缓存都更接近真实客户端行为。
-		// 无会话键（客户端未带 conversation_id）时传空，由 ChatHeaders 生成随机 UUID。
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, o.clientIP, o.sessKey)
+		// upstream.injectConversationHeaders）。这里用**对话标识**（session.ConversationID）
+		// 而不是粘性键 o.sessKey —— 后者会把 metadata.user_id 也算进去（那是"同一个
+		// 用户"，不是"同一次对话"），Claude Code 只带 user_id 时所有会话会在上游
+		// 看到同一个 conversation id，会话维度指纹立刻异常。
+		// 无对话标识（纯图片轮等）时传空，由 ChatHeaders 生成随机 UUID。
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, o.clientIP, o.convID)
 		if terr != nil {
 			// 传输层错误：网络抖动，或**该账号绑定的出口代理不可达**。
 			//
@@ -1347,6 +1358,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 		ctx:            r.Context(),
 		pickPred:       pickPred,
 		sessKey:        h.sessionKey(body),
+		convID:         session.ConversationID(body),
 		key:            key,
 		st:             st,
 		allowedRegions: allowedRegions,
@@ -1407,7 +1419,8 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     CooldownSoftForModel（until=重置墙钟，封顶 soft_rate_max）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s, model)：短冷却防雪崩，
 //     不随 soft_rate 退避。
-//   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrSessionDead → NoteSessionDead：连续 sessionDeadThreshold 次才 Disable（需人工重登）。
+//     单次 12153 / 网关 401 可能来自网络抖动或上游闪断，一次即杀号会误杀健康账号。
 //   - ErrSafetyBanned → CooldownSafetyBanned(restrictedCooldown 固定 24h)：账号级**风控**
 //     封控（旧称"内容安全"，2026-10-20 起上游文案已全量变为"账号存在异常行为"）。
 //     **不 Disable**——该形态有自愈可能（官方口径 1-3 工作日），长冷却给自愈出口，
@@ -1457,7 +1470,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 连续触发时 pool 内部按该模型的 streak 指数退避并封顶 soft_rate_max。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit", model)
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 连续计数语义（与 scheduler 一致，见 pool.NoteSessionDead）：单次 12153 只记一笔，
+		// 连续 sessionDeadThreshold 次才禁用。12153 与「网关 401 无业务信封」
+		// （IsGatewayUnauthorized）都归到这里，两者的共同语义是 session 已死、只能重登。
+		if h.cfg.Pool.NoteSessionDead(uid) {
+			log.Printf("WARN: [server] uid=%s: 连续 %d 次 session dead — 禁用",
+				logfmt.UID8(uid), pool.SessionDeadThreshold())
+		}
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封的拦截形态）：**模型级**软冷却，**不 Disable**——WAF 403
 		// 是 IP/指纹维频控信号（被拦后账号本身仍健康），罚过即走、到期自愈。

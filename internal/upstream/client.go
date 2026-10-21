@@ -410,6 +410,19 @@ func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
 }
 
+// IsGatewayUnauthorized 报告 401 响应是否为「网关层拒绝」形态（无业务信封）。
+//
+// 生产实测形态：APISIX/openresty 返回 HTML 错误页（或空体），而非上游业务信封。
+// 语义是 token 被上游判无效 —— 同 token 在 /v3/config 仍 200、在 /v2/* 全 401，
+// refresh 回 invalid_grant，即 session 已被作废，只能重登。
+//
+// 不显式分流的代价：落 ErrClient 兜底 = 只换号不罚，死号永远留在池里，每个请求
+// 都再打一遍、日志里刷一串 401（2026-10-17 现场：18 个号里 16 个已死，一次请求
+// 打空一整排）。归 ErrSessionDead 后走连续计数，与 12153 同一条处置链。
+func IsGatewayUnauthorized(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
+}
+
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
 // retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset
 // （epoch 秒或毫秒，取 now+ 剩余量）。大小写不敏感（http.Header.Get 已归一）。
@@ -639,6 +652,12 @@ func Classify(status int, body string) ErrKind {
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
 	}
+	// 网关 401（APISIX/openresty HTML 页，无业务信封）：token 被上游判无效。
+	// 不显式分流会落 ErrClient（只换号不罚），死号留在池里反复被选中——见
+	// IsGatewayUnauthorized 的注释。
+	if IsGatewayUnauthorized(status, body) {
+		return ErrSessionDead
+	}
 	// 账号级内容安全封控（403 + 11140 + request illegal）：判在内容策略之前——
 	// 二者都含「审核」语义但方向相反，且 contentBlockedMarkers 并不匹配本形态，
 	// 不显式分流就会一路落进 ErrClient 兜底（只换号不罚），死号留在池中被反复选中。
@@ -856,16 +875,22 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+//
 // 末尾注入 prompt_cache_key（P0 费用优化）：按账号隔离的稳定缓存键，让同一客户端
-// 对同一账号的连续请求命中上游前缀缓存。会话段从 body 自带的 conversation_id /
-// conversationId 取（本地未解析 X-Conversation-ID 头，故只走 body 源）。
-func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
+// 对同一账号的连续请求命中上游前缀缓存。
+//
+// 会话段来源（InjectPromptCacheKey 内部优先级）：body 自带的 conversation_id /
+// conversationId > 入站 convID 参数。**必须把 convID 传下去**：此前恒传空串，
+// 于是 body 不带 conversation_id 的客户端（Claude Code / Codex）全部退化成
+// `buildCacheKey(uid, "")` —— 同一账号上所有对话共用一个常量缓存槽，
+// 交错对话时每个切换点都是大前缀全 miss。
+func (c *Client) prepareBody(a *auth.Auth, body []byte, convID string) []byte {
 	body = PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(a))
 	uid := ""
 	if a != nil {
 		uid = a.UID
 	}
-	return InjectPromptCacheKey(body, uid, "")
+	return InjectPromptCacheKey(body, uid, convID)
 }
 
 // effortsSnapshot 返回该账号所在区域的 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1015,7 +1040,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP, convID string) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(a, body)))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(a, body, convID)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
