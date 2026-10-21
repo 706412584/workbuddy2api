@@ -9,6 +9,7 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -164,6 +165,11 @@ func (h *Handler) saveProxySlots(w http.ResponseWriter, r *http.Request) {
 	ok(w, nil)
 }
 
+// probeURL 探测目标。选 generate_204：全球可达、成功必回 204、响应体为空（省流量）。
+// 状态码即判据——204 表示经该出口真的访问到了目标；502/503 是 mihomo 在
+// 「上游节点连不上」时本地返回的失败信号。
+const probeURL = "http://www.gstatic.com/generate_204"
+
 // testProxy POST /__admin/proxy/test —— 探测某个代理是否可用。
 //
 // 用「经该代理访问一个必然可达的地址」判定：只做 TCP+HTTP 连通性，
@@ -216,7 +222,7 @@ func (h *Handler) testProxy(w http.ResponseWriter, r *http.Request) {
 			ForceAttemptHTTP2: false,
 		},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://www.gstatic.com/generate_204", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "构造探测请求失败：%v", err)
 		return
@@ -231,9 +237,30 @@ func (h *Handler) testProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Body.Close()
+	elapsed := time.Since(reqStart).Milliseconds()
+
+	// 第三步（关键）：**必须检查状态码**，不能只看 err。
+	//
+	// 回归背景（2026-10-21 面板实测）：本函数原先只判 err != nil，于是任何 HTTP
+	// 响应都算「可用」—— 探测目标是 generate_204（成功应为 204），但经故障出口时
+	// 会拿到 502，面板却显示「✓ 可用（… HTTP 502）」，把坏出口标成好出口。
+	//
+	// 为什么 502 是出口故障而非目标站问题：mihomo 在「上游节点连不上」时会在本地
+	// 直接回 502/503，不返回 HTML —— 这是 mihomo 侧的失败信号（可按需按类型放宽
+	// 或收紧）。故 >=400 一律判失败，并把状态码与耗时一并回报，便于区分
+	// 「出口全断」与「目标站抽风」。
+	if resp.StatusCode >= 400 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "stage": "request", "dialMs": dialMs,
+			"elapsedMs": elapsed, "status": resp.StatusCode,
+			"error": fmt.Sprintf("出口返回 HTTP %d（经该出口访问 %s 未成功，期望 204）"+
+				"；常见原因是节点不可用或已失效", resp.StatusCode, probeURL),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "stage": "ok", "dialMs": dialMs,
-		"elapsedMs": time.Since(reqStart).Milliseconds(),
+		"elapsedMs": elapsed,
 		"status":    resp.StatusCode,
 	})
 }

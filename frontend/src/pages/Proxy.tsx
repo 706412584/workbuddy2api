@@ -258,12 +258,23 @@ export function Proxy({ onChanged }: Props) {
     if (!s.url.trim()) return { ok: false, text: '请先填代理地址' }
     try {
       const r = await testProxy(s.url)
-      return r.ok
-        ? { ok: true, text: `✓ 可用（连接 ${r.dialMs ?? 0}ms + 请求 ${r.elapsedMs ?? 0}ms，HTTP ${r.status}）` }
-        : {
-            ok: false,
-            text: `✗ ${r.stage === 'dial' ? '连不上代理主机' : '代理可达但转发失败'}：${r.error ?? '未知错误'}`,
-          }
+      if (r.ok) {
+        return {
+          ok: true,
+          text: `✓ 可用（连接 ${r.dialMs ?? 0}ms + 请求 ${r.elapsedMs ?? 0}ms，HTTP ${r.status}）`,
+        }
+      }
+      // 区分三档，避免把「出口故障」错读成「目标站问题」：
+      //   dial    → 连不到代理端口（代理没起来 / 端口写错）
+      //   request 且带 status → 出口能连但返回 4xx/5xx（节点失效，mihomo 本地回 502/503）
+      //   request 无 status   → 传输层失败（超时、TLS、被重置）
+      const label =
+        r.stage === 'dial'
+          ? '连不上代理主机'
+          : r.status
+            ? `出口不可用（HTTP ${r.status}）`
+            : '代理可达但转发失败'
+      return { ok: false, text: `✗ ${label}：${r.error ?? '未知错误'}` }
     } catch (e) {
       return { ok: false, text: String(e) }
     }
