@@ -58,6 +58,9 @@ type Config struct {
 	// ResetProxyTransports 清空代理连接池缓存（代理槽位变更后调用）。
 	// nil = 不清（测试场景）。
 	ResetProxyTransports func()
+	// ProxyHealth 按槽位原始 URL 查出口健康（未记账返回 false）。
+	// nil = 不展示健康信息（测试场景）。
+	ProxyHealth func(rawURL string) (ProxyHealthInfo, bool)
 	// Sidecar mihomo sidecar 的编排接口（订阅 → 出口端口 → 槽位 → 账号绑定）。
 	// nil = 未启用/未接线；相关端点返回明确错误而非静默无操作。
 	Sidecar SidecarController

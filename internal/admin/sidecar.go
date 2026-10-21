@@ -31,6 +31,15 @@ type SidecarController interface {
 	AccountUIDs() []string
 }
 
+// ProxyHealthInfo 一个出口代理的健康快照（与 upstream.ProxyHealthSnapshot 同形，
+// 独立声明以免 admin 依赖 upstream 的其它部分）。
+type ProxyHealthInfo struct {
+	Unhealthy  bool   `json:"unhealthy"`
+	Fails      int    `json:"fails"`
+	LastErr    string `json:"last_error"`
+	CooldownMs int64  `json:"cooldown_ms"`
+}
+
 // SidecarStatus 状态快照（与 cmd/server 的同名字段对齐；此处独立声明以免 admin
 // 反向依赖 cmd/server）。
 type SidecarStatus struct {

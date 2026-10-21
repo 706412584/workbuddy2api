@@ -183,6 +183,32 @@ func (c *Client) proxyForAccount(a *auth.Auth) string {
 	return strings.TrimSpace(fn(a))
 }
 
+// ProxyForAccount 导出该账号生效的代理 URL（空 = 直连）。
+//
+// 供 server 层做两件事（见 proxyhealth.go）：
+//   - 选号时排除「走已判定不健康槽位」的账号（避免轮换反复撞同一个死代理）；
+//   - 传输层失败时把结果记到该代理的账上（而不是罚账号）。
+func (c *Client) ProxyForAccount(a *auth.Auth) string {
+	return c.proxyForAccount(a)
+}
+
+// NoteProxyOutcome 记一次「经该账号代理出站」的结果，并在连续失败达阈值时
+// 主动探测确认。返回该代理是否被判定为不健康。
+//
+// 由 server 的轮换循环在传输层失败/成功时调用 —— 只处理「配了代理」的账号，
+// 直连账号零开销（proxyForAccount 返回空即短路）。
+func (c *Client) NoteProxyOutcome(a *auth.Auth, success bool, errMsg string) bool {
+	url := c.proxyForAccount(a)
+	if url == "" {
+		return false // 直连：不记账
+	}
+	NoteProxyResult(url, success, errMsg)
+	if success {
+		return false
+	}
+	return MaybeProbeProxy(url)
+}
+
 // clientFor 返回该账号本次出站应使用的 http.Client（代理优先，回落共享 client）。
 //
 // fallback 为直连时使用的共享 client（c.HTTP 或 c.ChatHTTP）——保持既有语义：

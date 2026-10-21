@@ -34,6 +34,12 @@ type proxySlotView struct {
 	proxyreg.Slot
 	// Usage 有多少账号绑定了本槽位（界面显示「N 个账号在用」）。
 	Usage int `json:"usage"`
+	// 出口健康（按代理 URL 记账，见 upstream.ProxyHealth）。
+	// Healthy 为 false 时选号会排除绑定本槽位的账号（轮换改用别的出口）。
+	Healthy    bool   `json:"healthy"`
+	FailCount  int    `json:"fail_count"`
+	LastErr    string `json:"last_error,omitempty"`
+	CooldownMs int64  `json:"cooldown_ms,omitempty"`
 }
 
 // getProxySlots GET /__admin/proxy/slots —— 列出槽位与绑定概览。
@@ -46,7 +52,18 @@ func (h *Handler) getProxySlots(w http.ResponseWriter, r *http.Request) {
 	usage := h.cfg.Registry.UsageCount()
 	views := make([]proxySlotView, 0, len(slots))
 	for _, s := range slots {
-		views = append(views, proxySlotView{Slot: s, Usage: usage[s.ID]})
+		// 健康按**槽位 URL 原文**查（与 upstream 记账用的键一致 —— 它用
+		// proxyForAccount 的返回值，即 Registry.Resolve 给出的原始 URL）。
+		v := proxySlotView{Slot: s, Usage: usage[s.ID], Healthy: true}
+		if h.cfg.ProxyHealth != nil {
+			if hp, ok := h.cfg.ProxyHealth(s.URL); ok {
+				v.Healthy = !hp.Unhealthy
+				v.FailCount = hp.Fails
+				v.LastErr = hp.LastErr
+				v.CooldownMs = hp.CooldownMs
+			}
+		}
+		views = append(views, v)
 	}
 	// 失效绑定：绑定指向了不存在的槽位（槽位被删但绑定还在）。
 	binds := h.cfg.Registry.Binds()

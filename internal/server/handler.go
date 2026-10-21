@@ -520,6 +520,28 @@ func regionAllowed(allowed []auth.Region) func(*auth.Auth) bool {
 	return func(a *auth.Auth) bool { return set[a.Region()] }
 }
 
+// pickPredWithHealthyProxy 在既有谓词上叠加「排除走已判定不健康出口代理的账号」。
+//
+// 为什么需要（2026-10-21）：换号不等于换出口。一个代理槽位可能被多个账号共用
+// （实测一个 sidecar 槽位挂 4 个号），若只换号不换槽位，轮换会把它们逐个试一遍、
+// 全撞同一个死代理，白耗 MaxRotate 名额且注定失败。叠加这层过滤后，轮换实际会
+// 落到**别的槽位**上的账号，即「轮换到正可用的出口」。
+//
+// 直连账号（无代理）恒为可用 —— ProxyForAccount 返回空时视为健康，不受影响。
+// pred 为 nil 时只保留本层（不因此返回 nil，否则等于没过滤）。
+func (h *Handler) pickPredWithHealthyProxy(pred func(*auth.Auth) bool) func(*auth.Auth) bool {
+	up := h.cfg.Upstream
+	if up == nil {
+		return pred
+	}
+	return func(a *auth.Auth) bool {
+		if pred != nil && !pred(a) {
+			return false
+		}
+		return !upstream.ProxyUnhealthy(up.ProxyForAccount(a))
+	}
+}
+
 // modelsSlot 单区域的动态模型缓存。
 type modelsSlot struct {
 	ids      []upstream.ModelInfo
@@ -891,7 +913,7 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcludingForModelWhere(tried, o.model, o.pickPred)
+			acct = h.cfg.Pool.PickExcludingForModelWhere(tried, o.model, h.pickPredWithHealthyProxy(o.pickPred))
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -940,16 +962,33 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		// 无会话键（客户端未带 conversation_id）时传空，由 ChatHeaders 生成随机 UUID。
 		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, o.clientIP, o.sessKey)
 		if terr != nil {
-			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
-			// 上游 client 已打 transport error 日志。
+			// 传输层错误：网络抖动，或**该账号绑定的出口代理不可达**。
+			//
+			// 账号侧处置：只换号、**不罚账号**（原实现调了 fail(acct.UID)，已去掉）。
+			// 理由：代理是基础设施，账号本身健康；而一个槽位可能被多个账号共用
+			// （实测一个 sidecar 槽位挂 4 个号），罚账号会把绑同一死槽位的号
+			// 逐个打进冷却 —— 与 ErrServer 分支注释里警告过的「上游一次故障
+			// 把健康号逐批熔断」是同一类恶性循环。
+			//
+			// 代理侧处置：把结果记到该代理账上；连续失败达阈值会主动 TCP 探测，
+			// 确认端口真不可达则标记不健康（见 upstream.NoteProxyOutcome）。
+			// 下一轮选号会排除「走坏槽位」的账号，从而**换到别的出口**而不是
+			// 在同一个死代理上继续轮号。
+			proxyDown := h.cfg.Upstream.NoteProxyOutcome(acct, false, terr.Error())
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			fail(acct.UID)
+			if proxyDown {
+				log.Printf("WARN: [server] 出口代理不可达，标记不健康并排除其绑定账号：%v", terr)
+			}
+			// 换号退避后继续；下一轮的 pickPred 已带上「排除坏槽位」，
+			// 若全池都在坏槽位上则下一轮选不到号、自然收敛为 503。
 			if !rotateBackoff(i, ctx) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
 			}
 			continue
 		}
+		// 出站成功：清该代理的失败计数（代理自愈最可靠的信号）。
+		h.cfg.Upstream.NoteProxyOutcome(acct, true, "")
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))

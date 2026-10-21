@@ -282,6 +282,14 @@ func main() {
 		},
 		Registry:             proxyRegistry,
 		ResetProxyTransports: upstream.ResetProxyTransportCache,
+		// 出口健康查询（槽位列表显示「该出口是否可用 / 失败次数 / 冷却剩余」）。
+		ProxyHealth: func(rawURL string) (admin.ProxyHealthInfo, bool) {
+			hp, ok := upstream.ProxyHealthByURL(rawURL)
+			return admin.ProxyHealthInfo{
+				Unhealthy: hp.Unhealthy, Fails: hp.Fails,
+				LastErr: hp.LastErr, CooldownMs: hp.CooldownMs,
+			}, ok
+		},
 		// mihomo sidecar 端点（状态/同步/分配）；未启用时为 nil → 端点返回未接线。
 		Sidecar: sidecarController(sidecar, p),
 		ModelsByRegion: func() (cn, global []string) {
