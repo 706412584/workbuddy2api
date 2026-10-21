@@ -79,21 +79,23 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
 		}
 	}
-	// X-IDE-Version 缺省（client_version 空）= 内置默认 5.5.4，且四头齐全。
+	// X-IDE-Version 缺省（client_version 空）= 内置默认 5.8.4，且四头齐全。
 	c2 := &Client{ClientName: "WorkBuddy"}
 	h2 := chatHeadersReq(t, c2, a, "")
-	if got := h2.Get("X-IDE-Version"); got != "5.5.4" {
-		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.5.4")
+	if got := h2.Get("X-IDE-Version"); got != "5.8.4" {
+		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.8.4")
 	}
-	// ClientName 空时 X-IDE-Version 不设（保持旧行为：只有 X-Product=SaaS）。
+	// ClientName 空时 X-IDE-Version 仍为内置默认——2026-10-21 起 IDE 头无条件发送
+	// （对齐官方 applyGatewayHeaders 的常量组），不再随 client_name 开关。
 	c3 := &Client{}
 	h3 := chatHeadersReq(t, c3, a, "")
-	if got := h3.Get("X-IDE-Version"); got != "" {
-		t.Errorf("X-IDE-Version = %q want empty (client_name unset)", got)
+	if got := h3.Get("X-IDE-Version"); got != "5.8.4" {
+		t.Errorf("X-IDE-Version = %q want %q (unconditional)", got, "5.8.4")
 	}
 }
 
-// TestProductDefaultSaaS ClientName 空（缺省）时 X-Product=SaaS 且不设 X-IDE-*（旧行为）。
+// TestProductDefaultSaaS ClientName 空（缺省）时 X-Product=SaaS，
+// 但 X-IDE-* / X-Agent-Purpose 仍然发送（2026-10-21 起对齐官方常量组，无条件注入）。
 func TestProductDefaultSaaS(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{} // ClientName 空
@@ -101,10 +103,14 @@ func TestProductDefaultSaaS(t *testing.T) {
 	if got := h.Get("X-Product"); got != "SaaS" {
 		t.Errorf("X-Product = %q want %q", got, "SaaS")
 	}
-	// X-IDE-Name/Type 不应被设置。
-	for _, hdr := range []string{"X-IDE-Name", "X-IDE-Type", "X-Agent-Purpose"} {
-		if got := h.Get(hdr); got != "" {
-			t.Errorf("%s = %q want empty (not set in SaaS default)", hdr, got)
+	// 官方客户端无条件带这三头，缺任何一个都是可区分的特征差异。
+	for _, tc := range []struct{ hdr, want string }{
+		{"X-IDE-Name", "WorkBuddy"},
+		{"X-IDE-Type", "WorkBuddy"},
+		{"X-Agent-Purpose", "conversation"},
+	} {
+		if got := h.Get(tc.hdr); got != tc.want {
+			t.Errorf("%s = %q want %q (unconditional)", tc.hdr, got, tc.want)
 		}
 	}
 }
@@ -240,6 +246,74 @@ func TestExtractClientIP(t *testing.T) {
 				t.Errorf("ExtractClientIP = %q want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 客户端指纹头（官方 CLI 对所有出站请求无条件注入，2026-10-21 补齐）
+// ---------------------------------------------------------------------------
+
+// TestClientFingerprintHeadersPresent 官方客户端无条件发送的一批头必须齐全。
+//
+// 回归背景：2026-10-20 起上游按账号灰度返回 403 code=11140 "request illegal"
+// （displayMsg「账号存在异常行为，已被限制使用」）。排查证实是**账号级**封控
+// （同套请求头下健康账号 200、被封账号 403；换出口 IP 与换 UA 版本号均无效），
+// 但对照客户端 5.8.4 发现我们缺了一整批 CLI 统一拦截器注入的头——
+// 这是"请求不像官方客户端"最明显的缺口，故补齐作预防（见 injectClientFingerprint）。
+func TestClientFingerprintHeadersPresent(t *testing.T) {
+	c := &Client{}
+	a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+	req, _ := http.NewRequest("POST", "https://example.com/v2/chat/completions", nil)
+	c.ChatHeaders(req, a, "", "")
+
+	for _, tc := range []struct{ hdr, want string }{
+		{"x-codebuddy-request", "1"},
+		{"X-Agent-Intent", "craft"},
+		{"X-Agent-Type", "main"},
+		{"X-Private-Data", "true"},
+		{"X-Tenant-Id", "ent-1"},
+	} {
+		if got := req.Header.Get(tc.hdr); got != tc.want {
+			t.Errorf("%s = %q want %q", tc.hdr, got, tc.want)
+		}
+	}
+	// X-Request-ID：官方是 UUID 去掉连字符（32 hex）。
+	if got := req.Header.Get("X-Request-ID"); len(got) != 32 {
+		t.Errorf("X-Request-ID = %q want 32 hex chars", got)
+	}
+	// 链路追踪头：traceparent / b3 / X-B3-* / X-Trace-ID 齐全且 traceId 一致。
+	tid := req.Header.Get("X-Trace-ID")
+	if len(tid) != 32 {
+		t.Fatalf("X-Trace-ID = %q want 32 hex chars", tid)
+	}
+	sid := req.Header.Get("X-B3-SpanId")
+	if len(sid) != 16 {
+		t.Errorf("X-B3-SpanId = %q want 16 hex chars", sid)
+	}
+	for _, tc := range []struct{ hdr, want string }{
+		{"traceparent", "00-" + tid + "-" + sid + "-01"},
+		{"b3", tid + "-" + sid + "-1"},
+		{"X-B3-TraceId", tid},
+		{"X-B3-Sampled", "1"},
+	} {
+		if got := req.Header.Get(tc.hdr); got != tc.want {
+			t.Errorf("%s = %q want %q", tc.hdr, got, tc.want)
+		}
+	}
+}
+
+// TestTraceHeadersVaryPerRequest 追踪头表达"本次请求"，两次请求不应相同。
+func TestTraceHeadersVaryPerRequest(t *testing.T) {
+	c := &Client{}
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	tids := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		req, _ := http.NewRequest("POST", "https://example.com/v2/chat/completions", nil)
+		c.ChatHeaders(req, a, "", "")
+		tids[req.Header.Get("X-Trace-ID")] = true
+	}
+	if len(tids) != 5 {
+		t.Errorf("5 次请求产生 %d 个不同 traceId，期望 5（不应复用）", len(tids))
 	}
 }
 

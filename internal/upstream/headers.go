@@ -16,13 +16,18 @@ import (
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
 	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
-	// （WORKBUDDY_CLIENT_VERSION = 桌面端 package.json version，5.5.4 分发包即 5.5.4）。
+	// （resources/install-manifest.json 的 appVersion，以及 app.asar 内
+	// package.json 的 version；2026-10-15 分发包 = 5.8.4）。
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.5.4"
+	//
+	// 版本滞后本身不是封禁判据（2026-10-21 实测：同账号分别用 5.5.4 与 5.8.4 的 UA
+	// 请求，200/403 结果完全一致），但对齐当前分发包可减少"旧客户端"归因面。
+	defaultClientVersion = "5.8.4"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
-	// （cli/package.json version = 2.137.1 → resolveBundledCliUserAgent()）。
+	// （同分发包 app.asar.unpacked/cli/dist/*.mjs 内嵌 package.json 的
+	// publishConfig.customPackage.version = 2.161.0）。
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.137.1"
+	defaultCliVersion = "2.161.0"
 
 	originRefererCN   = "https://www.codebuddy.cn"
 	originRefererGlob = "https://www.workbuddy.ai"
@@ -175,9 +180,15 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP, convID s
 	}
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		// X-Tenant-Id：官方 CLI 恒与 X-Enterprise-Id 成对发（axiosToFetchAdapter 与
+		// /main/server.js 的 buildVlmGatewayHeaders 均如此），企业身份的两个同义头。
+		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
+	// X-Private-Data：官方 YN 常量组的常开项（applyGatewayHeaders 无条件套用，
+	// 仅自定义模型请求会删掉），表达"允许把私有代码上下文发给模型"。
+	req.Header.Set("X-Private-Data", "true")
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
 	if d := a.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
@@ -189,6 +200,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP, convID s
 	// 默认（ClientName 空）保持 X-Product="SaaS" 兼容现状，不设 X-IDE-*（不突变归因）；
 	// 配 ClientName（如 "WorkBuddy"）则四头跟随该值，对齐官方桌面端。
 	c.injectAttribution(req)
+	// 客户端指纹头：官方 CLI 对**所有**出站请求无条件注入的一批头
+	// （x-codebuddy-request / X-Agent-Intent / trace 家族等，见 injectClientFingerprint）。
+	// 我们此前完全不发这批头，是"请求不像官方客户端"最明显的缺口。
+	c.injectClientFingerprint(req)
 	// 会话三头：上游 2026-10-16 起强制校验（见 injectConversationHeaders）。
 	c.injectConversationHeaders(req, convID)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
@@ -196,6 +211,72 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP, convID s
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)
+}
+
+// injectClientFingerprint 注入官方 WorkBuddy CLI 对所有出站请求无条件携带的
+// 「客户端指纹」头组。
+//
+// 来源（2026-10-21 从客户端 5.8.4 分发包逆向，两处独立证据）：
+//
+//  1. app.asar 内 /main/server.js 的 applyGatewayHeaders()（VLM 网关路径）：
+//     x-codebuddy-request=1 / X-Agent-Intent=craft / acp-connection-id /
+//     X-Request-ID / traceparent + b3 + X-B3-* + X-Trace-ID。
+//  2. app.asar.unpacked/cli/dist/*.mjs 的 axiosToFetchAdapter()（CLI 对
+//     **每一个** axios 请求的拦截器，即 chat 主路径）：
+//     X-Agent-Intent=craft（或 session meta 的 codebuddy.ai/mode）、
+//     X-Agent-Type=main|subagent|team|auxiliary|compaction、X-Request-ID、
+//     X-Root-Request-ID、X-Compaction / X-Context-Compacted。
+//     另 runIdentityHeaders() 注入 X-Auth-Method / X-Id-Source / X-Userinfo。
+//
+// 与 injectAttribution 的分工：归属头（X-Product/X-IDE-*）是**业务用量归因**，
+// 官方只在配了 client_name 时全量发；本函数这批是 CLI 的**统一请求拦截器**，
+// 官方**无条件**发，与 client_name 无关，故分开放。
+//
+// 实测边界（2026-10-21，25 个账号 A/B）：补齐这批头**不能**解除已发生的
+// 403（账号级终态，换出口 IP 与换版本号 UA 同样无效），故它是**预防性对齐**，
+// 不是解封手段。取确定性值而非随机值，避免引入新的"特征漂移"。
+func (c *Client) injectClientFingerprint(req *http.Request) {
+	// x-codebuddy-request=1：CLI 的 withSecurityHeader() 给所有请求打的标记，
+	// 官方 worker 反代白名单里显式透传（只放行 authorization/cookie/x-codebuddy-request）。
+	req.Header.Set("x-codebuddy-request", "1")
+	// X-Agent-Intent：官方取自 session meta["codebuddy.ai/mode"]，普通会话回落 "craft"。
+	req.Header.Set("X-Agent-Intent", "craft")
+	// X-Agent-Type：网关是单会话直答，等价 resolveSessionAgentType 的 "main" 分支。
+	req.Header.Set("X-Agent-Type", "main")
+	// X-Request-ID：官方用本次 message id（UUID 打掉连字符）。这里独立生成，
+	// 上游不校验其与 X-Conversation-* 的关系（见 injectConversationHeaders 的实测）。
+	req.Header.Set("X-Request-ID", strings.ReplaceAll(newConversationID(), "-", ""))
+	// 不需要 X-Root-Request-ID / X-Compaction / X-Context-Compacted：前者是子代理
+	// 链路溯源（我们无子代理），后两者表达"本请求是否压缩轮"（网关不压缩上下文，
+	// 发假值反而是错误信号）。
+	injectTraceHeaders(req)
+}
+
+// injectTraceHeaders 注入 W3C + B3 双链路追踪头。
+// 形状对齐官方 applyTraceHeaders() 与 injectOtelSpanHeaders()：16 字节 traceId、
+// 8 字节 spanId（hex），traceparent 固定 sampled=01。
+// 每次请求独立生成——追踪头的语义就是"本次请求"，复用反而错误。
+func injectTraceHeaders(req *http.Request) {
+	// traceId 16 字节（32 hex）、spanId 8 字节（16 hex）——W3C traceparent 的定长，
+	// 与官方 randomBytes(16)/randomBytes(8) 一致。
+	var tid [16]byte
+	var sid [8]byte
+	if _, err := rand.Read(tid[:]); err != nil {
+		// crypto/rand 在受支持平台不会失败；退化固定值也好过缺头
+		// （官方每个请求都带，缺失是特征差异）。
+		copy(tid[:], "wb2a-trace-id-000")
+	}
+	if _, err := rand.Read(sid[:]); err != nil {
+		copy(sid[:], "wb2a-spn")
+	}
+	traceID := hex.EncodeToString(tid[:])
+	spanID := hex.EncodeToString(sid[:])
+	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
+	req.Header.Set("b3", traceID+"-"+spanID+"-1")
+	req.Header.Set("X-B3-TraceId", traceID)
+	req.Header.Set("X-B3-SpanId", spanID)
+	req.Header.Set("X-B3-Sampled", "1")
+	req.Header.Set("X-Trace-ID", traceID)
 }
 
 // injectConversationHeaders 注入上游强制要求的三个会话头。
@@ -245,22 +326,27 @@ func newConversationID() string {
 }
 
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。
-// 仅在 chat/completions 路径生效（ChatHeaders 调用）。ClientName 非空时全量跟随该值，
-// 空则只保留 X-Product="SaaS"（旧行为，向后兼容）。
+// 仅在 chat/completions 路径生效（ChatHeaders 调用）。
 //
-// B 段对齐官方白名单头组（application-manifest.js:27590-27601）：X-IDE-* 四头齐全且
-// 取值跟随 ClientName（X-IDE-Name/Type/Product = WorkBuddy），X-IDE-Version = 客户端
-// 版本段（config client_version 可覆盖）。与官方 banner 头组完全同形。
+// 2026-10-21 修正：X-IDE-Name/Type 与 X-Agent-Purpose **改为无条件发送**。
+// 官方客户端把它们放在 applyGatewayHeaders() 末尾的常量组里无条件套用
+// （YN = [[X-IDE-Type,WorkBuddy],[X-IDE-Name,WorkBuddy],[X-IDE-Version,0.0.0],
+// [X-Private-Data,true],[X-Product,SaaS]]，见 app.asar /main/server.js）。
+// 此前我们只在配了 client_name 时才发，等于给上游一个"这批请求没带 IDE 标识"
+// 的可区分特征——与本次 403 排查中"账号被单独标记"的方向一致，故对齐官方。
+// ClientName 非空时仍以该值为准（自定义品牌/版本的能力保留）。
 func (c *Client) injectAttribution(req *http.Request) {
-	if c == nil || c.ClientName == "" {
-		req.Header.Set("X-Product", "SaaS")
-		return
+	name := "WorkBuddy"
+	product := "SaaS"
+	if c != nil && c.ClientName != "" {
+		name = c.ClientName
+		product = c.ClientName
 	}
 	req.Header.Set("X-Agent-Purpose", "conversation")
-	req.Header.Set("X-IDE-Name", c.ClientName)
-	req.Header.Set("X-IDE-Type", c.ClientName)
+	req.Header.Set("X-IDE-Name", name)
+	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())
-	req.Header.Set("X-Product", c.ClientName)
+	req.Header.Set("X-Product", product)
 }
 
 // injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游。
