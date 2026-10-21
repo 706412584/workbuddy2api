@@ -5,6 +5,8 @@ go 1.25.0
 require (
 	github.com/redis/go-redis/v9 v9.18.0
 	golang.org/x/net v0.33.0
+	golang.org/x/sys v0.30.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
