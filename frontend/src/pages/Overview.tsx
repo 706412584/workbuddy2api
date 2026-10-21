@@ -289,11 +289,22 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
    */
   const [groupFilter, setGroupFilter] = useState('')
   const [groups, setGroups] = useState<Record<string, string>>({})
+  /**
+   * 下拉里的组名（**全部组**，含当前账号池看不到的）。
+   *
+   * 为什么不能用 `status.accounts` 反推：/status 已被密钥的分组约束过滤过
+   * （语义是「未绑分组的 key 只用未分组账号」）。用普通 key 时受限组压根不在
+   * 返回里，反推出的选项就只有「未分组」—— 于是「受限」这个组在下拉里
+   * 永远不出现（2026-10-22 实测）。选项必须取自分组表本身，与密钥无关。
+   */
+  const [groupNames, setGroupNames] = useState<string[]>([])
   useEffect(() => {
     let cancelled = false
     getGroups()
       .then((g) => {
-        if (!cancelled && g.available) setGroups(g.groups)
+        if (cancelled || !g.available) return
+        setGroups(g.groups)
+        setGroupNames(g.names)
       })
       .catch(() => {
         // 取不到就退化成「没有分组」：筛选下拉只剩「全部/未分组」，不影响其它功能
@@ -554,6 +565,20 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
     [onChanged],
   )
 
+  /**
+   * 每个组在当前账号池里有多少账号。
+   * 用来在选项里标出「这个组一个账号都看不到」——否则用户选中它只会看到空列表，
+   * 而原因（密钥的分组约束把它挡在外面了）完全不可见。
+   */
+  const groupVisibleCount = useMemo(() => {
+    const m: Record<string, number> = {}
+    for (const a of status?.accounts ?? []) {
+      const g = groups[a.uid] ?? ''
+      if (g) m[g] = (m[g] ?? 0) + 1
+    }
+    return m
+  }, [status, groups])
+
   if (!status) {
     return <div className="empty">尚无数据 —— 请先在右上角填入 API 密钥。</div>
   }
@@ -579,11 +604,6 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
     })
 
   const regions = new Set(status.accounts.map((a) => a.region ?? 'cn'))
-  /** 出现过的分组名（按 /status 里的账号过滤，避免列出网关未返回的组） */
-  const groupNameList = [
-    ...new Set(status.accounts.map((a) => groups[a.uid] ?? '').filter(Boolean)),
-  ].sort()
-
   // 批量重置只针对「异常」账号：正常账号没有可重置的东西，全量重置毫无收益。
   const problemUids = status.accounts
     .filter((a) => a.disabled || a.cooling || breakerActive(a, now))
@@ -763,16 +783,26 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
             <select
               value={groupFilter}
               onChange={(e) => setGroupFilter(e.target.value)}
-              title="按账号分组筛选。分组在「分组」页维护"
+              title="按账号分组筛选。分组在「分组」页维护；标 0 的组在当前密钥下看不到账号"
             >
               <option value="">全部</option>
               <option value="__none__">未分组</option>
-              {groupNameList.map((n) => (
+              {groupNames.map((n) => (
                 <option key={n} value={n}>
                   {n}
+                  {groupVisibleCount[n] ? '' : '（0）'}
                 </option>
               ))}
             </select>
+            {/* 选中的组当前一个账号都看不到时，明说原因是密钥的分组约束，
+                而不是让人对着空列表怀疑账号丢了。 */}
+            {groupFilter !== '' &&
+              groupFilter !== '__none__' &&
+              !groupVisibleCount[groupFilter] && (
+                <span className="dim" style={{ fontSize: 11.5 }}>
+                  该组在此密钥下不可见
+                </span>
+              )}
           </label>
 
           <div className="spacer" />
