@@ -44,11 +44,41 @@ func TestIdentityDesktopVariantRewritten(t *testing.T) {
 
 func TestBranchRewritten(t *testing.T) {
 	out := sanitizeText(ccBranch)
-	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {
+	if !strings.Contains(out, "Default branch (you will typically use this for PRs)") {
 		t.Errorf("branch not rewritten: %q", out)
 	}
 	if strings.Contains(out, "Main branch") {
 		t.Errorf("original branch still present: %q", out)
+	}
+}
+
+// 回归用例（2026-10-21，对照 xiaofan6ya 1.12.0 的说明发现）：
+// 上游按逐字指纹拦截的是 "you will usually use this for PRs" 这段**固定说明**，
+// 与前面的分支名标签无关。此前只匹配带 `Main branch (` 前缀的整句，
+// 当客户端不带该前缀时（分支标签形态不同 / 标签被省略）文案会脱离前缀单独出现，
+// 预检不命中 → 指纹原样发上游 → 可能触发 11128 单请求拦截。
+func TestBranchPhraseWithoutPrefixRewritten(t *testing.T) {
+	for _, in := range []string{
+		"you will usually use this for PRs",
+		"- you will usually use this for PRs",
+		"Current branch: master (you will usually use this for PRs)",
+	} {
+		out := sanitizeText(in)
+		if strings.Contains(out, "you will usually use this for PRs") {
+			t.Errorf("standalone phrase not rewritten: in=%q out=%q", in, out)
+		}
+		if !strings.Contains(out, "you will typically use this for PRs") {
+			t.Errorf("rewrite marker missing: in=%q out=%q", in, out)
+		}
+	}
+}
+
+// 断言整句形态只被改写一次（前缀条目 + 后半段条目不应叠加出
+// "Default branch (you will typically typically …)" 之类）。
+func TestBranchPhraseRewrittenOnlyOnce(t *testing.T) {
+	out := sanitizeText(ccBranch)
+	if strings.Contains(out, "typically typically") || strings.Contains(out, "usually typically") {
+		t.Errorf("double-rewritten: %q", out)
 	}
 }
 

@@ -17,6 +17,7 @@ var sanitizeFeatures = []string{
 	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
 	"You are Claude Code",        // 身份句（截断前缀即可命中）
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
+	"you will usually use this for PRs", // 同上后半段：分支名非 main 时脱离前缀单独出现
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
 	"11128",                      // 上游反探测：裸数字错误码
@@ -44,7 +45,24 @@ var sanitizeRewrites = [][2]string{
 	},
 	{
 		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)",
+		"Default branch (you will typically use this for PRs)",
+	},
+	{
+		// 后半段独立条目：**不依赖 `Main branch` 前缀**。
+		//
+		// 回归背景（2026-10-21，对照 xiaofan6ya 的 1.12.0 说明发现）：上游按
+		// 逐字指纹拦截的是 "you will usually use this for PRs" 这段**固定说明**，
+		// 与它前面的分支名标签无关。此前我们只匹配带 `Main branch (` 前缀的整句，
+		// 于是当客户端把分支标签写成别的形态（如 `Current branch:` / 直接省略标签）
+		// 时，这段文案会**脱离前缀单独出现** → 预检不命中 → 指纹原样发上游。
+		// 实测（2026-10-21）：`"you will usually use this for PRs"` 单独传入
+		// sanitizeText 不被改写。
+		//
+		// 放在整句条目之后：整句已被改写为 "Default branch (you will typically …)"，
+		// 本条目不再命中，避免二次改写；只有脱离前缀的残留才由它接住。
+		// 替换用 typically（与 usually 同义），保持"改一词、语义不变"的既有口径。
+		"you will usually use this for PRs",
+		"you will typically use this for PRs",
 	},
 	{
 		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",

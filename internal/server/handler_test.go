@@ -2108,7 +2108,7 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	if !strings.Contains(out, "official CLI tool for Claude.") {
 		t.Errorf("sanitized identity rewrite missing: %s", out)
 	}
-	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {
+	if !strings.Contains(out, "Default branch (you will typically use this for PRs)") {
 		t.Errorf("sanitized branch rewrite missing: %s", out)
 	}
 	// 2) messages 头部恰好一条 system = 自有提示词（Rewrite 已删旧 system）。
