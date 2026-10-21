@@ -133,11 +133,8 @@ func (e *Engine) EnsureRunning(sourceID, namePrefix, bindAddr string, bindings [
 
 	hash := configHash
 	if len(bindings) > 0 {
-		// 端口预检：mihomo 被占用端口不会退出，必须先自己确认端口空闲，
-		// 否则会「启动成功 → 探活失败 → 重启 → 仍失败」空转。
-		if err := preflightPorts(bindings); err != nil {
-			return err
-		}
+		// 写配置是**幂等**的（同样的 bindings → 同样的字节 → 同样的 hash），
+		// 故先写再判「是否需要重启」，不必担心多写一次。
 		h, err := WriteMihomoConfig(cfgPath, bindAddr, namePrefix, bindings)
 		if err != nil {
 			return err
@@ -152,6 +149,9 @@ func (e *Engine) EnsureRunning(sourceID, namePrefix, bindAddr string, bindings [
 	// 已在运行且配置未变：仍要确认端口真在监听。mihomo 端口被占时不退出，
 	// 若上次实际 bind 失败（如上一实例的孤儿占着端口），这里必须能发现并重启，
 	// 否则会因 hash 未变而永久短路 —— 面板显示 running 但代理全废。
+	//
+	// 这里**必须早于端口预检**：本进程自己的 mihomo 正占着这些端口，
+	// 先预检会把「重复同步同一份订阅」这种幂等操作误判成端口被占。
 	if p != nil && p.running && p.configHash == hash && p.runner != nil {
 		if err := p.runner.VerifyListening(listenVerifyTimeout); err == nil {
 			return nil
@@ -164,6 +164,16 @@ func (e *Engine) EnsureRunning(sourceID, namePrefix, bindAddr string, bindings [
 	}
 	if p != nil && p.runner != nil {
 		_ = p.runner.Stop()
+	}
+
+	// 真正要起新进程了：此时旧进程已停，端口应已释放，预检才有意义。
+	// 预检回答「这个端口现在能不能用」—— mihomo 遇占用端口不退出，不预检会陷入
+	// 「启动成功 → 探活失败 → 重启 → 仍失败」空转，且面板显示 running 而代理全废。
+	if len(bindings) > 0 {
+		if err := preflightPorts(bindings); err != nil {
+			e.procs[sourceID] = &proc{configHash: hash, lastError: err.Error()}
+			return err
+		}
 	}
 
 	runner := &Runner{Binary: bin, ConfigPath: cfgPath, DataDir: workDir, sourceID: sourceID}

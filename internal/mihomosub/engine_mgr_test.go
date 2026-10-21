@@ -136,3 +136,45 @@ func TestStopAllIdempotent(t *testing.T) {
 		t.Error("StopAll 后状态应为空")
 	}
 }
+
+// TestRepeatSyncIdempotentNotBlockedBySelf 回归：本进程自己的 mihomo 正占着端口时，
+// 再次同步同一份订阅必须**短路成功**，不能被端口预检误判成「端口被占」。
+//
+// 真实故障（2026-10-21 面板实测）：启动时自动同步起了 mihomo 占住 21680-21683，
+// 用户点「同步订阅」时预检试绑被自己的 mihomo 挡下 → 同步永久失败。
+// 修法：把「已在运行且配置未变」的短路判断移到预检之前（写配置是幂等的）。
+func TestRepeatSyncIdempotentNotBlockedBySelf(t *testing.T) {
+	d, err := os.ReadFile("testdata/subscription-sample.yaml")
+	if err != nil {
+		t.Skip("无样例订阅")
+	}
+	nodes, err := ParseSubscription(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) == 0 {
+		t.Skip("样例无节点")
+	}
+	// 只验证「同样的 bindings → 同样的 hash」这一幂等前提，
+	// 真正起进程的端到端由上层（cmd/server）冒烟覆盖。
+	b1, err := BuildBindings(nodes, "sidecar-", "127.0.0.1", "mixed", 21780, 2, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := BuildBindings(nodes, "sidecar-", "127.0.0.1", "mixed", 21780, 2, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	h1, err := WriteMihomoConfig(filepath.Join(dir, "a.yaml"), "127.0.0.1", "sidecar-", b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := WriteMihomoConfig(filepath.Join(dir, "b.yaml"), "127.0.0.1", "sidecar-", b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Errorf("同样 bindings 应得同样 hash（幂等前提），得到 %s vs %s", h1, h2)
+	}
+}

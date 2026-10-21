@@ -38,6 +38,33 @@ type ProxySlot struct {
 	Enabled bool `json:"enabled"`
 }
 
+// ProxySidecarConfig mihomo sidecar（订阅 → N 个本地出口端口）配置。
+//
+// 用途：把一份 Clash/分享链接订阅展开成 N 个本地 mixed 代理端口，再作为
+// proxy_slots 供账号粘性绑定，使不同账号走不同出口 IP（降低上游按设备/IP
+// 连坐风控的风险）。
+//
+// 未启用（SubscriptionURL 为空）时引擎不启动，proxy_slots 保持手工维护。
+type ProxySidecarConfig struct {
+	// Enabled 是否启用 sidecar。false 时其余字段忽略。
+	Enabled bool `json:"enabled"`
+	// SubscriptionURL 订阅地址（Clash YAML / base64 / 分享链接列表均可）。
+	SubscriptionURL string `json:"subscription_url"`
+	// Binary mihomo 可执行文件路径。空 = 先找网关同目录的 mihomo.exe，
+	// 再回落 PATH 查找 mihomo / clash-meta。
+	Binary string `json:"binary"`
+	// BasePort 起始端口，第 i 个节点用 BasePort+i。默认 21080。
+	BasePort int `json:"base_port"`
+	// MaxNodes 最多展开多少节点（即最多多少个出口）。默认 10。
+	MaxNodes int `json:"max_nodes"`
+	// DataDir 配置/工作目录根。空 = <state_file 所在目录>/proxy-sidecar。
+	DataDir string `json:"data_dir"`
+	// NamePrefix 代理名前缀（须唯一，便于辨认来源）。默认 "sidecar-"。
+	NamePrefix string `json:"name_prefix"`
+	// SyncIntervalSec 订阅自动刷新间隔（秒）。0 = 用默认 3600；负数 = 不自动刷新。
+	SyncIntervalSec int `json:"sync_interval_sec"`
+}
+
 // ProtocolConfig 协议适配（Anthropic /v1/messages、OpenAI /v1/responses）的模型名映射。
 // 客户端发的是 claude-* / gpt-* 这类名字，本网关上游只有 glm/deepseek 等，
 // 不做映射会直接拿到 code=11102（模型不存在）。
@@ -71,6 +98,9 @@ type Config struct {
 	// **不放在 auths/*.json 里**：那个文件由 SaveAtomic 在每次 token 刷新后整份重写
 	// （只写固定的 auth/account 字段），绑定放进去会被刷新悄悄抹掉。
 	AccountProxies map[string]string `json:"account_proxies"`
+
+	// ProxySidecar mihomo sidecar（订阅 → N 个本地出口端口）配置。
+	ProxySidecar ProxySidecarConfig `json:"proxy_sidecar"`
 
 	Server struct {
 		// MaxBodyMB 请求体大小上限（单位 MB，默认 32）。

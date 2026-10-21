@@ -35,6 +35,28 @@ import (
 // 函数注入缝，不便携带状态；与本仓库既有做法（degradeGate 等进程级状态）一致。
 var proxyRegistry *proxyreg.Registry
 
+// sidecar mihomo sidecar 编排器（订阅 → 出口端口 → 槽位）。未启用时为 nil。
+var sidecar *Sidecar
+
+// absFromExe 把相对路径按**可执行文件所在目录**解析为绝对路径。
+//
+// 为什么不用相对 CWD：Windows 上双击 exe / 计划任务启动时 CWD 可能是
+// C:\Windows\System32，相对路径会落到意想不到的地方（sidecar 配置、mihomo.exe
+// 的查找都受影响）。注入到 Sidecar 便于测试替换。
+func absFromExe(p string) string {
+	if p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return p
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(filepath.Dir(exe), p)
+}
+
 // slotsToRegistry 把 config 的槽位定义转成注册表类型。
 // 两种类型分开是刻意的：config 侧带 json tag 供配置文件读写，注册表侧是纯运行期模型，
 // 各自演进互不影响（避免改注册表内部结构时牵动配置文件格式）。
@@ -128,6 +150,24 @@ func main() {
 		}
 		return proxyRegistry.Resolve(a.UID)
 	})
+	// mihomo sidecar（订阅 → N 个本地出口端口 → 槽位）：启用时起子进程并自动同步。
+	// 未启用（enabled=false 或未填订阅）时完全不启动，行为零变化。
+	//
+	// **启动时只同步、不落盘**：槽位写入 config.json 由 admin 端点负责（那里有
+	// persistConfigEdits 的备份+一致性断言机制）。这里落盘过一版，结果启动路径
+	// 把账号绑定写进去了、槽位却没写 —— 绑定指向不存在的槽位。故启动路径只保证
+	// 「mihomo 起着、槽位在内存里」，持久化交给面板首次点「同步」。
+	sidecar = NewSidecar(cfg.ProxySidecar, cfg.StateFile, absFromExe)
+	if sidecar.Enabled() {
+		if _, err := sidecar.Sync(); err != nil {
+			// 首次同步失败不致命：面板可重试，也可走「粘贴订阅」路径绕过。
+			log.Printf("[sidecar] 首次同步失败（可在面板重试）：%v", err)
+		} else {
+			log.Printf("[sidecar] 已就绪（槽位尚未落盘；到面板点一次「同步订阅」即写入 config）")
+		}
+		sidecar.StartAutoSync()
+		defer sidecar.Stop()
+	}
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -242,6 +282,8 @@ func main() {
 		},
 		Registry:             proxyRegistry,
 		ResetProxyTransports: upstream.ResetProxyTransportCache,
+		// mihomo sidecar 端点（状态/同步/分配）；未启用时为 nil → 端点返回未接线。
+		Sidecar: sidecarController(sidecar, p),
 		ModelsByRegion: func() (cn, global []string) {
 			return h.ModelsForRegion(auth.RegionCN), h.ModelsForRegion(auth.RegionGlobal)
 		},
