@@ -3,6 +3,7 @@ package auth
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -157,5 +158,51 @@ func TestSaveAtomicPreservesDeviceToken(t *testing.T) {
 	}
 	if b.DeviceToken != "persisted-tok" {
 		t.Errorf("roundtrip DeviceToken = %q want %q", b.DeviceToken, "persisted-tok")
+	}
+}
+
+// TestCreatedAtRoundTrip created_at 必须能解析、落盘保留、且缺省为 0（不伪造）。
+//
+// 背景（2026-10-21）：上游不暴露账号真实注册时间，而 auths/*.json 的文件时间会被
+// token 刷新整份重写覆盖，因此「账号何时入库」无法从任何既有来源回溯。加此字段后：
+//   - 首次落盘（登录/导入）记一次；
+//   - 之后每次 SaveAtomic 整份重写都**保留**它；
+//   - 旧凭证（无该字段）解析为 0 = 未知，**不猜测**。
+func TestCreatedAtRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "workbuddy-u1.json")
+	a := &Auth{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 123, Domain: "www.workbuddy.ai",
+		UID: "u1", Nickname: "n1", FilePath: f, CreatedAt: 1700000000,
+	}
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	raw, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "created_at") {
+		t.Errorf("落盘文件应含 created_at：%s", raw)
+	}
+	got, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.CreatedAt != 1700000000 {
+		t.Errorf("created_at=%d want 1700000000（应原样保留）", got.CreatedAt)
+	}
+
+	// 旧凭证无该字段 → 0（未知），且 SaveAtomic 不写空键。
+	b := &Auth{AccessToken: "at2", UID: "u2", FilePath: filepath.Join(dir, "workbuddy-u2.json")}
+	if err := b.SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	raw2, _ := os.ReadFile(b.FilePath)
+	if strings.Contains(string(raw2), "created_at") {
+		t.Errorf("CreatedAt=0 时不应写 created_at 键：%s", raw2)
+	}
+	if p2, _ := Parse(raw2); p2.CreatedAt != 0 {
+		t.Errorf("无该字段应解析为 0，得到 %d", p2.CreatedAt)
 	}
 }

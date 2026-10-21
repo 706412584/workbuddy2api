@@ -31,6 +31,15 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// CreatedAt 本账号**首次入库**的 Unix 秒（登录成功 / 导入凭证落盘的时刻）。
+	//
+	// 为什么单独记一个字段：上游不暴露账号真实注册时间（实测 /v2/accounts 只返回
+	// uid / nickname / uin / type / lastLogin 等，无创建时间），而 auths/*.json 的
+	// **文件时间会被 token 刷新整份重写覆盖**（见 SaveAtomic），因此无法从任何既有
+	// 来源回溯「这个号是什么时候进池的」。故在首次落盘时记一次，之后由 SaveAtomic
+	// 原样保留。0 = 未知（早于本字段引入的旧凭证，**不做回溯猜测**）。
+	CreatedAt int64
 }
 
 // Region 账号所属的上游区域。区域由凭证的 domain 字段推导，
@@ -169,6 +178,8 @@ func Parse(raw []byte) (*Auth, error) {
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用）。
 			// 放在 auth 段之外，手写时无需嵌进 auth 对象，降低配置门槛。
 			DeviceToken string `json:"device_token"`
+			// CreatedAt 顶层 created_at（首次入库时间，Unix 秒；缺省 0 = 未知）。
+			CreatedAt int64 `json:"created_at"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -182,6 +193,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			CreatedAt:    n.CreatedAt,
 		}
 	} else {
 		var f struct {
@@ -193,6 +205,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			CreatedAt    int64  `json:"created_at"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -206,6 +219,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			CreatedAt:    f.CreatedAt,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -243,6 +257,11 @@ func (a *Auth) SaveAtomic() error {
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
+	}
+	// CreatedAt 非 0 才写回：0 = 未知（旧凭证），不写空键、也不伪造时间。
+	// 由此首次入库时间在后续每次 token 刷新（整份重写）中被保留。
+	if a.CreatedAt > 0 {
+		doc["created_at"] = a.CreatedAt
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

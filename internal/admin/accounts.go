@@ -445,10 +445,53 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 //
 // 重新序列化而非原样落盘：粘贴进来的 JSON 可能带 BOM、注释或多余空白，过一遍解析器
 // 能保证落盘的一定是干净可读的形态。解析用 any 而非结构体，故凭证里的额外字段会保留。
+// authFileCreatedAt 读该 uid 凭证文件里**已有**的首次入库时间。
+//
+// 用于 writeAuthFile 重写时继承它 —— 入参 raw 来自用户粘贴的凭证，不含该字段，
+// 若不从磁盘继承就会被抹掉（2026-10-21 实测踩到）。
+// 返回 0 = 文件不存在 / 解析失败 / 无该字段（均视为首次入库）。
+func authFileCreatedAt(dir, uid string) int64 {
+	if !authFileRE.MatchString("workbuddy-" + uid + ".json") {
+		return 0
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "workbuddy-"+uid+".json"))
+	if err != nil {
+		return 0
+	}
+	var probe struct {
+		CreatedAt int64 `json:"created_at"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return 0
+	}
+	return probe.CreatedAt
+}
+
 func (h *Handler) writeAuthFile(uid string, raw []byte) (string, error) {
 	var parsed any
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return "", err
+	}
+	// 首次入库时间：**设备码登录与手动导入两条路径都经过本函数**，故在此统一注入，
+	// 避免两处各写一遍而漏掉一处。
+	//
+	// 取值优先级（关键）：**必须先从磁盘上已有文件继承**。
+	// 因为入参 raw 是调用方给的凭证原文（粘贴的导入内容 / 登录工具输出），**不含**
+	// created_at；若只从 raw 判断「有没有」，覆盖导入会把已有时间抹掉
+	// （2026-10-21 实测踩到：重复导入后 created_at 变成 null）。
+	//  1. 磁盘已有文件的 created_at > 0 → 原样继承；
+	//  2. 否则视为首次入库 → 取当前时间。
+	// 「首次入库」语义：重复导入**不刷新**（它不是「最后更新时间」）。
+	//
+	// 已有值在后续 token 刷新（SaveAtomic 整份重写）中也由该函数保留。
+	// 时间基准用本地时钟：上游不提供权威注册时间（实测 /v2/accounts 只返回
+	// uid/nickname/uin/type/lastLogin，无创建时间）。
+	if m, ok := parsed.(map[string]any); ok {
+		if prev := authFileCreatedAt(h.cfg.AuthDir, uid); prev > 0 {
+			m["created_at"] = prev
+		} else {
+			m["created_at"] = time.Now().Unix()
+		}
 	}
 	text, err := json.MarshalIndent(parsed, "", "  ")
 	if err != nil {
