@@ -20,6 +20,8 @@ import type {
   ProxySlot,
   ProxyStatus,
   ProxyTestResult,
+  SidecarStatus,
+  SidecarSyncResult,
   AccountTestResult,
   RegionModels,
   LogTail,
@@ -521,3 +523,25 @@ export const testProxy = (url: string) =>
     method: 'POST',
     body: JSON.stringify({ url }),
   })
+
+// ── mihomo sidecar（订阅 → 出口端口 → 槽位）────────────────────────────
+
+/** mihomo sidecar 状态（是否启用 / 节点数 / 槽位数 / 二进制 / 进程态）。 */
+export const getSidecar = () => adminJSON<SidecarStatus>('/__admin/proxy/sidecar')
+
+/**
+ * 同步订阅：拉取并展开为出口槽位（落盘 + 热重载）。
+ * subscription 非空时用该内容（面板粘贴/上传，订阅站不可直连时用）；省略则按配置 URL 拉取。
+ */
+export const syncSidecar = (subscription?: string) =>
+  adminJSON<SidecarSyncResult>('/__admin/proxy/sidecar/sync', {
+    method: 'POST',
+    body: JSON.stringify(subscription ? { subscription } : {}),
+  })
+
+/** 把（全部或指定）账号粘性摊到 sidecar 槽位。已绑有效槽位的账号不会被改动。 */
+export const assignSidecar = (uids?: string[]) =>
+  adminJSON<{ assigned: number; binds?: Record<string, string>; message?: string }>(
+    '/__admin/proxy/sidecar/assign',
+    { method: 'POST', body: JSON.stringify(uids && uids.length ? { uids } : {}) },
+  )

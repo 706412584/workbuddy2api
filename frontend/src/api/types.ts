@@ -390,6 +390,49 @@ export interface ProxySlot {
   enabled: boolean
   /** 有多少账号绑定本槽位 */
   usage?: number
+  /** 出口是否可用（后端按代理 URL 记账；不健康时选号会排除绑定本槽位的账号） */
+  healthy?: boolean
+  /** 连续失败次数（成功一次即清零） */
+  fail_count?: number
+  /** 最近一次失败原因 */
+  last_error?: string
+  /** 判定不健康后的剩余冷却（毫秒），到期自动重探 */
+  cooldown_ms?: number
+}
+
+/** mihomo sidecar 状态（GET /__admin/proxy/sidecar）。 */
+export interface SidecarStatus {
+  enabled: boolean
+  node_count: number
+  slot_count: number
+  last_sync?: string
+  last_error?: string
+  base_port: number
+  max_nodes: number
+  /** 是否解析到 mihomo 可执行文件 */
+  binary_ok: boolean
+  binary_path: string
+  /** 各订阅源的 mihomo 进程态 */
+  engines?: { id: string; running: boolean; last_error?: string }[]
+  /** 未接线/未启用时后端返回的提示 */
+  message?: string
+}
+
+/** 展开出的一个出口槽位（sync 返回项）。 */
+export interface SidecarSlot {
+  id: string
+  name: string
+  url: string
+  enabled: boolean
+}
+
+/** POST /__admin/proxy/sidecar/sync 的结果。 */
+export interface SidecarSyncResult {
+  slots: SidecarSlot[]
+  node_count: number
+  fetched_at: string
+  /** 有损展开时的提示（如订阅节点数超过 max_nodes 被截断） */
+  warnings?: string[]
 }
 
 /** GET /__admin/proxy/slots */

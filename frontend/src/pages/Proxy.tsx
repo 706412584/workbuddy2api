@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AuthFileView, ProxySlot } from '../api/types'
-import { ApiError, getProxySlots, listAuthFiles, saveProxySlots, testProxy } from '../api/client'
+import type { AuthFileView, ProxySlot, SidecarStatus } from '../api/types'
+import {
+  ApiError,
+  assignSidecar,
+  getProxySlots,
+  getSidecar,
+  listAuthFiles,
+  saveProxySlots,
+  syncSidecar,
+  testProxy,
+} from '../api/client'
 
 interface Props {
   onChanged: () => void
@@ -374,6 +383,9 @@ export function Proxy({ onChanged }: Props) {
         </div>
       )}
 
+      {/* ── 订阅 sidecar（mihomo）────────────────────────────────────── */}
+      <SidecarPanel onDone={() => void load()} />
+
       {/* ── 槽位 ───────────────────────────────────────────────────── */}
       <div className="panel">
         <header>
@@ -418,6 +430,9 @@ export function Proxy({ onChanged }: Props) {
                   <th style={{ minWidth: 110 }}>名称</th>
                   <th style={{ minWidth: 320 }}>代理地址</th>
                   <th>启用</th>
+                  <th title="出口健康：连续失败达阈值后主动探测确认；不健康时选号会排除绑定本槽位的账号（轮换改用别的出口）">
+                    出口
+                  </th>
                   <th title="点击查看使用该槽位的账号">在用</th>
                   <th>探测</th>
                   <th></th>
@@ -470,6 +485,24 @@ export function Proxy({ onChanged }: Props) {
                           onChange={(e) => updSlot(s.id, { enabled: e.target.checked })}
                           title="关闭后绑定它的账号回落直连（槽位保留，便于临时切换）"
                         />
+                      </td>
+                      <td>
+                        {s.healthy === false ? (
+                          <span
+                            className="badge err"
+                            title={
+                              `出口不可用：连续失败 ${s.fail_count ?? 0} 次` +
+                              (s.last_error ? `\n最近错误：${s.last_error}` : '') +
+                              (s.cooldown_ms ? `\n${Math.ceil(s.cooldown_ms / 1000)}s 后自动重探` : '')
+                            }
+                          >
+                            {s.cooldown_ms ? `${Math.ceil(s.cooldown_ms / 1000)}s` : '异常'}
+                          </span>
+                        ) : (
+                          <span className="badge ok" title="出口正常（或尚未出站）">
+                            正常
+                          </span>
+                        )}
                       </td>
                       <td>
                         <span
@@ -677,5 +710,176 @@ export function Proxy({ onChanged }: Props) {
         <span className="mono">proxy_slots</span> 与 <span className="mono">account_proxies</span>。
       </div>
     </>
+  )
+}
+
+/**
+ * SidecarPanel 订阅 → 出口端口 → 槽位 的一键面板。
+ *
+ * 设计取舍：
+ *   - 订阅 URL 存在 config.json（proxy_sidecar.subscription_url），不在前端保存；
+ *     面板只负责「触发同步」「粘贴订阅」「分配账号」三件事。
+ *   - 「同步订阅」与「自动分配」是**两步**而非一步：同步只写槽位，分配只改绑定。
+ *     分开的理由是绑定是**粘性**的（已绑有效槽位的账号不会被改），分步才能让用户
+ *     先看清展开了哪些出口、再决定要不要摊账号。
+ *   - 未启用时（后端返回 enabled=false）整块显示为提示，不渲染按钮 ——
+ *     避免用户在没配订阅的部署上点了按钮却只拿到报错。
+ */
+function SidecarPanel({ onDone }: { onDone: () => void }) {
+  const [st, setSt] = useState<SidecarStatus | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [msg, setMsg] = useState('')
+  const [pasted, setPasted] = useState('')
+  const [showPaste, setShowPaste] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      setSt(await getSidecar())
+      setErr('')
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e))
+    }
+  }, [])
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const run = useCallback(
+    async (fn: () => Promise<string>) => {
+      setBusy(true)
+      setErr('')
+      setMsg('')
+      try {
+        setMsg(await fn())
+        await load()
+        onDone()
+      } catch (e) {
+        setErr(e instanceof ApiError ? e.message : String(e))
+      } finally {
+        setBusy(false)
+      }
+    },
+    [load, onDone],
+  )
+
+  const doSync = () =>
+    run(async () => {
+      const r = await syncSidecar(pasted.trim() || undefined)
+      setPasted('')
+      setShowPaste(false)
+      const warn = r.warnings?.length ? '；' + r.warnings.join('；') : ''
+      return `已展开 ${r.slots.length} 个出口（订阅共 ${r.node_count} 个节点）${warn}`
+    })
+
+  const doAssign = () =>
+    run(async () => {
+      const r = await assignSidecar()
+      return r.message ?? `已为 ${r.assigned} 个账号分配出口（已绑定的保持不变）`
+    })
+
+  if (!st) {
+    return (
+      <div className="panel">
+        <header>
+          <h2>订阅出口（mihomo）</h2>
+        </header>
+        <div className="empty">{err || '读取中…'}</div>
+      </div>
+    )
+  }
+
+  if (!st.enabled) {
+    return (
+      <div className="panel">
+        <header>
+          <h2>订阅出口（mihomo）</h2>
+          <span className="sub">未启用</span>
+        </header>
+        <div className="empty">
+          未启用订阅导出。在 <span className="mono">config.json</span> 里配置
+          <span className="mono"> proxy_sidecar</span>：
+          <span className="mono">{'{ "enabled": true, "subscription_url": "…" }'}</span>
+          ，并把 <span className="mono">mihomo.exe</span> 放到网关同目录。
+          <div className="dim" style={{ marginTop: 6 }}>
+            启用后可把一份 Clash/分享链接订阅展开成 N 个本地出口端口，让不同账号走不同出口 IP。
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const engineOK = !!st.engines?.some((e) => e.running)
+  return (
+    <div className="panel">
+      <header>
+        <h2>订阅出口（mihomo）</h2>
+        <span className="sub">
+          {st.node_count} 个节点 → {st.slot_count} 个出口
+        </span>
+        <div className="spacer" />
+        <button className="btn" onClick={() => setShowPaste((v) => !v)} disabled={busy}>
+          {showPaste ? '取消粘贴' : '粘贴订阅'}
+        </button>
+        <button className="btn primary" onClick={() => void doSync()} disabled={busy}>
+          {busy ? '处理中…' : '同步订阅'}
+        </button>
+        <button className="btn" onClick={() => void doAssign()} disabled={busy || st.slot_count === 0}>
+          自动分配账号
+        </button>
+        <button className="btn" onClick={() => void load()} disabled={busy}>
+          刷新
+        </button>
+      </header>
+
+      {err && (
+        <div className="note err">
+          <span>●</span>
+          <div style={{ wordBreak: 'break-word' }}>{err}</div>
+        </div>
+      )}
+      {msg && (
+        <div className="note info">
+          <span>●</span>
+          <div>{msg}</div>
+        </div>
+      )}
+      {st.last_error && (
+        <div className="note err">
+          <span>●</span>
+          <div style={{ wordBreak: 'break-word' }}>上次同步失败：{st.last_error}</div>
+        </div>
+      )}
+
+      {showPaste && (
+        <div style={{ padding: '10px 14px' }}>
+          <textarea
+            className="mono"
+            value={pasted}
+            onChange={(e) => setPasted(e.target.value)}
+            placeholder="在此粘贴订阅内容（Clash YAML / base64 / 分享链接列表）。留空则按 config 里的订阅地址拉取。"
+            style={{ width: '100%', minHeight: 110, fontSize: 11.5 }}
+          />
+          <div className="dim" style={{ fontSize: 11.5, marginTop: 4 }}>
+            订阅站无法直连（需代理）时用这条路径：在能访问的机器上打开订阅链接、全选复制后粘贴到这里。
+            粘贴后点「同步订阅」。
+          </div>
+        </div>
+      )}
+
+      <div className="dim" style={{ padding: '4px 14px 12px', fontSize: 11.5, lineHeight: 1.9 }}>
+        <div>
+          mihomo 核心：{st.binary_ok ? <span className="badge ok">就绪</span> : <span className="badge err">未找到</span>}
+          {st.binary_path && <span className="mono" style={{ marginLeft: 8 }}>{st.binary_path}</span>}
+        </div>
+        <div>
+          出口进程：{engineOK ? <span className="badge ok">运行中</span> : <span className="badge warn">未运行</span>}
+          <span style={{ marginLeft: 8 }}>
+            端口 {st.base_port}–{st.base_port + Math.max(0, st.slot_count - 1)}（仅监听 127.0.0.1）
+          </span>
+        </div>
+        {st.last_sync && <div>上次同步：{new Date(st.last_sync).toLocaleString()}</div>}
+      </div>
+    </div>
   )
 }
