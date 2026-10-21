@@ -61,6 +61,10 @@ type Config struct {
 	// ProxyHealth 按槽位原始 URL 查出口健康（未记账返回 false）。
 	// nil = 不展示健康信息（测试场景）。
 	ProxyHealth func(rawURL string) (ProxyHealthInfo, bool)
+	// Groups 账号分组：读快照 / 整体替换（面板保存后热重载）。
+	// nil = 未接线，分组端点返回明确错误。
+	Groups GroupsController
+
 	// Sidecar mihomo sidecar 的编排接口（订阅 → 出口端口 → 槽位 → 账号绑定）。
 	// nil = 未启用/未接线；相关端点返回明确错误而非静默无操作。
 	Sidecar SidecarController
@@ -146,6 +150,10 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /__admin/proxy/slots", h.saveProxySlots)
 	h.mux.HandleFunc("POST /__admin/proxy/test", h.testProxy)
 	// mihomo sidecar（订阅驱动）：状态 / 拉取同步 / 一键分配
+	// 账号分组：读 / 整体保存 / 批量设置（把封禁号移入受限组等）
+	h.mux.HandleFunc("GET /__admin/groups", h.getGroups)
+	h.mux.HandleFunc("POST /__admin/groups", h.postGroups)
+	h.mux.HandleFunc("POST /__admin/groups/set", h.postGroupSet)
 	h.mux.HandleFunc("GET /__admin/proxy/sidecar", h.getSidecar)
 	h.mux.HandleFunc("POST /__admin/proxy/sidecar/sync", h.postSidecarSync)
 	h.mux.HandleFunc("POST /__admin/proxy/sidecar/assign", h.postSidecarAssign)

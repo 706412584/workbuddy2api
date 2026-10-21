@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AuthFileView } from '../api/types'
+import type { AuthFileView, CallRecord } from '../api/types'
 import {
   ApiError,
   deleteAuth,
   exportAccounts,
   fmtTime,
   getLoadedAccounts,
+  getGroups,
+  saveGroups,
   importAuth,
   importAuthBatch,
   listAuthFiles,
@@ -24,6 +26,31 @@ export function Accounts({ onChanged }: Props) {
   /** 网关已加载的 uid 集合；null = 还没问出来（此时不判断是否加载） */
   const [loadedUids, setLoadedUids] = useState<Set<string> | null>(null)
   const [err, setErr] = useState('')
+  // 账号分组：草稿表（uid → 分组名）+ 是否有未保存改动。
+  // 后端把分组表存在 config.json 的 account_groups，本页只做编辑与保存。
+  const [groups, setGroups] = useState<Record<string, string>>({})
+  const [groupsAvailable, setGroupsAvailable] = useState(true)
+  const [groupsDirty, setGroupsDirty] = useState(false)
+  const setGroupDraft = useCallback((uid: string, g: string) => {
+    setGroups((m) => {
+      const n = { ...m }
+      const t = g.trim()
+      if (t) n[uid] = t
+      else delete n[uid]
+      return n
+    })
+    setGroupsDirty(true)
+  }, [])
+  const doSaveGroups = useCallback(async () => {
+    try {
+      await saveGroups(groups)
+      setGroupsDirty(false)
+      setErr('')
+      setRowMsg('分组已保存')
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e))
+    }
+  }, [groups])
   const [busy, setBusy] = useState(false)
 
   const [region, setRegion] = useState<'cn' | 'global'>('cn')
@@ -62,6 +89,15 @@ export function Accounts({ onChanged }: Props) {
           ? `账号接口不可用：[HTTP ${e.status}] ${e.message}`
           : `账号接口不可用：${String(e)}。该功能由 vite dev/preview server 提供，直接用网关端口打开页面时不存在。`,
       )
+    }
+    // 分组表：与账号列表同批拉，失败就置为不可用（输入框禁用，不谎称未分组）。
+    try {
+      const g = await getGroups()
+      setGroups(g.groups)
+      setGroupsAvailable(g.available)
+      setGroupsDirty(false)
+    } catch {
+      setGroupsAvailable(false)
     }
     // 单独取「网关已加载」，失败就把判断置为未知 —— 绝不因为查不到就宣称账号未加载。
     try {
@@ -330,6 +366,16 @@ export function Accounts({ onChanged }: Props) {
               <span className="mono">auths/</span> 里改动（绕开了面板）才需要点右侧按钮。
             </div>
           </div>
+          {groupsDirty && (
+            <>
+              <span className="badge warn" title="有未保存的分组改动">
+                分组未保存
+              </span>
+              <button className="btn primary" onClick={() => void doSaveGroups()}>
+                保存分组
+              </button>
+            </>
+          )}
           <button className="btn primary" onClick={() => void doRescan()} disabled={rescanning}>
             {rescanning ? <span className="spin" /> : null}
             {rescanning ? ' 扫描中' : '重新扫描 auths'}
@@ -586,6 +632,12 @@ export function Accounts({ onChanged }: Props) {
                   <th>账号</th>
                   <th>区域</th>
                   <th>状态</th>
+                  <th title="账号分组。API key 可绑定到分组：未分组 key 只用未分组账号，分组 key 只用该组账号（互不通用、不回退）">
+                    分组
+                  </th>
+                  <th title="最近几次调用（成功/失败原因）。用于回答「这个号最近发生了什么」——注意「凭证有效期」上方的状态不受此影响">
+                    最近调用
+                  </th>
                   <th>凭证有效期</th>
                   <th>文件</th>
                   <th>操作</th>
@@ -633,6 +685,19 @@ export function Accounts({ onChanged }: Props) {
                         ) : (
                           <span className="badge ok">已加载</span>
                         )}
+                      </td>
+                      <td style={{ fontSize: 11.5 }}>
+                        <input
+                          value={groups[f.uid] ?? ''}
+                          placeholder="未分组"
+                          title="改分组后按「保存分组」生效；空 = 移出分组"
+                          onChange={(e) => setGroupDraft(f.uid, e.target.value)}
+                          style={{ width: 86 }}
+                          disabled={!groupsAvailable}
+                        />
+                      </td>
+                      <td style={{ fontSize: 11 }}>
+                        <CallHistory calls={f.calls} lastSuccess={f.lastSuccess} />
                       </td>
                       <td className="nowrap" style={{ fontSize: 11.5 }}>
                         {f.expired ? (
@@ -686,5 +751,45 @@ export function Accounts({ onChanged }: Props) {
         )}
       </div>
     </>
+  )
+}
+
+/**
+ * CallHistory 一个账号最近几次调用的紧凑展示。
+ *
+ * 为什么需要（2026-10-21）：排查「被封号是否因为闲置」时发现，**成功没有可靠日志**
+ * （请求日志行不带日期且批量刷盘），而 `lastSuccess` 这个字段名有欺骗性 ——
+ * 它记的是「末次成功」，号一直失败时不更新，看起来像"很久没被用"。
+ * 本组件把「末次成功」与「最近若干次调用」并列，一眼能区分
+ * 「没被使用」与「被使用但一直失败」。
+ */
+function CallHistory({ calls, lastSuccess }: { calls?: CallRecord[]; lastSuccess?: string }) {
+  if (!calls || calls.length === 0) {
+    return <span className="dim">无记录</span>
+  }
+  const okN = calls.filter((c) => c.ok).length
+  const failN = calls.length - okN
+  return (
+    <div style={{ lineHeight: 1.5 }}>
+      <div className="dim" title={lastSuccess ? `末次成功：${lastSuccess}` : '还没有成功过'}>
+        最近 {calls.length}：<span style={{ color: 'var(--ok)' }}>{okN}✓</span>
+        {failN > 0 && (
+          <>
+            {' '}
+            <span style={{ color: 'var(--err)' }}>{failN}✗</span>
+          </>
+        )}
+      </div>
+      {calls.slice(0, 3).map((c, i) => (
+        <div
+          key={i}
+          className="mono dim"
+          style={{ fontSize: 10.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 190 }}
+          title={`${c.t}${c.model ? ' · ' + c.model : ''}${c.ms ? ' · ' + c.ms + 'ms' : ''}${c.reason ? ' · ' + c.reason : ''}`}
+        >
+          {c.ok ? '✓' : '✗'} {fmtTime(c.t)} {c.reason ? c.reason.slice(0, 18) : ''}
+        </div>
+      ))}
+    </div>
   )
 }

@@ -545,3 +545,20 @@ export const assignSidecar = (uids?: string[]) =>
     '/__admin/proxy/sidecar/assign',
     { method: 'POST', body: JSON.stringify(uids && uids.length ? { uids } : {}) },
   )
+
+// ── 账号分组 ──────────────────────────────────────────────────────────
+
+/** 分组表（uid → 分组名）与出现过的分组名。 */
+export const getGroups = () =>
+  adminJSON<{ groups: Record<string, string>; names: string[]; available: boolean }>('/__admin/groups')
+
+/** 整体保存分组表（空分组名 = 移出分组）。 */
+export const saveGroups = (groups: Record<string, string>) =>
+  adminJSON<{ ok: boolean }>('/__admin/groups', { method: 'POST', body: JSON.stringify({ groups }) })
+
+/** 给一批账号设置同一个分组（group 为空 = 移出分组）。 */
+export const setAccountGroup = (uids: string[], group: string) =>
+  adminJSON<{ updated: number; group: string }>('/__admin/groups/set', {
+    method: 'POST',
+    body: JSON.stringify({ uids, group }),
+  })

@@ -18,6 +18,7 @@ import (
 
 	"workbuddy2api/internal/admin"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/groupreg"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/proxyreg"
 	"workbuddy2api/internal/redisstore"
@@ -150,6 +151,20 @@ func main() {
 		}
 		return proxyRegistry.Resolve(a.UID)
 	})
+	// 账号调用历史落盘（只读诊断）：不配就不落盘（仅内存）。
+	if cfg.CallLogDir != "" {
+		keep := cfg.CallLogKeepDays
+		if keep == 0 {
+			keep = 7
+		}
+		p.EnableCallLog(absFromExe(cfg.CallLogDir), keep)
+		defer p.CloseCallLog()
+		log.Printf("[calllog] 账号调用历史落盘已启用：dir=%s keepDays=%d", cfg.CallLogDir, keep)
+	}
+
+	// 账号分组注册表（uid → 分组）。空配置 = 全部未分组 → 不过滤（行为不变）。
+	server.SetGroups(groupreg.New(cfg.AccountGroups))
+
 	// mihomo sidecar（订阅 → N 个本地出口端口 → 槽位）：启用时起子进程并自动同步。
 	// 未启用（enabled=false 或未填订阅）时完全不启动，行为零变化。
 	//
@@ -292,6 +307,8 @@ func main() {
 		},
 		// mihomo sidecar 端点（状态/同步/分配）；未启用时为 nil → 端点返回未接线。
 		Sidecar: sidecarController(sidecar, p),
+		// 账号分组（读/保存/批量设置）。nil → 端点返回未接线。
+		Groups: groupsAdapter{},
 		ModelsByRegion: func() (cn, global []string) {
 			return h.ModelsForRegion(auth.RegionCN), h.ModelsForRegion(auth.RegionGlobal)
 		},
@@ -465,7 +482,7 @@ func serverAPIKeys(in []APIKeySpec) []server.APIKeySpec {
 	}
 	out := make([]server.APIKeySpec, 0, len(in))
 	for _, k := range in {
-		out = append(out, server.APIKeySpec{Key: k.Key, Region: auth.Region(k.Region), Name: k.Name})
+		out = append(out, server.APIKeySpec{Key: k.Key, Region: auth.Region(k.Region), Name: k.Name, Group: k.Group})
 	}
 	return out
 }

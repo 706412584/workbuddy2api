@@ -19,7 +19,19 @@ type APIKeySpec struct {
 	Key    string `json:"key"`
 	Region string `json:"region"` // "" / "cn" / "global"
 	Name   string `json:"name"`   // 可选标识，仅用于日志
+	// Group 该 key 绑定的账号分组（空 = 未分组）。
+	//
+	// 语义（对齐 sub2api）：**未分组 key 只能用未分组账号；分组 key 只能用该组账号**，
+	// 两者互不通用，且组内无可用账号时**不回退**到全量（直接报无可
+	// 用账号）—— 回退会让「用分组隔离封禁号」失效。
+	Group string `json:"group,omitempty"`
 }
+
+// AccountGroups 账号 uid → 分组名。空/未列的 uid = 未分组。
+//
+// 为什么放在 config 而非 auths/*.json：后者由 SaveAtomic 在每次 token 刷新后整份
+// 重写（只写固定字段），放进去会被刷新悄悄抹掉 —— 与 account_proxies 同一理由。
+type AccountGroups map[string]string
 
 // ProxySlot 一个出站代理槽位。账号通过槽位 id 绑定，多个账号可共用同一槽位。
 //
@@ -98,6 +110,16 @@ type Config struct {
 	// **不放在 auths/*.json 里**：那个文件由 SaveAtomic 在每次 token 刷新后整份重写
 	// （只写固定的 auth/account 字段），绑定放进去会被刷新悄悄抹掉。
 	AccountProxies map[string]string `json:"account_proxies"`
+
+	// AccountGroups 账号 uid → 分组名（见 AccountGroups 类型说明）。
+	AccountGroups AccountGroups `json:"account_groups"`
+
+	// CallLogDir 账号调用历史（成功/失败原因）的落盘目录。
+	// 空 = 不落盘（仅内存保留最近 N 次，重启即丢）。相对路径按可执行文件目录解析。
+	CallLogDir string `json:"call_log_dir"`
+	// CallLogKeepDays 调用日志保留天数（按天一个 calls-YYYYMMDD.jsonl）。
+	// 0 = 用默认 7；负数 = 不清理。
+	CallLogKeepDays int `json:"call_log_keep_days"`
 
 	// ProxySidecar mihomo sidecar（订阅 → N 个本地出口端口）配置。
 	ProxySidecar ProxySidecarConfig `json:"proxy_sidecar"`

@@ -32,6 +32,10 @@ type Pool struct {
 	idleWeightMax     float64
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
+	// calls 账号级调用历史（环形缓冲 + 可选 JSONL 落盘），见 calls.go。
+	// 只读诊断用，**不参与**选号/冷却/封禁任何决策。
+	calls *callLog
+
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -50,6 +54,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		calls:              &callLog{byID: map[string][]CallRecord{}},
 	}
 	if stateFp != "" {
 		p.load()
@@ -206,3 +211,43 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
+
+// ── 账号调用历史（只读诊断，见 calls.go）────────────────────────────────
+
+// EnableCallLog 开启调用历史落盘（dir 为空或 keepDays<=0 则仅内存）。
+// 由 main 按 config 调用；不调用也能用（默认纯内存）。
+func (p *Pool) EnableCallLog(dir string, keepDays int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls.sink = newCallSink(dir, keepDays)
+}
+
+// NoteCall 记一次调用结果到账号的调用历史。
+//
+// 与 NoteSuccess/NoteAttempt 的分工：那两个改的是**选号/冷却状态**，
+// 本函数只写**诊断历史**，绝不参与任何决策 —— 故失败时也照记。
+// reason 由调用方给人类可读串（复用既有错误分类文案），本函数不做判定。
+func (p *Pool) NoteCall(uid string, ok bool, reason, model string, ms int64) {
+	if uid == "" {
+		return
+	}
+	p.calls.Add(uid, CallRecord{
+		Time: time.Now(), OK: ok, Reason: reason, Model: model, Ms: ms,
+	})
+}
+
+// CallHistory 返回某账号最近 CallHistorySize 次调用（新→旧）。
+func (p *Pool) CallHistory(uid string) []CallRecord { return p.calls.Get(uid) }
+
+// CallHistoryAll 返回全部账号的调用历史（uid → 新→旧）。
+func (p *Pool) CallHistoryAll() map[string][]CallRecord { return p.calls.Snapshot() }
+
+// CloseCallLog 关闭落盘句柄（进程退出时调用）。
+func (p *Pool) CloseCallLog() {
+	p.mu.RLock()
+	c := p.calls
+	p.mu.RUnlock()
+	if c != nil && c.sink != nil {
+		c.sink.close()
+	}
+}

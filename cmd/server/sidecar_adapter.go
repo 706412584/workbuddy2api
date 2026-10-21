@@ -8,6 +8,7 @@ package main
 import (
 	"workbuddy2api/internal/admin"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/server"
 )
 
 // sidecarAdapter 实现 admin.SidecarController。
@@ -93,3 +94,12 @@ func sidecarController(s *Sidecar, p *pool.Pool) admin.SidecarController {
 	}
 	return newSidecarAdapter(s, p)
 }
+
+// ── 账号分组控制器（注入 admin 的 GroupsController）──────────────────────
+
+type groupsAdapter struct{}
+
+func (groupsAdapter) Snapshot() map[string]string { return server.GroupsSnapshot() }
+func (groupsAdapter) SetAll(m map[string]string)  { server.SetAccountGroups(m) }
+func (groupsAdapter) Names() []string             { return server.GroupNames() }
+func (groupsAdapter) GroupOf(uid string) string   { return server.GroupOf(uid) }

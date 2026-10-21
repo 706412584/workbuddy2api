@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/groupreg"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
@@ -25,14 +26,22 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// APIKeySpec 一个 API key 及其绑定的上游区域。
+// APIKeySpec 一个 API key 及其绑定的上游区域与账号分组。
 // Region 为空表示不限区域（等价于旧的单一 api_key 行为）；绑定后该密钥的请求
 // 只会使用对应区域的账号，其 /v1/models 与 /status 也按该区域过滤。
+// Group 为空表示未分组 —— 此时只使用**未分组**账号（见 groupreg 语义）。
 type APIKeySpec struct {
 	Key    string      `json:"key"`
 	Region auth.Region `json:"region"`
 	Name   string      `json:"name"` // 可选，用于日志/排查标识
+	// Group 绑定的账号分组名。空 = 未分组（只能用未分组账号）。
+	Group string `json:"group,omitempty"`
 }
+
+// groups 账号分组注册表（uid → 分组名）。包级变量与 proxyRegistry 同理由：
+// admin 面板要在运行期读写它（热重载），而 Config 是值传递的注入缝。
+// nil = 未接线（不过滤，行为与加分组功能前一致）。
+var groups *groupreg.Registry
 
 // Config handler 依赖。
 type Config struct {
@@ -350,7 +359,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 // 空转是模型侧现象而非账号侧（实测 7 个不同账号都中过、全部同一模型），
 // 按密钥区域切开只会让形态更难看清。要看跨重启的长期趋势请查 gateway.log。
 func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec) {
-	pred := keyRegionPred(key)
+	pred := h.keyPickPred(key, nil)
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailedWhere(pred)
 	sticky := 0
 	if h.cfg.StickyCount != nil {
@@ -382,14 +391,6 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec
 	})
 }
 
-// keyRegionPred 把密钥绑定的区域编译成账号谓词；未绑定区域返回 nil（=不过滤）。
-// 复用 regionAllowed，使「密钥区域」与「模型区域」共用同一套判定语义。
-func keyRegionPred(key *APIKeySpec) func(*auth.Auth) bool {
-	if key == nil || key.Region == "" {
-		return nil
-	}
-	return regionAllowed([]auth.Region{key.Region})
-}
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
 // context_length 取自 2026-09-13 直连上游 /console/enterprises/personal/models 的
@@ -1069,6 +1070,8 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), o.model)
+			// 调用历史：把**分类结果**记成原因（复用既有文案，不另做判定）。
+			h.cfg.Pool.NoteCall(acct.UID, false, kind.String(), o.model, time.Since(st.start).Milliseconds())
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
 			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，说明 IP 被拦而非账号）
@@ -1093,6 +1096,9 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID, o.model)
+		// 调用历史（只读诊断，见 pool/calls.go）：记成功。与上面的 NoteSuccess
+		// 正交 —— 那个改选号状态，这个只为「这个号最近发生了什么」留痕。
+		h.cfg.Pool.NoteCall(acct.UID, true, "", o.model, time.Since(st.start).Milliseconds())
 
 		// 流式：转发必须在轮换循环内完成 —— 思考死循环只能靠「读了若干帧之后」
 		// 才判得出来，若交给调用方转发，这里就没有重试的机会了。
@@ -1322,7 +1328,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, key *A
 		return
 	}
 	allowedRegions = regions
-	pickPred := regionAllowed(allowedRegions)
+	// 账号谓词 = 区域 ∩ **密钥绑定的分组**。
+	//
+	// 分组这一维在此处叠加（而非只看 regionAllowed）：chat 是最主要的出站路径，
+	// 必须与 /status、/v1/models 一样受分组约束，否则「把封禁号隔离进受限组」
+	// 只对状态页生效、真实请求仍会打过去 —— 实测踩到过（普通 key 的调用记录里
+	// 出现了受限组账号）。
+	pickPred := h.keyPickPred(key, allowedRegions)
 
 	rc := h.forwardChat(w, body, forwardOpt{
 		ctx:            r.Context(),
@@ -1600,4 +1612,82 @@ func (h *Handler) readBodyOrFail(w http.ResponseWriter, r *http.Request, anthrop
 		return nil, false
 	}
 	return body, true
+}
+
+// ── 账号分组接线（main / admin 用）─────────────────────────────────────
+
+// SetGroups 注入分组注册表。nil = 不过滤（行为与加分组功能前一致）。
+func SetGroups(r *groupreg.Registry) { groups = r }
+
+// GroupsSnapshot 返回 uid → 分组 的副本（供 admin 面板展示）。
+func GroupsSnapshot() map[string]string {
+	if groups == nil {
+		return map[string]string{}
+	}
+	return groups.All()
+}
+
+// SetAccountGroups 整体替换分组表（面板保存后热重载）。
+func SetAccountGroups(m map[string]string) {
+	if groups == nil {
+		groups = groupreg.New(m)
+		return
+	}
+	groups.Set(m)
+}
+
+// GroupNames 返回出现过的分组名（供面板下拉）。
+func GroupNames() []string {
+	if groups == nil {
+		return nil
+	}
+	return groups.Names()
+}
+
+// GroupOf 返回某账号的分组名（空 = 未分组）。
+func GroupOf(uid string) string {
+	if groups == nil {
+		return ""
+	}
+	return groups.GroupOf(uid)
+}
+
+// MatchesGroup 报告账号是否属于该分组（admin 校验/面板用）。
+func MatchesGroup(uid, group string) bool {
+	if groups == nil {
+		return group == "" // 未接线：只认为空分组匹配
+	}
+	return groups.Matches(uid, group)
+}
+
+// keyPickPred 构造某次请求的账号谓词 = 区域约束 ∩ 密钥分组约束。
+//
+// 抽成方法供**所有**出站路径共用（chat / messages / responses / status / models）：
+// 只要有任一路径自己拼谓词而漏掉分组，隔离就会被绕过（实测踩到过 —— chat 路径
+// 原先只调 regionAllowed，导致普通 key 的调用记录里出现受限组账号）。
+//
+// regions 为空 = 不限区域（该维不过滤）。groups 未接线 = 不限分组。
+func (h *Handler) keyPickPred(key *APIKeySpec, regions []auth.Region) func(*auth.Auth) bool {
+	var preds []func(*auth.Auth) bool
+	if len(regions) > 0 {
+		preds = append(preds, regionAllowed(regions))
+	}
+	if groups != nil {
+		g := ""
+		if key != nil {
+			g = key.Group
+		}
+		preds = append(preds, func(a *auth.Auth) bool { return groups.Matches(a.UID, g) })
+	}
+	if len(preds) == 0 {
+		return nil
+	}
+	return func(a *auth.Auth) bool {
+		for _, p := range preds {
+			if !p(a) {
+				return false
+			}
+		}
+		return true
+	}
 }

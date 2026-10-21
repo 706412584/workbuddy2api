@@ -40,6 +40,15 @@ type authFileView struct {
 	DisabledReason string `json:"disabledReason,omitempty"`
 	// InPool 该账号是否已在网关池中。false 时 Disabled/DisabledReason 无意义。
 	InPool bool `json:"inPool"`
+	// CreatedAt 首次入库时间（Unix 秒；0 = 未知，早于该字段引入的旧凭证）。
+	CreatedAt int64 `json:"createdAt,omitempty"`
+	// LastSuccess 末次**成功**时刻（池状态；空/零值 = 从未成功）。
+	// 注意语义：它是"末次成功"，**不是"末次被调用"** —— 号一直失败时它不更新。
+	// 要判断"是否还在被用"请看 Calls。
+	LastSuccess string `json:"lastSuccess,omitempty"`
+	// Calls 最近若干次调用（新→旧），含成功/失败原因。供面板回答「这个号最近
+	// 发生了什么」—— 这是本次新增，用于补上"成功无可靠日志"的观测缺口。
+	Calls []pool.CallRecord `json:"calls,omitempty"`
 }
 
 // viewOf 解析单个凭证文件为视图。解析失败（含缺 accessToken）返回 false，
@@ -114,6 +123,11 @@ func mergePoolState(p *pool.Pool, views []authFileView) {
 		views[i].InPool = true
 		views[i].Disabled = s.Disabled
 		views[i].DisabledReason = s.DisabledReason
+		if !s.LastSuccessTime.IsZero() {
+			views[i].LastSuccess = s.LastSuccessTime.Format(time.RFC3339)
+		}
+		// 调用历史（只读诊断）：「这个号最近发生了什么」。
+		views[i].Calls = p.CallHistory(views[i].UID)
 	}
 }
 

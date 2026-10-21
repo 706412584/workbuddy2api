@@ -150,6 +150,12 @@ export interface AuthFileView {
   disabledReason?: string
   /** 该账号是否已在网关池中；false 时 disabled 无意义 */
   inPool: boolean
+  /** 首次入库时间（Unix 秒；0/缺省 = 未知，早于该字段引入的旧凭证） */
+  createdAt?: number
+  /** 末次**成功**时刻（不是"末次被调用"——号一直失败时它不更新） */
+  lastSuccess?: string
+  /** 最近调用历史（新→旧），含成功/失败原因 */
+  calls?: CallRecord[]
 }
 
 export interface AccountsResponse {
@@ -453,4 +459,23 @@ export interface ProxyTestResult {
   elapsedMs?: number
   status?: number
   error?: string
+}
+
+/** 账号调用记录（pool.CallRecord）。 */
+export interface CallRecord {
+  /** 调用时刻（RFC3339） */
+  t: string
+  ok: boolean
+  /** 失败原因（人类可读） */
+  reason?: string
+  model?: string
+  /** 耗时毫秒 */
+  ms?: number
+}
+
+/** GET /__admin/groups 的响应。 */
+export interface GroupsStatus {
+  groups: Record<string, string>
+  names: string[]
+  available: boolean
 }
