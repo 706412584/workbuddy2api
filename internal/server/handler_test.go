@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2636,5 +2637,95 @@ func TestReadBodyOrFailTooLarge(t *testing.T) {
 	}
 	if aerr.Type != "error" || aerr.Error.Type != "request_too_large" {
 		t.Fatalf("anthropic error shape: got %+v, want type=error / error.type=request_too_large", aerr)
+	}
+}
+
+// TestRefreshTransportFailureDoesNotBlameAccount 是 2026-10-23 事故的回归锁。
+//
+// 场景：本机 DNS 中途失败（Clash/TUN 抖动）→ RefreshToken 的 HTTP 往返返回**裸传输
+// 错误**（没有 *upstream.Error 信封）。旧代码用 `errors.As(err, &ue)` 判断，传输错误
+// 落进 else 分支调 Pool.NoteError —— 而 NoteError 每次都会喂熔断器
+// （NoteError → recordBreakerFailureLocked），连续 3 次就把健康号标成「熔断中」30 分钟。
+//
+// 实测证据：5f7bdc55 熔断到期 15:05:39，其唯一一次 429 在 14:35:39 —— 恰好差一个
+// breaker_cooldown 基数。6 分钟 DNS 窗口内 107 次解析失败，期间若干号 token 到期。
+//
+// 断言：传输层失败**不改变**账号的熔断计数与熔断窗口（不罚账号），但仍换号。
+func TestRefreshTransportFailureDoesNotBlameAccount(t *testing.T) {
+	// 所有出站请求都直接失败在传输层（模拟 DNS 解析失败）。
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: "www.workbuddy.ai", IsNotFound: true}
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	// token 已过期 → NeedsRefresh 必为真，请求必然先走 refresh。
+	acct := &auth.Auth{
+		UID: "u1", AccessToken: "at-old", RefreshToken: "rt",
+		ExpiresAt: time.Now().Add(-time.Hour).Unix(), Domain: "copilot.tencent.com",
+	}
+	p := testPoolWith(acct)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rec, req)
+
+	// 请求本身失败（确实没有可用账号），但账号不该被罚。
+	if rec.Code == http.StatusOK {
+		t.Fatalf("传输层全失败时不该返回 200")
+	}
+	for _, st := range p.List() {
+		if st.UID != "u1" {
+			continue
+		}
+		if st.BreakerFails != 0 {
+			t.Errorf("传输层失败不该计入熔断失败数：BreakerFails=%d（旧实现会累计并熔断）", st.BreakerFails)
+		}
+		if !st.BreakerUntil.IsZero() {
+			t.Errorf("传输层失败不该触发熔断：BreakerUntil=%v", st.BreakerUntil)
+		}
+		if st.ErrTotal != 0 {
+			t.Errorf("传输层失败不该计入 errTotal：ErrTotal=%d", st.ErrTotal)
+		}
+	}
+}
+
+// TestRefreshBusinessErrorStillBlames 反向确认：拿到上游**业务**答复（带信封）时
+// 仍然照旧罚账号 —— 否则「刷新失败永不罚号」会让真正需要重登的死号留在池里。
+func TestRefreshBusinessErrorStillBlames(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			// 401 带业务信封：账号侧凭证问题，必须照旧记错。
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":12153,"msg":"session expired"}`)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	acct := &auth.Auth{
+		UID: "u1", AccessToken: "at-old", RefreshToken: "rt",
+		ExpiresAt: time.Now().Add(-time.Hour).Unix(), Domain: "copilot.tencent.com",
+	}
+	p := testPoolWith(acct)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rec, req)
+
+	// 12153 走 NoteSessionDead（连续计数），单次不该累计 errTotal、也不该熔断。
+	for _, st := range p.List() {
+		if st.UID == "u1" && st.BreakerFails != 0 {
+			t.Errorf("业务错误（12153）单次不该熔断：BreakerFails=%d", st.BreakerFails)
+		}
 	}
 }

@@ -677,12 +677,24 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.DisabledReason = e.reason
 	}
 	if st.Cooling {
-		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
+		// 剩余时间与类别必须按**真正生效的那个来源**报。
+		//
+		// Cooling 是 `until || breakerUntil` 的并集，但旧代码无论谁生效都只读 e.until：
+		// 熔断期间（until 为零值）会算出 0 剩余，并透出 e.coolKind 里上一次冷却留下的
+		// **陈旧类别** —— 实测面板显示「kind=hard_credit + 余额 557 + 熔断中」这种
+		// 自相矛盾的状态（该号其实是 6004 限流触发的熔断，coolKind 是别的路径的残留）。
+		//
+		// 熔断不是冷却类别（它是「反复失败」的指数退避），故此时不给 CoolKind：
+		// 面板已有独立的「熔断中 / 熔断剩 N」展示，不需要再编一个类别出来。
+		if now.Before(e.until) {
+			st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
+			st.CoolKind = e.coolKind.String()
+		} else {
+			st.CoolRemaining = int64(time.Until(e.breakerUntil).Seconds() + 0.999)
+		}
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
-		st.CoolKind = e.coolKind.String()
 	}
 	// 模型级冷却单列：它们不写 until（账号对其他模型仍可用），只看 Cooling/Until
 	// 会把「4.1-flash 冷却中」的账号显示成正常 —— 运维盲区。

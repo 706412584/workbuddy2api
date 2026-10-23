@@ -2425,3 +2425,57 @@ func TestReviveDisabledClearsManualFlag(t *testing.T) {
 		t.Error("ReviveDisabled 应清掉人工标记，后续自动禁用可被测试解除")
 	}
 }
+
+// TestStatusDuringBreakerReportsBreakerNotStaleKind 是 2026-10-23 面板显示 bug 的回归锁。
+//
+// 症状：账号卡片显示「kind=hard_credit + 余额 557 + 熔断中」，自相矛盾。
+//
+// 成因：Cooling 取的是 `until || breakerUntil` 的并集，但 CoolRemaining/CoolKind 旧代码
+// 只读 e.until。熔断期间（until 已过期或本就是零值）于是报出 0 剩余，并把 e.coolKind
+// 里**上一次冷却**留下的陈旧类别一起透出去。
+//
+// 实测对应场景：6004 模型级限流（Cooldown 的 model 分支**不写** coolKind，只喂熔断器）
+// 连续 3 次 → 熔断 30 分钟；面板同时显示的是更早一次余额冷却留下的 coolKind=hard_credit。
+//
+// 断言：熔断生效时剩余时间取自 breakerUntil，且不报任何冷却类别。
+func TestStatusDuringBreakerReportsBreakerNotStaleKind(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(1, time.Hour, time.Hour) // 阈值 1：一次失败即熔断，便于断言
+
+	// 先造一次「已过期」的余额冷却，让 e.coolKind 残留 CoolHard（陈旧类别）。
+	p.Cooldown("u1", CoolHard, -time.Minute, "余额不足", "")
+
+	// 再喂一次熔断信号（等价于 6004 限流那条不写 coolKind 的路径）。
+	p.NoteError("u1")
+
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Fatal("熔断生效时 Cooling 应为 true")
+	}
+	if st.BreakerUntil.IsZero() {
+		t.Fatal("应已触发熔断")
+	}
+	if st.CoolKind != "" {
+		t.Errorf("熔断不是冷却类别，不该透出陈旧 coolKind：got %q（旧实现会报 hard_credit）", st.CoolKind)
+	}
+	if st.CoolRemaining <= 0 {
+		t.Errorf("熔断期间剩余时间应取自 breakerUntil（>0）：got %d（旧实现恒为 0）", st.CoolRemaining)
+	}
+}
+
+// TestStatusRealCooldownStillReportsKind 反向确认：真正的账号级冷却仍在时，
+// 类别照旧透出（别把修复做成「再也不显示 kind」）。
+func TestStatusRealCooldownStillReportsKind(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足", "")
+
+	st, _ := p.Status("u1")
+	if st.CoolKind != "hard_credit" {
+		t.Errorf("真实冷却的类别应照旧透出：got %q want hard_credit", st.CoolKind)
+	}
+	if st.CoolRemaining <= 0 {
+		t.Errorf("真实冷却的剩余时间应 >0：got %d", st.CoolRemaining)
+	}
+}

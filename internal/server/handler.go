@@ -398,7 +398,6 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec
 	})
 }
 
-
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
 // context_length 取自 2026-09-13 直连上游 /console/enterprises/personal/models 的
 // maxInputTokens 实测值；此前统一硬编码 131072，会让客户端误以为只有 128K 而提前截断。
@@ -945,12 +944,13 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 		}
 		heldUID = acct.UID
 
-		// token 临近过期 → 先 refresh（失败冷却换号）
+		// token 临近过期 → 先 refresh（失败换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				switch {
+				case errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead:
 					// 连续计数语义（与 scheduler 的 keepalive/checkin 一致）：12153 会被
 					// 临时触发（网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用会
 					// 误杀健康号（P0-1：13 个 disabled 号 refresh 全部成功）。
@@ -958,7 +958,33 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 						log.Printf("WARN: [server] chat refresh uid=%s: 连续 %d 次 12153 session dead — 禁用",
 							logfmt.UID8(acct.UID), pool.SessionDeadThreshold())
 					}
-				} else {
+				case !errors.As(err, &ue):
+					// **本地传输失败，不罚账号**（2026-10-23 实测事故）。
+					//
+					// doJSON 在 DNS 解析失败 / 拨号失败 / 连接被重置时返回的是**裸
+					// 传输错误**（没有 *upstream.Error 信封），旧代码因此落进 else
+					// 分支调 NoteError —— 每次 NoteError 都喂一次熔断器（见
+					// pool.NoteError → recordBreakerFailureLocked），连续 3 次就把
+					// 健康号标成「熔断中」。
+					//
+					// 实测：Clash/TUN 抖动导致本机 DNS 中途失败，6 分钟里 107 次
+					// `dial tcp: lookup www.workbuddy.ai: getaddrinfow: ...`，期间
+					// 恰好有若干账号 token 到期走 refresh → 被误熔断 30 分钟。
+					// 证据：5f7bdc55 熔断到期 15:05:39，而其唯一一次 429 在 14:35:39，
+					// 两者恰好差一个 breaker_cooldown 基数（30m）。
+					//
+					// 判据与 chat 出站的传输层错误分支**完全一致**（那里明确写着
+					// 「只换号、不罚账号」，理由同样适用于 refresh）：账号本身健康，
+					// 是本地网络/代理基础设施出了问题，罚账号只会把整池健康号
+					// 逐个打进熔断，而故障早已恢复。
+					//
+					// 仍换号（下面的 fail + continue）：该号这次没能刷新，换一个
+					// 不必刷新的号继续服务本次请求。但**不记错、不熔断**——若整池
+					// 都刷不出来（真断网），那是全局故障，罚谁都没用。
+					log.Printf("WARN: [server] chat refresh uid=%s: 传输层失败，不罚账号（本地网络/代理问题）：%v",
+						logfmt.UID8(acct.UID), err)
+				default:
+					// 拿到上游的**业务**答复（402/401/400 带信封等）：这才是账号侧问题。
 					h.cfg.Pool.NoteError(acct.UID)
 				}
 				fail(acct.UID)
@@ -1193,7 +1219,7 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 				// 其余流错误（客户端断连、上游中断）：无法重试（响应已开始），如实记日志。
 				log.Printf("WARN: [server] stream uid=%s: %v", logfmt.UID8(acct.UID), serr)
 			}
-		// 粘性绑定与租约：流已写完，绑定成功号（多轮对话下一跳不再随机抽）。
+			// 粘性绑定与租约：流已写完，绑定成功号（多轮对话下一跳不再随机抽）。
 			if sessKey != "" && h.cfg.Session != nil {
 				h.cfg.Session.Bind(sessKey, acct.UID)
 			}

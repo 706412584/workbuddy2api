@@ -39,6 +39,9 @@ function accountState(a: PoolStatus['accounts'][number], now: number) {
   if (a.disabled) return { label: '已禁用', cls: 'err' } as const
   if (breakerActive(a, now)) return { label: '熔断中', cls: 'err' } as const
   if (a.cooling) {
+    // cool_kind 缺失 = 处于熔断（后端不再透出陈旧类别）。此时按熔断表述，
+    // 否则会落进 else 显示成「限流冷却」——而它可能压根不是限流引起的。
+    if (!a.cool_kind) return { label: '熔断冷却', cls: 'warn' } as const
     const kind = a.cool_kind === 'hard_credit' ? '余额冷却' : '限流冷却'
     return { label: kind, cls: 'warn' } as const
   }
