@@ -8,16 +8,14 @@
 package admin
 
 import (
-	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	"workbuddy2api/internal/proxyreg"
+	"workbuddy2api/internal/upstream"
 )
 
 // proxyStatus 槽位 + 绑定 + 使用计数的界面视图。
@@ -37,10 +35,19 @@ type proxySlotView struct {
 	Usage int `json:"usage"`
 	// 出口健康（按代理 URL 记账，见 upstream.ProxyHealth）。
 	// Healthy 为 false 时选号会排除绑定本槽位的账号（轮换改用别的出口）。
-	Healthy    bool   `json:"healthy"`
-	FailCount  int    `json:"fail_count"`
-	LastErr    string `json:"last_error,omitempty"`
-	CooldownMs int64  `json:"cooldown_ms,omitempty"`
+	Healthy bool `json:"healthy"`
+	// HealthKnown 该出口是否有过任何探测/出站记录。
+	//
+	// **必须与 Healthy 分开**：健康账只记「真实出站」与「手动测试」的结果，
+	// 从没被用过的槽位没有任何记录。旧实现把「无记录」默认成 Healthy=true，
+	// 于是面板把「从未使用」显示成「正常」—— 2026-10-24 实测：8 个槽位经出口
+	// 访问 generate_204 全部返回 502，面板却全绿，误导成「出口都健康」。
+	// 界面据此显示第三态「未探测」，而不是谎报正常。
+	HealthKnown bool   `json:"health_known"`
+	ProbedAt    string `json:"probed_at,omitempty"`
+	FailCount   int    `json:"fail_count"`
+	LastErr     string `json:"last_error,omitempty"`
+	CooldownMs  int64  `json:"cooldown_ms,omitempty"`
 }
 
 // getProxySlots GET /__admin/proxy/slots —— 列出槽位与绑定概览。
@@ -58,10 +65,12 @@ func (h *Handler) getProxySlots(w http.ResponseWriter, r *http.Request) {
 		v := proxySlotView{Slot: s, Usage: usage[s.ID], Healthy: true}
 		if h.cfg.ProxyHealth != nil {
 			if hp, ok := h.cfg.ProxyHealth(s.URL); ok {
+				v.HealthKnown = true
 				v.Healthy = !hp.Unhealthy
 				v.FailCount = hp.Fails
 				v.LastErr = hp.LastErr
 				v.CooldownMs = hp.CooldownMs
+				v.ProbedAt = hp.ProbedAt
 			}
 		}
 		views = append(views, v)
@@ -165,17 +174,16 @@ func (h *Handler) saveProxySlots(w http.ResponseWriter, r *http.Request) {
 	ok(w, nil)
 }
 
-// probeURL 探测目标。选 generate_204：全球可达、成功必回 204、响应体为空（省流量）。
-// 状态码即判据——204 表示经该出口真的访问到了目标；502/503 是 mihomo 在
-// 「上游节点连不上」时本地返回的失败信号。
-const probeURL = "http://www.gstatic.com/generate_204"
-
 // testProxy POST /__admin/proxy/test —— 探测某个代理是否可用。
 //
 // 用「经该代理访问一个必然可达的地址」判定：只做 TCP+HTTP 连通性，
 // **不打上游**（避免用真实账号流量做探测，也避免消耗额度）。
 // 目标选 http://www.gstatic.com/generate_204（全球可达的 204 端点）；
 // 失败时回落报告拨号阶段的错误，便于区分「代理连不上」与「代理连上但出不去」。
+//
+// 探测结果**同时写回健康登记**（NoteProxyResult），使面板的槽位健康列能反映
+// 手动「测试」的结论 —— 否则健康列只认「真实出站」的账，从没被用过的坏槽位
+// 会一直显示「正常」（2026-10-24 实测：8 个槽位实际全部 502，面板全绿）。
 func (h *Handler) testProxy(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		URL string `json:"url"`
@@ -193,75 +201,16 @@ func (h *Handler) testProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, _ := url.Parse(body.URL)
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	// 第一步：能否连上代理本身（区分「代理不可达」与「代理可达但转发失败」）
-	stage := "dial"
-	start := time.Now()
-	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", u.Host)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "stage": stage, "elapsedMs": time.Since(start).Milliseconds(),
-			"error": "连不上代理主机 " + u.Host + "：" + err.Error(),
-		})
-		return
-	}
-	conn.Close()
-	dialMs := time.Since(start).Milliseconds()
-
-	// 第二步：经代理发一次真实 HTTP 请求（用标准库的 Proxy 钩子，http 代理通用）
-	stage = "request"
-	reqStart := time.Now()
-	client := &http.Client{
-		Timeout: 8 * time.Second,
-		Transport: &http.Transport{
-			Proxy:             http.ProxyURL(u),
-			DisableKeepAlives: true, // 探测用短连接，不留池
-			ForceAttemptHTTP2: false,
-		},
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "构造探测请求失败：%v", err)
-		return
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "stage": stage, "dialMs": dialMs,
-			"elapsedMs": time.Since(reqStart).Milliseconds(),
-			"error":     "代理可达但转发失败：" + err.Error(),
-		})
-		return
-	}
-	resp.Body.Close()
-	elapsed := time.Since(reqStart).Milliseconds()
-
-	// 第三步（关键）：**必须检查状态码**，不能只看 err。
-	//
-	// 回归背景（2026-10-21 面板实测）：本函数原先只判 err != nil，于是任何 HTTP
-	// 响应都算「可用」—— 探测目标是 generate_204（成功应为 204），但经故障出口时
-	// 会拿到 502，面板却显示「✓ 可用（… HTTP 502）」，把坏出口标成好出口。
-	//
-	// 为什么 502 是出口故障而非目标站问题：mihomo 在「上游节点连不上」时会在本地
-	// 直接回 502/503，不返回 HTML —— 这是 mihomo 侧的失败信号（可按需按类型放宽
-	// 或收紧）。故 >=400 一律判失败，并把状态码与耗时一并回报，便于区分
-	// 「出口全断」与「目标站抽风」。
-	if resp.StatusCode >= 400 {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "stage": "request", "dialMs": dialMs,
-			"elapsedMs": elapsed, "status": resp.StatusCode,
-			"error": fmt.Sprintf("出口返回 HTTP %d（经该出口访问 %s 未成功，期望 204）"+
-				"；常见原因是节点不可用或已失效", resp.StatusCode, probeURL),
-		})
-		return
+	res := upstream.ProbeProxyURL(r.Context(), body.URL)
+	// 写回健康登记：成功清账、失败记一笔（与真实出站共用同一本账）。
+	// 这样面板的槽位健康列能反映手动「测试」的结论，而不是只认真实出站的账。
+	if h.cfg.ProxyNoteResult != nil {
+		h.cfg.ProxyNoteResult(body.URL, res.OK, res.Error)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "stage": "ok", "dialMs": dialMs,
-		"elapsedMs": elapsed,
-		"status":    resp.StatusCode,
+		"ok": res.OK, "stage": res.Stage, "dialMs": res.DialMs,
+		"elapsedMs": res.ElapsedMs, "status": res.Status,
+		"error": res.Error,
 	})
 }
 

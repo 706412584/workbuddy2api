@@ -306,7 +306,13 @@ func main() {
 			return admin.ProxyHealthInfo{
 				Unhealthy: hp.Unhealthy, Fails: hp.Fails,
 				LastErr: hp.LastErr, CooldownMs: hp.CooldownMs,
+				ProbedAt: hp.ProbedAt,
 			}, ok
+		},
+		// 面板「测试」的结论写回同一本健康账，让槽位健康列反映手动探测结果
+		// （否则从没被用过的坏槽位会一直显示「正常」）。
+		ProxyNoteResult: func(rawURL string, ok bool, errMsg string) {
+			upstream.NoteProxyResult(rawURL, ok, errMsg)
 		},
 		// mihomo sidecar 端点（状态/同步/分配）；未启用时为 nil → 端点返回未接线。
 		Sidecar: sidecarController(sidecar, p),

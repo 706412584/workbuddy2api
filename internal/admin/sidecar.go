@@ -38,6 +38,8 @@ type ProxyHealthInfo struct {
 	Fails      int    `json:"fails"`
 	LastErr    string `json:"last_error"`
 	CooldownMs int64  `json:"cooldown_ms"`
+	// ProbedAt 最近一次记账时刻（RFC3339）。供面板显示「多久没探过」。
+	ProbedAt string `json:"probed_at,omitempty"`
 }
 
 // SidecarStatus 状态快照（与 cmd/server 的同名字段对齐；此处独立声明以免 admin

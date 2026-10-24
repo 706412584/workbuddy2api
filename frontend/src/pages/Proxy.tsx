@@ -286,7 +286,13 @@ export function Proxy({ onChanged }: Props) {
     setTests((t) => ({ ...t, [s.id]: r }))
   }
 
-  /** 一键测全部槽位（串行，避免同时打一堆连接）。 */
+  /**
+   * 一键测全部槽位（串行，避免同时打一堆连接）。
+   *
+   * 测完会 `load()` 刷新：后端 testProxy 会把结论写回出口健康账，
+   * 于是健康列从「未探测」变成「正常/异常」—— 这正是「右下角按钮做健康监测」
+   * 要的效果（在此之前测试结果只留在本页局部 state 里，健康列看不到）。
+   */
   const testAll = async () => {
     setTestingAll(true)
     for (const s of slots) {
@@ -296,6 +302,8 @@ export function Proxy({ onChanged }: Props) {
       setTests((t) => ({ ...t, [s.id]: r }))
     }
     setTestingAll(false)
+    await load()
+    onChanged()
   }
 
   // ── 保存 ────────────────────────────────────────────────────────────
@@ -504,13 +512,24 @@ export function Proxy({ onChanged }: Props) {
                             title={
                               `出口不可用：连续失败 ${s.fail_count ?? 0} 次` +
                               (s.last_error ? `\n最近错误：${s.last_error}` : '') +
-                              (s.cooldown_ms ? `\n${Math.ceil(s.cooldown_ms / 1000)}s 后自动重探` : '')
+                              (s.cooldown_ms ? `\n${Math.ceil(s.cooldown_ms / 1000)}s 后自动重探` : '') +
+                              (s.probed_at ? `\n最近探测：${s.probed_at}` : '')
                             }
                           >
                             {s.cooldown_ms ? `${Math.ceil(s.cooldown_ms / 1000)}s` : '异常'}
                           </span>
+                        ) : !s.health_known ? (
+                          /* 三态里的第三态：没有任何探测/出站记录。
+                             不能显示成「正常」—— 实测 8 个槽位全部 502 却全绿，
+                             误导成「出口都健康」。 */
+                          <span className="badge warn" title="尚无探测记录：该出口还没被用过，也没点过「测试」。点右侧「测试」立即探测。">
+                            未探测
+                          </span>
                         ) : (
-                          <span className="badge ok" title="出口正常（或尚未出站）">
+                          <span
+                            className="badge ok"
+                            title={'出口正常' + (s.probed_at ? `\n最近探测：${s.probed_at}` : '')}
+                          >
                             正常
                           </span>
                         )}

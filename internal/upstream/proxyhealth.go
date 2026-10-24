@@ -19,7 +19,11 @@
 package upstream
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +42,80 @@ const (
 	proxyUnhealthyTTL = 60 * time.Second
 )
 
+// ProbeURL 探测目标。选 generate_204：全球可达、成功必回 204、响应体为空（省流量）。
+// 状态码即判据 —— 204 表示经该出口真的访问到了目标；502/503 是 mihomo 在
+// 「上游节点连不上」时**本地**返回的失败信号。
+const ProbeURL = "http://www.gstatic.com/generate_204"
+
+// ProbeResult 一次出口探测的结果（面板字段与内部判定共用）。
+type ProbeResult struct {
+	OK bool
+	// Stage dial（连不上代理主机）/ request（可达但转发失败）/ ok
+	Stage     string
+	DialMs    int64
+	ElapsedMs int64
+	Status    int
+	Error     string
+}
+
+// ProbeProxyURL 探测一个代理出口是否可用。ctx 由调用方给（面板请求 / 同步流程）。
+//
+// 判定链路（三步，缺一都会误判）：
+//  1. TCP 能连上代理主机 —— 区分「代理进程没了」与「代理活着但出不去」；
+//  2. 经代理发一次 GET（标准库 Proxy 钩子，http/https 代理通用）；
+//  3. **校验状态码**，不能只看 err。
+//
+// 第 3 步的回归背景（2026-10-21）：原实现只判 err != nil，于是任何 HTTP 响应都算
+// 「可用」—— 目标是 generate_204（成功应为 204），经故障出口时会拿到 502，
+// 面板却显示「✓ 可用（… HTTP 502）」。mihomo 在「上游节点连不上」时**在本地**
+// 直接回 502/503 且不返回 HTML，所以 >=400 一律判失败。
+func ProbeProxyURL(ctx context.Context, rawURL string) ProbeResult {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ProbeResult{Stage: "dial", Error: "URL 解析失败：" + err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", u.Host)
+	if err != nil {
+		return ProbeResult{Stage: "dial", ElapsedMs: time.Since(start).Milliseconds(),
+			Error: "连不上代理主机 " + u.Host + "：" + err.Error()}
+	}
+	conn.Close()
+	dialMs := time.Since(start).Milliseconds()
+
+	reqStart := time.Now()
+	client := &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(u),
+			DisableKeepAlives: true, // 探测用短连接，不留池
+			ForceAttemptHTTP2: false,
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ProbeURL, nil)
+	if err != nil {
+		return ProbeResult{Stage: "request", DialMs: dialMs, Error: "构造探测请求失败：" + err.Error()}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ProbeResult{Stage: "request", DialMs: dialMs,
+			ElapsedMs: time.Since(reqStart).Milliseconds(),
+			Error:     "代理可达但转发失败：" + err.Error()}
+	}
+	resp.Body.Close()
+	elapsed := time.Since(reqStart).Milliseconds()
+
+	if resp.StatusCode >= 400 {
+		return ProbeResult{Stage: "request", DialMs: dialMs, ElapsedMs: elapsed, Status: resp.StatusCode,
+			Error: fmt.Sprintf("出口返回 HTTP %d（经该出口访问 %s 未成功，期望 204）；常见原因是节点不可用或已失效",
+				resp.StatusCode, ProbeURL)}
+	}
+	return ProbeResult{OK: true, Stage: "ok", DialMs: dialMs, ElapsedMs: elapsed, Status: resp.StatusCode}
+}
+
 // proxyHealth 按代理 URL 记账的健康登记表。
 type proxyHealth struct {
 	mu sync.Mutex
@@ -53,6 +131,9 @@ type proxyEntry struct {
 	lastErr string
 	// probedAt 最近一次主动探测时刻（避免并发请求同时探测同一代理）。
 	probedAt time.Time
+	// notedAt 最近一次记账时刻（真实出站或手动测试）。面板据此显示「多久没探过」，
+	// 与 probedAt（主动 TCP 探测的节流用）语义不同：notedAt 每次结果都更新。
+	notedAt time.Time
 }
 
 var proxyHealthReg = &proxyHealth{m: map[string]*proxyEntry{}}
@@ -70,6 +151,7 @@ func NoteProxyResult(proxyURL string, success bool, errMsg string) {
 		e = &proxyEntry{}
 		proxyHealthReg.m[proxyURL] = e
 	}
+	e.notedAt = time.Now()
 	if success {
 		e.fails = 0
 		e.unhealthyUntil = time.Time{}
@@ -115,6 +197,8 @@ type ProxyHealthSnapshot struct {
 	Unhealthy  bool   `json:"unhealthy"`
 	LastErr    string `json:"last_error"`
 	CooldownMs int64  `json:"cooldown_ms"`
+	// ProbedAt 最近一次记账时刻（RFC3339；零值 = 从未有记录，面板显示「未探测」）。
+	ProbedAt string `json:"probed_at,omitempty"`
 }
 
 // ProxyHealth 导出全部代理健康快照。
@@ -124,7 +208,7 @@ func ProxyHealth() []ProxyHealthSnapshot {
 	out := make([]ProxyHealthSnapshot, 0, len(proxyHealthReg.m))
 	now := time.Now()
 	for u, e := range proxyHealthReg.m {
-		s := ProxyHealthSnapshot{URL: sanitizeProxyURL(u), Fails: e.fails, LastErr: e.lastErr}
+		s := ProxyHealthSnapshot{URL: sanitizeProxyURL(u), Fails: e.fails, LastErr: e.lastErr, ProbedAt: rfc3339OrEmpty(e.notedAt)}
 		if !e.unhealthyUntil.IsZero() && now.Before(e.unhealthyUntil) {
 			s.Unhealthy = true
 			s.CooldownMs = e.unhealthyUntil.Sub(now).Milliseconds()
@@ -132,6 +216,14 @@ func ProxyHealth() []ProxyHealthSnapshot {
 		out = append(out, s)
 	}
 	return out
+}
+
+// rfc3339OrEmpty 零值时间返回空串（面板据此区分「未探测」与「刚探过」）。
+func rfc3339OrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 // ResetProxyHealth 清空健康登记（代理配置变更时调用——旧 URL 的记录已无意义）。
@@ -239,7 +331,7 @@ func ProxyHealthByURL(rawURL string) (ProxyHealthSnapshot, bool) {
 		return ProxyHealthSnapshot{}, false
 	}
 	now := time.Now()
-	s := ProxyHealthSnapshot{URL: sanitizeProxyURL(rawURL), Fails: e.fails, LastErr: e.lastErr}
+	s := ProxyHealthSnapshot{URL: sanitizeProxyURL(rawURL), Fails: e.fails, LastErr: e.lastErr, ProbedAt: rfc3339OrEmpty(e.notedAt)}
 	if !e.unhealthyUntil.IsZero() && now.Before(e.unhealthyUntil) {
 		s.Unhealthy = true
 		s.CooldownMs = e.unhealthyUntil.Sub(now).Milliseconds()

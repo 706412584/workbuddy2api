@@ -15,6 +15,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/mihomosub"
+	"workbuddy2api/internal/upstream"
 )
 
 // sidecarHTTPTimeout 拉订阅/探活的超时。订阅通常几百 KB，30s 足够。
@@ -167,9 +169,14 @@ func (s *Sidecar) applySubscription(body []byte) (*SyncResult, error) {
 		s.setErr(err)
 		return nil, fmt.Errorf("订阅解析失败：%w", err)
 	}
+
+	// 探测候选池必须**大于** max_nodes：否则「先取前 N 个再探测」会把
+	// 「前 N 个恰好都失效」变成「同步失败」，而订阅后面明明还有能用的节点。
+	// 上限取 min(节点数, max(max_nodes*3, max_nodes+8))，兼顾「够补」与「别探太久」。
+	probeCap := s.probeCap(len(nodes))
 	bindings, err := mihomosub.BuildBindings(
 		nodes, s.cfg.NamePrefix, "127.0.0.1", "mixed",
-		s.cfg.BasePort, s.cfg.MaxNodes, nil, nil,
+		s.cfg.BasePort, probeCap, nil, nil,
 	)
 	if err != nil {
 		s.setErr(err)
@@ -187,8 +194,42 @@ func (s *Sidecar) applySubscription(body []byte) (*SyncResult, error) {
 		return nil, fmt.Errorf("启动 mihomo 失败：%w", err)
 	}
 
-	slots := make([]ProxySlot, 0, len(bindings))
-	for _, b := range bindings {
+	// ── 出口健康探测（2026-10-24 新增）────────────────────────────────
+	//
+	// 为什么必须在同步时探测：槽位是从订阅生成的，而机场会**轮换节点**。
+	// 实测（2026-10-24）：订阅里 5 个 lxyun 域名节点全部不可用，展开成槽位后
+	// 经它们访问 generate_204 一律 502/超时，但面板健康列**全绿** —— 因为健康
+	// 账只记「真实出站」，而这些槽位从没被用过。用户把账号绑上去才发现全废。
+	//
+	// 语义选择（按用户「按你建议」的决定）：
+	//   - 探测不通的节点**丢弃**，并用探测通的节点补足到 max_nodes；
+	//   - **全部不通** → 返回错误且**不落盘**（保留原配置）。
+	//     账号失去出口比报错严重得多：宁可这次同步失败，让用户看到原因。
+	//
+	// 顺序必须先启动后探测：探测要经本地 mixed 端口发出，而端口是 mihomo 起的。
+	// 探测用的端口就是候选池的端口（basePort..basePort+probeCap-1），
+	// 与最终槽位端口一致（BuildBindings 的 port = base+i 由 identity 排序决定），
+	// 故探测的 URL 与最终槽位 URL 逐字相同 —— 健康账的键天然对齐。
+	alive, dead := s.probeBindings(bindings)
+	if len(alive) == 0 {
+		err := fmt.Errorf("订阅里 %d 个候选节点全部探测不通（经出口访问 %s 均失败）——"+
+			"订阅可能已失效，或节点已被机场轮换。本次同步**未改动**原槽位配置",
+			len(bindings), upstream.ProbeURL)
+		s.setErr(err)
+		return nil, err
+	}
+	// 截断到 max_nodes（探测通过的按稳定顺序取前 N 个）
+	alive = selectAlive(alive, s.cfg.MaxNodes)
+	// 探测筛选后集合变化 → 用存活节点重写配置并重启（端口随之压缩到 base..base+len-1）
+	if len(alive) != len(bindings) {
+		if err := s.engine.EnsureRunning(sourceID, s.cfg.NamePrefix, "127.0.0.1", alive, ""); err != nil {
+			s.setErr(err)
+			return nil, fmt.Errorf("按可用节点重启 mihomo 失败：%w", err)
+		}
+	}
+
+	slots := make([]ProxySlot, 0, len(alive))
+	for _, b := range alive {
 		slots = append(slots, ProxySlot{
 			ID:      b.Name, // 用「节点 identity 派生的稳定名」作槽位 id：同名即同节点
 			Name:    b.Node.Name,
@@ -198,9 +239,17 @@ func (s *Sidecar) applySubscription(body []byte) (*SyncResult, error) {
 	}
 
 	res := &SyncResult{Slots: slots, NodeCount: len(nodes), FetchedAt: time.Now()}
-	if len(nodes) > len(bindings) {
+	res.Warnings = append(res.Warnings,
+		fmt.Sprintf("探测 %d 个候选出口：%d 个可用、%d 个不可用（已丢弃）",
+			len(bindings), len(alive), len(dead)))
+	for _, d := range dead {
 		res.Warnings = append(res.Warnings,
-			fmt.Sprintf("订阅含 %d 个节点，按 max_nodes=%d 只展开前 %d 个", len(nodes), s.cfg.MaxNodes, len(bindings)))
+			fmt.Sprintf("丢弃 %s：%s", d.Name, firstLine(d.Err)))
+	}
+	if len(nodes) > probeCap {
+		res.Warnings = append(res.Warnings,
+			fmt.Sprintf("订阅共 %d 个节点，本次只探测了前 %d 个（够补足 %d 个可用出口即停）",
+				len(nodes), probeCap, s.cfg.MaxNodes))
 	}
 
 	s.mu.Lock()
@@ -212,9 +261,106 @@ func (s *Sidecar) applySubscription(body []byte) (*SyncResult, error) {
 
 	// 注册表接线与落盘由 admin 层负责（见 admin.persistSidecarSlots）：
 	// 本层只管「订阅 → mihomo → 槽位定义」，不碰 config.json，避免两层都写配置。
-	log.Printf("[sidecar] 同步完成：%d 个节点 → %d 个出口端口（%d..%d），dataDir=%s",
-		len(nodes), len(bindings), s.cfg.BasePort, s.cfg.BasePort+len(bindings)-1, s.dataDir)
+	log.Printf("[sidecar] 同步完成：%d 个节点 → 探测 %d 个候选 → 保留 %d 个可用出口（%d..%d），dataDir=%s",
+		len(nodes), len(bindings), len(alive), s.cfg.BasePort, s.cfg.BasePort+len(alive)-1, s.dataDir)
 	return res, nil
+}
+
+// probeCap 返回本次要展开并探测的候选节点数。
+//
+// 必须 > max_nodes：给「前 N 个失效」留补位余量。上限同时受节点总数与
+// probeCeiling 约束 —— 每个候选要占一个本地端口并起一条 mihomo listener，
+// 探太多既慢又浪费端口。
+func (s *Sidecar) probeCap(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	want := s.cfg.MaxNodes*3 + 8
+	if want > probeCeiling {
+		want = probeCeiling
+	}
+	if want > total {
+		want = total
+	}
+	return want
+}
+
+// probeCeiling 候选探测数的硬上限。
+const probeCeiling = 40
+
+// selectAlive 从探测通过的候选里取前 max 个（候选已按 identity 稳定排序，
+// 故取前 N 个是确定性的：同一份订阅、同一批可用节点 → 同一组槽位）。
+func selectAlive(alive []mihomosub.Binding, max int) []mihomosub.Binding {
+	if max <= 0 || len(alive) <= max {
+		return alive
+	}
+	return alive[:max]
+}
+
+// probeDead 一个探测失败的候选。
+type probeDead struct {
+	Name string
+	Err  string
+}
+
+// probeBindings 并发探测每个候选出口，返回（存活、失败）。
+//
+// 并发度固定 probeConcurrency：串行 40 个 × 最坏 12s = 8 分钟不可接受；
+// 全并发又会对本机 mihomo 与上游节点同时发起几十条连接。8 路约一到两轮。
+func (s *Sidecar) probeBindings(bindings []mihomosub.Binding) (alive []mihomosub.Binding, dead []probeDead) {
+	type outcome struct {
+		b   mihomosub.Binding
+		ok  bool
+		err string
+	}
+	sem := make(chan struct{}, probeConcurrency)
+	results := make([]outcome, len(bindings))
+	var wg sync.WaitGroup
+
+	// 每路探测的总时长上限（dial 5s + 转发 8s 已在 ProbeProxyURL 内各自封顶；
+	// 这里再给一个更紧的整体上限，避免某个节点把整轮拖满）。
+	ctx, cancel := context.WithTimeout(context.Background(), probeRoundTimeout)
+	defer cancel()
+
+	for i, b := range bindings {
+		wg.Add(1)
+		go func(i int, b mihomosub.Binding) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			url := fmt.Sprintf("http://127.0.0.1:%d", b.Port)
+			r := probeFn(ctx, url)
+			results[i] = outcome{b: b, ok: r.OK, err: r.Error}
+		}(i, b)
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.ok {
+			alive = append(alive, r.b)
+			continue
+		}
+		dead = append(dead, probeDead{Name: r.b.Node.Name, Err: r.err})
+	}
+	return alive, dead
+}
+
+// probeConcurrency 探测并发度。
+const probeConcurrency = 8
+
+// probeFn 实际执行一次出口探测。抽成变量是为了让测试注入桩 ——
+// 探测要真起 mihomo 并经它出网，单测里做不到（也不该做）。
+var probeFn = upstream.ProbeProxyURL
+
+// probeRoundTimeout 一轮探测的整体时长上限。
+const probeRoundTimeout = 45 * time.Second
+
+// firstLine 取错误首行（探测错误的模板很长，面板里只放一行够用）。
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // Assign 把池中账号**粘性**摊到 sidecar 槽位上。

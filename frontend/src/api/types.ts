@@ -400,6 +400,14 @@ export interface ProxySlot {
   usage?: number
   /** 出口是否可用（后端按代理 URL 记账；不健康时选号会排除绑定本槽位的账号） */
   healthy?: boolean
+  /**
+   * 该出口是否有过任何探测/出站记录。
+   * false = 从未探测过 —— 此时 `healthy` 无意义（后端默认 true），
+   * 界面必须显示「未探测」而不是「正常」，否则会谎报健康。
+   */
+  health_known?: boolean
+  /** 最近一次记账时刻（RFC3339）；空 = 从未探测 */
+  probed_at?: string
   /** 连续失败次数（成功一次即清零） */
   fail_count?: number
   /** 最近一次失败原因 */

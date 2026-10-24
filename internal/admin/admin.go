@@ -63,6 +63,10 @@ type Config struct {
 	// ProxyHealth 按槽位原始 URL 查出口健康（未记账返回 false）。
 	// nil = 不展示健康信息（测试场景）。
 	ProxyHealth func(rawURL string) (ProxyHealthInfo, bool)
+	// ProxyNoteResult 把一次探测结论写回出口健康登记（成功清账 / 失败记一笔）。
+	// 供 /__admin/proxy/test 把「手动测试」的结果反映到槽位健康列。
+	// nil = 不写回（测试场景）。
+	ProxyNoteResult func(rawURL string, ok bool, errMsg string)
 	// Groups 账号分组：读快照 / 整体替换（面板保存后热重载）。
 	// nil = 未接线，分组端点返回明确错误。
 	Groups GroupsController
