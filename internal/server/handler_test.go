@@ -2729,3 +2729,93 @@ func TestRefreshBusinessErrorStillBlames(t *testing.T) {
 		}
 	}
 }
+
+// TestTransportErrorReleasesInFlightLease 是 2026-10-25 生产事故的回归锁。
+//
+// 症状：面板上 5 个账号全显示「正常」、点「测试」全部「链路正常」，但每个账号的
+// 在途（in_flight）都卡死在 3/3 —— 正常候选路径一个都选不到，每次请求都走全冷却
+// 兜底打同一个 429 号，客户端**持续 503**。
+//
+// 根因：154e112 为「代理故障不罚账号」把传输层错误分支的 fail(acct.UID) 换成裸
+// continue，而 fail() 里**同时**含 releaseHeld() —— 租约释放被一起删掉了。于是
+// **每次上游传输错误永久泄漏一个在途名额**（in_flight 只增不减），累积到
+// max_in_flight 后该账号被 inFlightFull 永久排除。
+//
+// 实测：205 次传输错误 → 5 个账号的 in_flight 全部卡满。
+//
+// 本用例：让每次出站都失败在传输层，跑 MaxRotate 轮，断言请求结束后
+// **所有账号的 in_flight 都回到 0**。
+func TestTransportErrorReleasesInFlightLease(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: "www.workbuddy.ai", IsNotFound: true}
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	// 单账号池 + 上限 1：只要泄漏一次，下一轮就选不到号（最容易暴露）。
+	acct := &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "copilot.tencent.com"}
+	p := testPoolWith(acct)
+	p.SetMaxInFlight(1)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("传输层全失败时不该返回 200")
+	}
+	for _, st := range p.List() {
+		if st.InFlight != 0 {
+			t.Errorf("账号 %s 的在途名额泄漏：InFlight=%d（应为 0）——"+
+				"传输层错误路径必须释放在途租约，否则累积到上限后该号被永久排除，全池 503",
+				st.UID, st.InFlight)
+		}
+	}
+}
+
+// TestTransportErrorDoesNotRepeatSameAccount 传输层错误必须真的换号。
+//
+// 与上面的泄漏是同一处代码的两个后果：泄漏会让「换号」失效（下一轮选不到号），
+// 于是同一个号被反复打。这里断言 max_in_flight 足够时，多轮确实换到了不同账号。
+func TestTransportErrorDoesNotRepeatSameAccount(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			// 用 Authorization 区分账号（每个账号有独立 access token）。
+			mu.Lock()
+			seen[r.Header.Get("Authorization")]++
+			mu.Unlock()
+			return nil, &net.DNSError{Err: "no such host", Name: "www.workbuddy.ai", IsNotFound: true}
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "copilot.tencent.com"},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999, Domain: "copilot.tencent.com"},
+	)
+	p.SetMaxInFlight(3)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rec, req)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 2 {
+		t.Errorf("传输层错误应在账号间轮换，实际只打了 %d 个账号：%v", len(seen), seen)
+	}
+	for _, st := range p.List() {
+		if st.InFlight != 0 {
+			t.Errorf("账号 %s 在途未归还：InFlight=%d", st.UID, st.InFlight)
+		}
+	}
+}

@@ -1025,6 +1025,21 @@ func (h *Handler) forwardChat(w http.ResponseWriter, body []byte, o forwardOpt) 
 			if proxyDown {
 				log.Printf("WARN: [server] 出口代理不可达，标记不健康并排除其绑定账号：%v", terr)
 			}
+			// **必须释放在途租约**（2026-10-25 生产事故）。
+			//
+			// 154e112 为「代理故障不罚账号」把此处的 fail(acct.UID) 换成裸 continue，
+			// 但 fail() 里同时含 releaseHeld() —— 租约释放被一起删掉了。后果：
+			// **每次上游传输错误永久泄漏一个在途名额**（in_flight 只增不减），
+			// 累积到 max_in_flight 后该账号被 inFlightFull 永久排除在候选外。
+			//
+			// 实测：205 次传输错误 → 5 个 global 账号的 in_flight 全部卡死在 3/3，
+			// 正常候选路径一个都选不到 → 每次请求都走全冷却兜底
+			// （pickEarliestExpiryLocked，它同样先过滤 inFlightFull，只剩被罚的号）
+			// → 反复打同一个 429 号 → 客户端持续 503，而面板上账号全显示「正常」。
+			//
+			// 这里只释放租约、**不调 fail()**：fail 还会 NoteAttempt 降权，而那正是
+			// 154e112 要避免的（代理是基础设施、账号健康）。故显式 releaseHeld。
+			releaseHeld()
 			// 换号退避后继续；下一轮的 pickPred 已带上「排除坏槽位」，
 			// 若全池都在坏槽位上则下一轮选不到号、自然收敛为 503。
 			if !rotateBackoff(i, ctx) {
