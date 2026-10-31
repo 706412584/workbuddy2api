@@ -31,17 +31,19 @@ func (h *Handler) persistSidecarSlots(res SidecarSyncResult) error {
 	binds := h.cfg.Registry.Binds()
 
 	merged := mergeSlots(cur, res.Slots)
-	// 清掉指向已消失槽位的绑定（否则界面显示「已失效绑定」）
-	valid := map[string]bool{}
-	for _, s := range merged {
-		valid[s.ID] = true
-	}
-	for uid, sid := range binds {
-		if !valid[sid] {
-			delete(binds, uid)
-		}
-	}
 
+	// 绑定一律**保留**，不因槽位消失而删除。
+	//
+	// 回归背景（2026-11-01 事故）：旧实现在这里把「指向已消失槽位的绑定」整条删掉。
+	// 而 sidecar 每次同步都会重新探测并只保留 top-N 个出口 —— 节点集合每小时都可能
+	// 轮换，于是**每小时自动同步都会把全部账号绑定清空一次**（实测 10-31 16:34:52
+	// 一次同步把 16 条绑定全删成 0 条）。后果是所有账号悄悄回落成**直连**：
+	// 同一台机器、同一个出口 IP 上跑二十多个号，正是上游判定「异常行为」最典型的
+	// 特征，等于主动制造连坐封号条件。
+	//
+	// 保留的代价仅是界面上可能显示「已失效绑定」；收益是节点回来时绑定自动复活
+	// （槽位 ID 由节点 identity 派生，同名即同节点），且不会在用户不知情时改网络行为。
+	// 真正失效的绑定在解析时按「查不到槽位 = 直连」处理（见 proxyreg.Resolve）。
 	return h.writeProxyConfig(merged, binds)
 }
 

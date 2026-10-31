@@ -198,6 +198,14 @@ export default function App() {
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [busy, setBusy] = useState(false)
+
+  // 手机端（≤760px CSS 断点）侧栏收起为抽屉；切页后自动收起。
+  const [navOpen, setNavOpen] = useState(false)
+  const pick = (t: Tab) => {
+    setTab(t)
+    setNavOpen(false)
+  }
+
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -305,7 +313,17 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
+      {/* 手机端顶部的抽屉开关（桌面端 CSS 隐藏） */}
+      <button
+        className="nav-toggle"
+        aria-label="菜单"
+        aria-expanded={navOpen}
+        onClick={() => setNavOpen((v) => !v)}
+      >
+        {navOpen ? '✕' : '☰'}
+      </button>
+
+      <aside className={'sidebar' + (navOpen ? ' open' : '')}>
         <div className="brand">
           <h1>workbuddy2api</h1>
           <p>管理面板</p>
@@ -313,7 +331,7 @@ export default function App() {
 
         <nav className="nav">
           {TABS.map((t) => (
-            <button key={t.id} aria-current={tab === t.id} onClick={() => setTab(t.id)}>
+            <button key={t.id} aria-current={tab === t.id} onClick={() => pick(t.id)}>
               <span
                 className="dot"
                 style={{
@@ -341,6 +359,8 @@ export default function App() {
           </div>
         </div>
       </aside>
+      {/* 抽屉打开时的遮罩（点击关闭） */}
+      {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} />}
 
       <div className="main">
         <header className="topbar">
@@ -350,25 +370,27 @@ export default function App() {
 
           <div className="spacer" />
 
-          <KeyPicker
-            value={apiKey}
-            keys={keyTable}
-            legacyKey={legacyKey}
-            onChange={setApiKey}
-          />
-          <AdminTokenPicker value={adminTok} onChange={setAdminTok} />
-          <button className="btn" onClick={() => void refresh(true)} disabled={busy}>
-            {busy ? <span className="spin" /> : null}
-            {busy ? ' 刷新中' : '刷新'}
-          </button>
-          <label style={{ margin: 0, display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={(e) => setAutoRefresh(e.target.checked)}
+          <div className="topbar-tools">
+            <KeyPicker
+              value={apiKey}
+              keys={keyTable}
+              legacyKey={legacyKey}
+              onChange={setApiKey}
             />
-            自动 5s
-          </label>
+            <AdminTokenPicker value={adminTok} onChange={setAdminTok} />
+            <button className="btn" onClick={() => void refresh(true)} disabled={busy}>
+              {busy ? <span className="spin" /> : null}
+              {busy ? ' 刷新中' : '刷新'}
+            </button>
+            <label style={{ margin: 0, display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={autoRefresh}
+                onChange={(e) => setAutoRefresh(e.target.checked)}
+              />
+              自动 5s
+            </label>
+          </div>
         </header>
 
         <main className="content">

@@ -496,16 +496,174 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+/* ── 移动端适配（≤760px）──────────────────────────────────────
+   模式取自 workbench（D:/app/gallery/workbench）的移动端设计：
+   侧栏变抽屉 + 顶栏紧凑 + 表格横向滚动 + 触控目标 ≥36px + safe-area。
+   桌面端（>980px）完全不受影响；980-760 之间侧栏恢复纵排但仍是抽屉形态。 */
+
+/* 抽屉开关：桌面隐藏 */
+.nav-toggle {
+  display: none;
+}
+
+.nav-scrim {
+  display: none;
+}
+
 @media (max-width: 980px) {
   .app {
     grid-template-columns: 1fr;
   }
+
+  /* 侧栏 → 固定定位抽屉，默认藏在屏外；.open 滑入 */
   .sidebar {
-    position: static;
-    height: auto;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 216px;
+    max-width: 78vw;
+    height: 100dvh;
+    z-index: 60;
+    transform: translateX(-100%);
+    transition: transform 0.22s ease;
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.35);
+    padding-top: calc(18px + env(safe-area-inset-top, 0px));
+    overflow-y: auto;
   }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .nav-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(0, 0, 0, 0.45);
+  }
+
+  .nav-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    top: calc(10px + env(safe-area-inset-top, 0px));
+    left: 10px;
+    z-index: 40;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-panel);
+    color: var(--text-strong);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+  }
+}
+
+@media (max-width: 760px) {
+  /* 全局：字号与触控目标 */
+  html {
+    font-size: 15px;
+  }
+
+  button.btn,
+  input,
+  select,
+  textarea {
+    font-size: 14px;
+  }
+
+  /* 触控目标：所有按钮 ≥36px 高 */
+  button.btn {
+    padding: 8px 14px;
+    min-height: 36px;
+  }
+
+  /* 顶栏：汉堡按钮让出空间，tools 换行铺满 */
+  .topbar {
+    padding: calc(52px + env(safe-area-inset-top, 0px)) 12px 10px 56px;
+    gap: 8px;
+  }
+
+  .topbar-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .topbar-tools input,
+  .topbar-tools select {
+    width: 100% !important; /* KeyPicker/AdminTokenPicker 的内联 320/200 宽在手机上铺满 */
+  }
+
+  /* 内容区：收窄留白，统计卡两列 */
+  .content {
+    padding: 12px;
+    gap: 12px;
+  }
+
   .grid-2,
-  .grid-2.eq {
+  .grid-2.eq,
+  .grid-2.forms {
+    grid-template-columns: 1fr;
+    max-width: none;
+  }
+
+  .stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stat .v {
+    font-size: 18px;
+  }
+
+  /* 表格：手机上横向滚动是唯一正确解（卡片化改造 9 个页面成本过高且丢列）。
+     外层包 scroll-x 的已有；给未包的表格页一个兜底容器行为。 */
+  .panel .body {
+    padding: 10px;
+  }
+
+  /* 徽标与表格字号微收，信息密度接近桌面 */
+  table {
+    font-size: 12px;
+  }
+
+  th,
+  td {
+    padding: 8px 9px;
+  }
+
+  /* Playground 输出区占屏更高 */
+  .output {
+    max-height: 62svh;
+  }
+
+  .logview {
+    max-height: calc(100dvh - 260px);
+  }
+
+  /* 行内按钮组不折行溢出：允许 wrap */
+  .row {
+    gap: 8px;
+  }
+
+  /* 测试/操作小按钮（padding 0 6px 那类）在手机上加高 */
+  button.btn[style*='padding: 0'] {
+    min-height: 30px;
+    padding: 4px 10px !important;
+  }
+}
+
+/* 超窄屏（≤380px）：统计卡单列 */
+@media (max-width: 380px) {
+  .stats {
     grid-template-columns: 1fr;
   }
 }

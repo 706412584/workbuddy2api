@@ -789,11 +789,21 @@ type frameResult struct {
 func firstFrame(rc io.Reader) (firstEvent, message string, ok bool) {
 	var buf []byte
 	tmp := make([]byte, 1024)
+	// 读到**出现 data: 行**为止，而不是「出现任意换行」就停。
+	//
+	// 回归背景（2026-11-01）：旧实现一见到 `\n` 就 break，而上游在首帧前常先发
+	// 注释行（`: keep-alive`）或空行。此时缓冲区里根本没有 data: 行，函数返回
+	// 「上游返回 200 但没有 SSE 数据帧」——但账号其实完全正常（同一条流接着就有
+	// 正常的 assistant 帧）。7237fcc8 / 772b109b 两个健康号被这条误报成「失败」，
+	// 面板上看起来像「新号能用、老号都死了」。
+	//
+	// 上限 4KB 保留：一次连通性测试不该读完整段回复（那是整个回复的费用）。
+	// 超过上限仍无 data: 行才判空流。
 	for len(buf) < 4096 {
 		n, err := rc.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			if bytes.Contains(buf, []byte("\n")) {
+			if hasSSEDataLine(buf) {
 				break
 			}
 		}
@@ -841,6 +851,17 @@ func firstFrame(rc io.Reader) (firstEvent, message string, ok bool) {
 		return c.Object, "", true
 	}
 	return "chunk", "", true
+}
+
+// hasSSEDataLine 报告缓冲区里是否已出现一行以 "data:" 开头的 SSE 帧。
+// 注释行（": keep-alive"）与空行不算——上游常在首帧前先发它们。
+func hasSSEDataLine(buf []byte) bool {
+	for _, l := range bytes.Split(buf, []byte("\n")) {
+		if bytes.HasPrefix(l, []byte("data:")) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseUpstreamError 从上游错误体里取业务码与文案。
