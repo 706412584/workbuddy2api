@@ -331,6 +331,11 @@ func (c *Client) injectClientFingerprint(req *http.Request) {
 	req.Header.Set("X-Agent-Intent", "craft")
 	// X-Agent-Type：网关是单会话直答，等价 resolveSessionAgentType 的 "main" 分支。
 	req.Header.Set("X-Agent-Type", "main")
+	// X-Agent-Runtime：官方 buildConversationHeaders 恒发（resolveAgentRuntime），
+	// 取值域 local-agent|cloud-agent|agent-agent（normalizeAgentRuntime 白名单），
+	// 无 baggage/session meta/env 时回落 "other"（2026-10-31 逆向 5.9.3 dist 确认）。
+	// 网关无 otel baggage、无 session meta → 官方在同条件下也发 "other"，照抄。
+	req.Header.Set("X-Agent-Runtime", "other")
 	// X-Request-ID：官方用本次 message id（UUID 打掉连字符）。这里独立生成，
 	// 上游不校验其与 X-Conversation-* 的关系（见 injectConversationHeaders 的实测）。
 	req.Header.Set("X-Request-ID", strings.ReplaceAll(newConversationID(), "-", ""))

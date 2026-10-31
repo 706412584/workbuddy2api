@@ -1105,6 +1105,11 @@ type ModelInfo struct {
 	SupportsToolCall  bool
 	// CanDisableThinking 推理模型是否允许关闭思考（false 时思考恒开）。
 	CanDisableThinking bool
+
+	// VideoGeneration 视频生成能力块（modelEntry.VideoGeneration 原样透出）。
+	// 非 nil = 该模型带 text-to-video / image-to-video tag，可走 /v2/videos/* 任务接口。
+	// nil = 普通对话模型。供模型列表标注视频入口（server 层据此加 supports_video）。
+	VideoGeneration json.RawMessage
 }
 
 // modelsPathFor 按账号区域返回模型目录端点路径。
@@ -1150,6 +1155,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 视频模型不在 cli agent 名单（名单只含对话面），但在 data.models 里带
+	// text-to-video / image-to-video tag。单独捞出来附在尾部，供 /v1/models
+	// 透出视频入口（server 层据此允许 model=xxx 走 /v1/videos/*）。
+	out = append(out, parseVideoModels(raw)...)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
 	// 只替换该账号所在区域的槽位，另一区域的缓存保持不变。
 	cache := make(map[string][]string, len(out))
@@ -1201,6 +1210,8 @@ type modelEntry struct {
 		Effort           string   `json:"effort"`
 		SupportedEfforts []string `json:"supportedEfforts"`
 	} `json:"reasoning"`
+	// VideoGeneration 视频生成能力块（kling 等视频模型下发，普通对话模型无此键）。
+	VideoGeneration json.RawMessage `json:"videoGeneration"`
 }
 
 // parseModels 解析模型目录响应（两域共用）：
@@ -1255,12 +1266,57 @@ func parseModels(raw []byte) ([]ModelInfo, error) {
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsToolCall:   m.SupportsToolCall,
 			CanDisableThinking: m.CanDisableThinking,
+			VideoGeneration:    m.VideoGeneration,
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// parseVideoModels 从模型目录响应里捞视频模型（带 text-to-video / image-to-video
+// tag 且带 videoGeneration 能力块的条目）。与 parseModels 的 cli 名单过滤互补：
+// cli 名单是**对话**面，视频模型在其外。
+// 上游未下发 credits（实测 kling-video-v3 为空）→ Credits 留空，展示侧显示「—」
+// 按既有「缺失≠免费」语义处理。
+func parseVideoModels(raw []byte) []ModelInfo {
+	var env modelsEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil
+	}
+	var out []ModelInfo
+	for _, m := range env.Data.Models {
+		if m.Disabled || m.VideoGeneration == nil {
+			continue
+		}
+		isVideo := false
+		for _, t := range m.Tags {
+			if t == "text-to-video" || t == "image-to-video" {
+				isVideo = true
+				break
+			}
+		}
+		if !isVideo {
+			continue
+		}
+		desc := m.DescriptionZh
+		if strings.TrimSpace(desc) == "" {
+			desc = m.DescriptionEn
+		}
+		out = append(out, ModelInfo{
+			ID:              m.ID,
+			Name:            m.Name,
+			ContextWindow:   m.MaxInputTokens,
+			MaxTokens:       m.MaxOutputTokens,
+			Credits:         m.Credits,
+			Description:     desc,
+			Vendor:          m.Vendor,
+			Tags:            m.Tags,
+			VideoGeneration: m.VideoGeneration,
+		})
+	}
+	return out
 }
 
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。

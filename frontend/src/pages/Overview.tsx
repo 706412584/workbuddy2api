@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AccountTestResult,
+  AppealResult,
   Health,
   PoolStatus,
   RegionModels,
@@ -8,6 +9,7 @@ import type {
   ThinkingLoopHit,
 } from '../api/types'
 import {
+  appealAccount,
   breakerActive,
   fmtDuration,
   fmtTime,
@@ -324,6 +326,9 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
   const [tests, setTests] = useState<Record<string, AccountTestResult>>({})
   const [testing, setTesting] = useState<Set<string>>(new Set())
   const [resetting, setResetting] = useState<Set<string>>(new Set())
+  /** 申诉中（按 uid）；结果按 uid 存展示在测试结果旁 */
+  const [appealing, setAppealing] = useState<Set<string>>(new Set())
+  const [appeals, setAppeals] = useState<Record<string, AppealResult>>({})
   const [batching, setBatching] = useState(false)
   const [copied, setCopied] = useState('')
   const [err, setErr] = useState('')
@@ -478,6 +483,43 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
     },
     [effectiveModel],
   )
+
+  /** 一键申诉（11140）：先 dry-run 预览，确认后真发。结果展示在测试结果旁。 */
+  const doAppeal = useCallback(async (uid: string, nick: string) => {
+    setErr('')
+    setNote('')
+    try {
+      const preview = await appealAccount(uid, undefined, true)
+      if (!alive.current) return
+      const text = preview.payload?.content ?? ''
+      if (
+        !confirm(
+          `将以账号 ${nick || uid} 的身份向上游提交 11140 申诉（应用内反馈通道）。\n\n` +
+            `—— 申诉正文（可自行修改后重试，此处默认官方事实陈述）——\n${text}\n\n` +
+            `确认提交？`,
+        )
+      ) {
+        return
+      }
+    } catch (e) {
+      if (!alive.current) return
+      setErr(`申诉预览失败：${e instanceof Error ? e.message : String(e)}`)
+      return
+    }
+    setAppealing((s) => mark(s, uid, true))
+    try {
+      const r = await appealAccount(uid)
+      if (!alive.current) return
+      setAppeals((t) => ({ ...t, [uid]: r }))
+      if (r.ok) setNote(`申诉已提交：feedbackId=${r.feedbackId || '（上游未返回 id）'}`)
+      else setErr(`申诉提交失败：${r.detail || '未知原因'}`)
+    } catch (e) {
+      if (!alive.current) return
+      setErr(`申诉失败：${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      if (alive.current) setAppealing((s) => mark(s, uid, false))
+    }
+  }, [])
 
   /**
    * 把一份文本放进剪贴板，并把按钮文字短暂切成「已复制」。
@@ -999,6 +1041,31 @@ export function Overview({ status, health, now, onChanged, keyRegion, poolTotal 
                               >
                                 {copied === a.uid ? '已复制' : '复制'}
                               </button>
+                              {/* 11140 官方申诉出口是应用内反馈；按钮仅在测出该码时出现 */}
+                              {!tests[a.uid].ok && tests[a.uid].code === 11140 && (
+                                <>
+                                  <button
+                                    className="btn"
+                                    style={{ padding: '0 6px', fontSize: 10.5, lineHeight: 1.6 }}
+                                    onClick={() => void doAppeal(a.uid, a.nickname ?? '')}
+                                    disabled={appealing.has(a.uid)}
+                                    title="以该账号身份向上游提交 11140 申诉（应用内反馈通道）"
+                                  >
+                                    {appealing.has(a.uid) ? <span className="spin" /> : null}
+                                    申诉
+                                  </button>
+                                  {appeals[a.uid] && (
+                                    <span
+                                      className="dim"
+                                      style={{ fontSize: 10.5, opacity: 0.85 }}
+                                    >
+                                      {appeals[a.uid].ok
+                                        ? `已提交 ${appeals[a.uid].feedbackId || ''}`
+                                        : '提交失败'}
+                                    </span>
+                                  )}
+                                </>
+                              )}
                             </div>
                           </div>
                         )}

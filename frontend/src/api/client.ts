@@ -23,6 +23,7 @@ import type {
   SidecarStatus,
   SidecarSyncResult,
   AccountTestResult,
+  AppealResult,
   RegionModels,
   LogTail,
   RequestStats,
@@ -438,6 +439,16 @@ export const testAccount = (uid: string, model?: string) =>
   adminJSON<AccountTestResult>('/__admin/accounts/test', {
     method: 'POST',
     body: JSON.stringify({ uid, model }),
+  })
+
+/**
+ * 以账号身份提交 11140 申诉（上游应用内反馈通道 POST /v2/feedback）。
+ * dryRun=true 只回显将提交的内容，不打上游 —— 前端按钮先预览再真发。
+ */
+export const appealAccount = (uid: string, content?: string, dryRun = false) =>
+  adminJSON<AppealResult>('/__admin/accounts/appeal', {
+    method: 'POST',
+    body: JSON.stringify({ uid, content, dry_run: dryRun }),
   })
 
 /**

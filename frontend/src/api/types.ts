@@ -103,6 +103,9 @@ export interface ModelInfo {
   supports_reasoning?: boolean
   supports_tool_call?: boolean
   can_disable_thinking?: boolean
+  /** 视频生成模型（走 /v1/videos/* 任务接口），video_generation 为上游能力块原文 */
+  supports_video?: boolean
+  video_generation?: Record<string, unknown>
 }
 
 export interface ModelList {
@@ -386,6 +389,17 @@ export interface AccountTestResult {
   latencyMs: number
   /** 成功时收到的首个 SSE 事件，证明链路真的通了 */
   firstEvent?: string
+}
+
+/** 11140 申诉提交结果（dry_run 时 payload 为将提交的表单预览）。 */
+export interface AppealResult {
+  ok: boolean
+  uid: string
+  nickname?: string
+  feedbackId?: string
+  dryRun: boolean
+  detail?: string
+  payload?: Record<string, string>
 }
 
 /** 一个出站代理槽位。 */

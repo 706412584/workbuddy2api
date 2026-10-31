@@ -221,6 +221,8 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// videoT 视频任务 task_id → 账号 uid 绑定表（进程内，见 video.go）。
+	videoT *videoTasks
 }
 
 // NewHandler 构建 handler。
@@ -240,7 +242,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = defaultMaxBodyBytes
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), loopLog: &loopLog{}}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), loopLog: &loopLog{}, videoT: newVideoTasks()}
 	h.loopGuard = cfg.LoopGuard.toLoopGuard()
 	// 生效判据落一行启动日志：这几项只能从配置推导，出问题时（误杀/漏判）第一件
 	// 事就是确认实际生效的阈值，没有这行只能去翻配置文件猜。
@@ -260,6 +262,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.anthropicMessages))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuth(h.countTokens))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	// 视频生成（提交 + 轮询）：上游独立任务接口 /v2/videos/*（见 video.go）。
+	h.mux.HandleFunc("POST /v1/videos/generations", h.withAuth(h.videoGenerations))
+	h.mux.HandleFunc("POST /v1/videos/tasks", h.withAuth(h.videoTasks))
+	// Grok 协议兼容（AndroidCodeStudio VideoGenerationTool）：GET /v1/videos/{id} 轮询。
+	h.mux.HandleFunc("GET /v1/videos/{id}", h.withAuth(h.videoTaskGetPath))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -401,18 +408,19 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request, key *APIKeySpec
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
 // context_length 取自 2026-09-13 直连上游 /console/enterprises/personal/models 的
 // maxInputTokens 实测值；此前统一硬编码 131072，会让客户端误以为只有 128K 而提前截断。
+// credits 为 2026-10-31 动态接口实测值（此前缺失，回退窗口内面板倍率全「—」）。
 // hy3-preview / hy3-preview-agent 在上游实测表中无对应条目，保留 131072 兜底。
 var staticModelsCN = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.79"},
+	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000, "credits": "x0.79"},
 	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 512000},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000},
+	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000, "credits": "x0.57"},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 512000, "credits": "x0.25"},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000, "credits": "x0.00"},
 	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.51"},
+	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.11"},
 }
 
 // 静态 global（workbuddy.ai）模型表。
@@ -421,20 +429,21 @@ var staticModelsCN = []map[string]any{
 // 模型名单为 2026-09 用真实 intl 凭证逐个模型实测「可用」的结果；
 // context_length 按同 id 取 CN 上游实测的 maxInputTokens —— 两区是同一套 API 的两次部署，
 // 但 global 侧无法实测验证，属外推值，可能偏高。
+// credits 为 2026-10-31 global /v3/config 实测值（同 id 以 global 实测为准，无实测不编造）。
 // 注意 global 不含 deepseek-v4-flash / deepseek-v4-pro（调用报 code=11102 service info not found）。
 var staticModelsGlobal = []map[string]any{
-	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.69"},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.79"},
 	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
 	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
 	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
 	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
 	{"id": "kimi-k2.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 164000},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 512000},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000},
-	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
-	{"id": "hy4-preview-x", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
-	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 512000, "credits": "x0.25"},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000, "credits": "x0.00"},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.29"},
+	{"id": "hy4-preview-x", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.29"},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "credits": "x0.00"},
 	{"id": "auto", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 168000},
 }
 
@@ -467,6 +476,9 @@ var modelRegions = func() map[string]map[auth.Region]bool {
 		"kimi-k2.5", "kimi-k2.6", "kimi-k2.7",
 		"minimax-m3",
 	)
+	// 视频模型（2026-10-31 实测 global /v3/config；与对话模型走同一批账号，
+	// 但端点是 /v2/videos/* 任务接口 —— 见 video.go）。
+	add(auth.RegionGlobal, "kling-video-v3")
 	return m
 }()
 
@@ -699,6 +711,12 @@ func (h *Handler) regionModels(r auth.Region) []map[string]any {
 			}
 			if mi.SupportsToolCall {
 				entry["supports_tool_call"] = true
+			}
+			// 视频模型（带 videoGeneration 能力块）：标注入口，客户端据此把该 id
+			// 路由到 /v1/videos/*（任务接口），而非 /v1/chat/completions。
+			if len(mi.VideoGeneration) > 0 {
+				entry["supports_video"] = true
+				entry["video_generation"] = json.RawMessage(mi.VideoGeneration)
 			}
 			out = append(out, entry)
 		}

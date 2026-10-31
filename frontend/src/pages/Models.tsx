@@ -82,9 +82,10 @@ function Caps({ m }: { m: ModelInfo }) {
   if (m.supports_images) caps.push('图')
   if (m.supports_reasoning) caps.push('思')
   if (m.supports_tool_call) caps.push('具')
+  if (m.supports_video) caps.push('视频')
   if (caps.length === 0) return <span className="dim">—</span>
   return (
-    <span className="dim" style={{ fontSize: 11, letterSpacing: 1 }} title="图=多模态 思=推理 具=工具调用">
+    <span className="dim" style={{ fontSize: 11, letterSpacing: 1 }} title="图=多模态 思=推理 具=工具调用 视频=视频生成（走 /v1/videos/*）">
       {caps.join(' ')}
     </span>
   )

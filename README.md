@@ -392,6 +392,7 @@ cd frontend && npm run dev     # :7864，/api 与 /__admin 都反代到 :7863
 | `POST /v1/messages` | 同上 | **Anthropic Messages 协议**（Claude Code 直连）；流式/非流式 |
 | `POST /v1/messages/count_tokens` | 同上 | token 计数（**本地估算**，上游无此接口；仅用于客户端上下文预算） |
 | `POST /v1/responses` | 同上 | **OpenAI Responses 协议**（Codex CLI 直连）；流式/非流式 |
+| `POST /v1/videos/generations` · `POST /v1/videos/tasks` · `GET /v1/videos/{id}` | 同上 | **视频生成任务接口**（提交 / 轮询 / Grok 兼容轮询，见「视频生成」章节） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性/区域；disabled 账号透出 `disabled_reason`） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -454,6 +455,66 @@ export ANTHROPIC_API_KEY=<你的 cn 或 global 密钥>
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`
 - 非流式请求由本地聚合完整 SSE 流为单 `chat.completion` 响应（含 `reasoning_content` / `tool_calls`）
 
+### 视频生成（/v1/videos）
+
+上游的视频生成是**独立任务接口**（不在 chat completions 里），网关以两条端点透出，
+与 chat 共用同一账号池、鉴权与区域路由：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /v1/videos/generations` | 提交任务。body：`model`（必填，如 `kling-video-v3`）、`prompt`（必填）、`seconds`（3-15，Grok 客户端的 `duration` 自动翻译）、`image_url`（图生视频首帧）、`last_image_url`（尾帧）、`reference_images`/`reference_videos`/`reference_audios`（参考素材，`[{url:"..."}]`）、`resolution`（720P/1080P/4K）、`aspect_ratio`（16:9/9:16/1:1）、`enable_audio`、`watermark` |
+| `POST /v1/videos/tasks` | 轮询。body：`{"task_id":"..."}`。返回 `status`（`queued`/`in_progress`/`completed`/`failed`）与 `data[0].url`（MP4 签名下载链接）、`usage.credit`（本次消耗） |
+| `GET /v1/videos/{id}` | **Grok 协议兼容**轮询（供 AndroidCodeStudio 等客户端）：返回 `status`（`done`/`failed`/`in_progress`）+ `video.url` + `request_id` |
+
+行为语义：
+
+- **任务粘号**：提交成功后网关把 `task_id → 账号` 绑定（进程内 24h），轮询强制回原账号——
+  视频任务跨账号查询上游必返 `14410 task not found`。绑定号冷却中时轮询返回 409 `video_account_unavailable`，稍后重试即可
+- **错误透传**：`14407`（模型路由不存在）/`14410`（任务不存在）/`10001`（缺参）等业务信封
+  原样透传，不轮换不罚号
+- **模型发现**：`GET /v1/models` 中视频模型带 `supports_video: true` 与 `video_generation`
+  能力块（时长/分辨率/宽高比范围），客户端可据此渲染参数面板
+- **计费**：按次扣账号 credits（实测 kling-video-v3 5s ≈ 36 credits），面板余额可见
+
+curl 示例：
+
+```bash
+# 提交（文生视频）
+curl -X POST http://127.0.0.1:7863/v1/videos/generations \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"kling-video-v3","prompt":"一只猫在草地上奔跑","seconds":5,"watermark":true}'
+# → {"id":"<task_id>","status":"queued","request_id":"<task_id>"}
+
+# 轮询（原生形态）
+curl -X POST http://127.0.0.1:7863/v1/videos/tasks \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"task_id":"<task_id>"}'
+# → status=completed 后取 data[0].url 下载
+
+# 轮询（Grok 兼容形态，等价）
+curl http://127.0.0.1:7863/v1/videos/<task_id> -H "Authorization: Bearer $KEY"
+# → status=done 后取 video.url
+```
+
+#### AndroidCodeStudio（android-code-studio）接入
+
+ACS 的「能力 → 视频生成」走 Grok 协议（`POST /videos/generations` → `GET /videos/{id}`），
+网关已完整兼容。配置：
+
+1. 设置 → AI 助手 → 能力 → **视频生成**
+2. 服务商选 **Grok**（或自定义端点走 Grok 分流：模型名不带 `grok-imagine-video` 前缀时
+   默认 Agnes 协议——**必须选 Grok 服务商**或把模型名配成 `grok-imagine-video` 才会走
+   `GET /videos/{id}` 轮询；选 Agnes 会去打网关不存在的 `/agnesapi`）
+3. Base URL：`http://<网关地址>:7863/v1`（含 `/v1`）
+4. API Key：网关密钥；模型名：`kling-video-v3`（手填，ACS 的 Grok 模型下拉里没有它）
+
+注意：ACS 的 Grok 分流按模型名正则 `^grok-imagine-video` 判定——若你的 ACS 版本
+模型名填 `kling-video-v3` 会走 Agnes 协议，此时把模型名改成 `grok-imagine-video` 并
+无法通过网关（上游无此模型）。**变通**：在 ACS 配置里模型名保持 `kling-video-v3`，
+仅当 ACS 强制按前缀分流时才需要在其 `VideoGenerationEndpoint.isGrokProtocol` 放行
+（或等上游支持 Grok Imagine）。提交流量两种模型名都会打到网关并成功提交，
+差异只在轮询路径。
+
 ### 请求体超限（413）
 
 请求体超过 `server.max_body_mb`（默认 32 MB）时网关直接返回：
@@ -477,6 +538,8 @@ export ANTHROPIC_API_KEY=<你的 cn 或 global 密钥>
 | 相对路径（绝对路径见出处表） | 方法 | 用途 |
 |---|---|---|
 | `chat/completions` | POST | 聊天补全（SSE） |
+| `videos/generations` · `videos/tasks` | POST | 视频生成任务提交 / 轮询（见「视频生成」章节） |
+| `feedback` | POST | 应用内反馈（11140 官方申诉通道，面板「申诉」按钮） |
 | `console/enterprises/personal/models` | GET | 动态模型列表 |
 | `plugin/auth/token/refresh` | POST | token 刷新 |
 | `billing/meter/daily-checkin` | POST | 每日签到 |
